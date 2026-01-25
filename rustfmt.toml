@@ -1,0 +1,8 @@
+# Maximum line width
+max_width = 80
+
+# Use edition 2024 formatting rules
+edition = "2024"
+
+# Additional formatting preferences
+use_small_heuristics = "Default"

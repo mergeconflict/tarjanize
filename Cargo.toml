@@ -1,0 +1,18 @@
+[package]
+name = "tarjanize"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ra_ap_hir = "0.0.234"
+ra_ap_ide = "0.0.234"
+ra_ap_ide_db = "0.0.234"
+ra_ap_base_db = "0.0.234"
+ra_ap_project_model = "0.0.234"
+ra_ap_vfs = "0.0.234"
+ra_ap_load-cargo = "0.0.234"
+ra_ap_paths = "0.0.234"
+ra_ap_syntax = "0.0.234"
+anyhow = "1.0"
+camino = "1.1"
+clap = { version = "4.5", features = ["derive"] }
