@@ -224,27 +224,25 @@ The final output (Phase 5) is a **Markdown report** (`report.md`). See Phase 5 f
 
 Contains all symbols from all crates in the workspace, along with all dependency edges (both within and across crates).
 
-#### Schema (`symbol_graph.schema.json`)
+#### Schema (`schemas/symbol_graph.schema.json`)
 
-The structure mirrors Rust's hierarchy: workspace → crates → modules (nested) → symbols.
+The structure mirrors Rust's hierarchy: workspace → crates (as root modules) → modules (nested) → symbols.
 
 ```
 SymbolGraph
 ├── workspace_name: string
-├── crates: []
-│   └── Crate
-│       ├── name: string
-│       └── root_module: Module
-│           ├── name: string
-│           ├── symbols: []
-│           │   └── Symbol (union type)
-│           │       ├── name: string
-│           │       ├── file: string
-│           │       ├── cost: number
-│           │       └── oneOf:
-│           │           ├── module_def: { kind, visibility }
-│           │           └── impl: { self_type?, trait? }
-│           └── submodules?: [] (recursive Module)
+├── crates: []                         # Each crate is represented as its root Module
+│   └── Module
+│       ├── name: string               # Crate name (from Cargo.toml) for root modules
+│       ├── symbols: []
+│       │   └── Symbol (union type)
+│       │       ├── name: string
+│       │       ├── file: string
+│       │       ├── cost: number
+│       │       └── oneOf:
+│       │           ├── module_def: { kind, visibility? }
+│       │           └── impl: { self_type?, trait? }
+│       └── submodules?: [] (recursive Module)
 └── edges: []
     └── Edge
         ├── from: string (path)
@@ -253,96 +251,17 @@ SymbolGraph
 
 **Symbol identity**: No explicit ID field. Identity is implicit from position in the
 module tree. Edges use full paths like `crate::module::Name`. For impls, use
-`<impl Trait for Type>` or `<impl Type>` (inherent).
+`impl Trait for Type` or `impl Type` (inherent).
+
+**Visibility**: The `visibility` field is optional. Absent means private (no visibility
+modifier in source). Present values include `pub` and `pub(restricted)` (covers
+`pub(crate)`, `pub(super)`, `pub(in path)`).
 
 **Impl fields**: `self_type` and `trait` are full paths if the target is local
-(workspace member), or `null` if foreign (external crate). Phase 2 uses these
+(workspace member), or absent/null if foreign (external crate). Phase 2 uses these
 to derive coherence edges.
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "SymbolGraph",
-  "type": "object",
-  "required": ["workspace_name", "crates", "edges"],
-  "properties": {
-    "workspace_name": { "type": "string", "description": "Name of the workspace (e.g., 'omicron')" },
-    "crates": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/crate" }
-    },
-    "edges": {
-      "type": "array",
-      "items": { "$ref": "#/$defs/edge" },
-      "uniqueItems": true
-    }
-  },
-  "$defs": {
-    "crate": {
-      "type": "object",
-      "required": ["name", "root_module"],
-      "properties": {
-        "name": { "type": "string", "description": "Crate name from Cargo.toml" },
-        "root_module": { "$ref": "#/$defs/module" }
-      }
-    },
-    "module": {
-      "type": "object",
-      "required": ["name", "symbols"],
-      "properties": {
-        "name": { "type": "string", "description": "Module name (e.g., 'silo', or 'lib' for root)" },
-        "symbols": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/symbol" },
-          "description": "Symbols in this module. May be empty for re-export-only modules."
-        },
-        "submodules": {
-          "type": "array",
-          "items": { "$ref": "#/$defs/module" }
-        }
-      }
-    },
-    "symbol": {
-      "type": "object",
-      "required": ["name", "file", "cost"],
-      "properties": {
-        "name": { "type": "string", "description": "Symbol name (e.g., 'silo_create', '<impl Display for Silo>')" },
-        "file": { "type": "string", "description": "Path to symbol's file relative to crate root" },
-        "cost": { "type": "number", "description": "Size in bytes (proxy for compile-time complexity)" },
-        "module_def": { "$ref": "#/$defs/module_def_fields" },
-        "impl": { "$ref": "#/$defs/impl_fields" }
-      },
-      "oneOf": [
-        { "required": ["module_def"] },
-        { "required": ["impl"] }
-      ]
-    },
-    "module_def_fields": {
-      "type": "object",
-      "required": ["kind", "visibility"],
-      "properties": {
-        "kind": { "type": "string", "description": "Symbol kind (function, struct, enum, trait, const, static, type_alias, macro)" },
-        "visibility": { "type": "string", "description": "Visibility (pub, pub(crate), pub(super), private)" }
-      }
-    },
-    "impl_fields": {
-      "type": "object",
-      "properties": {
-        "self_type": { "type": ["string", "null"], "description": "Path to self type if local, null if foreign" },
-        "trait": { "type": ["string", "null"], "description": "Path to trait if local, null if foreign (inherent impls omit this)" }
-      }
-    },
-    "edge": {
-      "type": "object",
-      "required": ["from", "to"],
-      "properties": {
-        "from": { "type": "string", "description": "Path of the dependent (e.g., 'crate::module::func')" },
-        "to": { "type": "string", "description": "Path of the dependency" }
-      }
-    }
-  }
-}
-```
+See `schemas/symbol_graph.schema.json` for the complete JSON Schema definition.
 
 ### CondensedGraph
 
@@ -358,7 +277,7 @@ The symbol graph with SCCs condensed into atomic units, forming a DAG.
 
 **SCC IDs**: Generated deterministically from the paths of contained symbols (e.g., hash of sorted paths). This ensures stability across runs.
 
-#### Schema (`condensed_graph.schema.json`)
+#### Schema (`schemas/condensed_graph.schema.json`)
 
 ```
 CondensedGraph
@@ -377,64 +296,7 @@ CondensedGraph
         └── to: string (SCC id)
 ```
 
-```json
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "CondensedGraph",
-  "type": "object",
-  "required": ["crates", "edges"],
-  "properties": {
-    "crates": {
-      "type": "array",
-      "description": "Crates in the workspace, each containing its SCCs",
-      "items": { "$ref": "#/$defs/crate" }
-    },
-    "edges": {
-      "type": "array",
-      "description": "Edges between SCCs (from dependent to dependency)",
-      "items": { "$ref": "#/$defs/edge" },
-      "uniqueItems": true
-    }
-  },
-  "$defs": {
-    "crate": {
-      "type": "object",
-      "required": ["name", "sccs", "cost"],
-      "properties": {
-        "name": { "type": "string", "description": "Crate name" },
-        "cost": { "type": "number", "description": "Sum of SCC costs (bytes)" },
-        "sccs": {
-          "type": "array",
-          "description": "SCCs belonging to this crate",
-          "items": { "$ref": "#/$defs/scc" }
-        }
-      }
-    },
-    "scc": {
-      "type": "object",
-      "required": ["id", "symbols", "cost"],
-      "properties": {
-        "id": { "type": "string", "description": "Unique SCC identifier" },
-        "symbols": {
-          "type": "array",
-          "items": { "type": "string" },
-          "description": "Paths of symbols in this SCC (references SymbolGraph)",
-          "minItems": 1
-        },
-        "cost": { "type": "number", "description": "Sum of symbol costs (bytes)" }
-      }
-    },
-    "edge": {
-      "type": "object",
-      "required": ["from", "to"],
-      "properties": {
-        "from": { "type": "string", "description": "SCC ID of the dependent" },
-        "to": { "type": "string", "description": "SCC ID of the dependency" }
-      }
-    }
-  }
-}
-```
+See `schemas/condensed_graph.schema.json` for the complete JSON Schema definition.
 
 ## CLI Interface
 

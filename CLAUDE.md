@@ -10,6 +10,7 @@ cargo build                     # Full build
 cargo nextest run               # Run all tests
 cargo nextest run <name>        # Run tests matching name
 cargo nextest run -E 'test(foo)'  # Run tests matching expression
+cargo llvm-cov nextest          # Run tests with coverage report
 cargo fmt                       # Format code (80-char lines, edition 2024)
 cargo clippy                    # Lint
 ```
@@ -60,4 +61,24 @@ Don't just describe the mechanics; justify the existence and design of the code.
 
 ## Testing
 
-Test fixture in `tests/fixtures/method_resolution/` - a minimal Cargo project testing method resolution (trait defaults vs impl overrides).
+**Coverage requirement:** All modules except `main.rs` must maintain ≥90% line coverage. Run `cargo llvm-cov nextest` to check. The `main.rs` file is excluded because it's the CLI entry point and not exercised by unit tests.
+
+Tests use `ra_ap_test_fixture` for fast, in-memory fixture-based testing. Each test creates an in-memory database with the fixture syntax:
+```rust
+let db = RootDatabase::with_files(r#"
+//- /lib.rs crate:test_crate deps:other_crate
+pub fn my_function() {}
+"#);
+```
+
+Test files target one property at a time (e.g., `test_fixture_fn_param_type`, `test_fixture_trait_supertrait`).
+
+## Static Verification
+
+Beyond `cargo clippy` and `cargo fmt`, consider running these tools periodically:
+
+```bash
+cargo audit                     # Check for security vulnerabilities in deps
+cargo udeps                     # Find unused dependencies
+cargo hack check --feature-powerset  # Verify all feature combinations compile
+```

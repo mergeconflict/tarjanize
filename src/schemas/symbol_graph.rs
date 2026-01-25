@@ -100,6 +100,103 @@ pub struct Edge {
 mod tests {
     use super::*;
     use anyhow::{Context, Result};
+    use tracing::info;
+
+    /// Test serialization roundtrip for SymbolGraph.
+    ///
+    /// This exercises the Serialize/Deserialize derives and skip_serializing_if
+    /// attributes.
+    #[test]
+    fn test_symbol_graph_serialization() {
+        let graph = SymbolGraph {
+            workspace_name: "test".to_string(),
+            crates: vec![Module {
+                name: "test_crate".to_string(),
+                symbols: vec![
+                    // ModuleDef with visibility
+                    Symbol {
+                        name: "pub_fn".to_string(),
+                        file: "lib.rs".to_string(),
+                        cost: 100.0,
+                        kind: SymbolKind::ModuleDef {
+                            kind: "function".to_string(),
+                            visibility: Some("pub".to_string()),
+                        },
+                    },
+                    // ModuleDef without visibility (private)
+                    Symbol {
+                        name: "priv_fn".to_string(),
+                        file: "lib.rs".to_string(),
+                        cost: 50.0,
+                        kind: SymbolKind::ModuleDef {
+                            kind: "function".to_string(),
+                            visibility: None,
+                        },
+                    },
+                    // Impl with both self_type and trait
+                    Symbol {
+                        name: "impl Foo for Bar".to_string(),
+                        file: "lib.rs".to_string(),
+                        cost: 200.0,
+                        kind: SymbolKind::Impl {
+                            self_type: Some("Bar".to_string()),
+                            trait_: Some("Foo".to_string()),
+                        },
+                    },
+                    // Impl with only self_type (inherent impl)
+                    Symbol {
+                        name: "impl Bar".to_string(),
+                        file: "lib.rs".to_string(),
+                        cost: 150.0,
+                        kind: SymbolKind::Impl {
+                            self_type: Some("Bar".to_string()),
+                            trait_: None,
+                        },
+                    },
+                ],
+                submodules: Some(vec![Module {
+                    name: "submod".to_string(),
+                    symbols: vec![],
+                    submodules: None, // Tests skip_serializing_if for None
+                }]),
+            }],
+            edges: [Edge {
+                from: "test_crate::pub_fn".to_string(),
+                to: "test_crate::Bar".to_string(),
+            }]
+            .into_iter()
+            .collect(),
+        };
+
+        // Serialize to JSON
+        let json = serde_json::to_string_pretty(&graph).expect("serialize");
+
+        // Verify skip_serializing_if works - None values shouldn't appear
+        assert!(
+            !json.contains("\"submodules\": null"),
+            "None submodules should be skipped"
+        );
+        assert!(
+            !json.contains("\"visibility\": null"),
+            "None visibility should be skipped"
+        );
+        assert!(
+            !json.contains("\"self_type\": null"),
+            "None self_type should be skipped"
+        );
+        assert!(
+            !json.contains("\"trait\": null"),
+            "None trait should be skipped"
+        );
+
+        // Deserialize back
+        let parsed: SymbolGraph =
+            serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed.workspace_name, "test");
+        assert_eq!(parsed.crates.len(), 1);
+        assert_eq!(parsed.crates[0].symbols.len(), 4);
+        assert_eq!(parsed.edges.len(), 1);
+    }
 
     /// Verifies that the JSON Schema generated from Rust types matches the
     /// checked-in schema file.
@@ -127,12 +224,13 @@ mod tests {
         if std::env::var("GENERATE_GOLDEN").is_ok() {
             let json = serde_json::to_string_pretty(&schema)?;
             std::fs::write(golden_path, &json)?;
-            println!("Updated golden file: {}", golden_path);
+            info!(path = golden_path, "Updated golden file");
             return Ok(());
         }
 
-        let golden_json = std::fs::read_to_string(golden_path)
-            .context("Golden file not found. Run with GENERATE_GOLDEN=1 to create it.")?;
+        let golden_json = std::fs::read_to_string(golden_path).context(
+            "Golden file not found. Run with GENERATE_GOLDEN=1 to create it.",
+        )?;
 
         // Compare Schema objects rather than JSON strings. This makes the test
         // insensitive to formatting differences (key ordering, whitespace).
