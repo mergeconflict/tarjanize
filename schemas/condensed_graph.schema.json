@@ -1,0 +1,98 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CondensedGraph",
+  "type": "object",
+  "required": [
+    "crates",
+    "edges"
+  ],
+  "properties": {
+    "crates": {
+      "type": "array",
+      "description": "Crates in the workspace, each containing its SCCs",
+      "items": {
+        "$ref": "#/$defs/crate"
+      }
+    },
+    "edges": {
+      "type": "array",
+      "description": "Edges between SCCs (from dependent to dependency)",
+      "items": {
+        "$ref": "#/$defs/edge"
+      },
+      "uniqueItems": true
+    }
+  },
+  "$defs": {
+    "crate": {
+      "type": "object",
+      "required": [
+        "name",
+        "sccs",
+        "cost"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "description": "Crate name"
+        },
+        "cost": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Sum of SCC costs (bytes)"
+        },
+        "sccs": {
+          "type": "array",
+          "description": "SCCs belonging to this crate",
+          "items": {
+            "$ref": "#/$defs/scc"
+          }
+        }
+      }
+    },
+    "scc": {
+      "type": "object",
+      "required": [
+        "id",
+        "symbols",
+        "cost"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique SCC identifier"
+        },
+        "symbols": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Paths of symbols in this SCC (references SymbolGraph)",
+          "minItems": 1
+        },
+        "cost": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Sum of symbol costs (bytes)"
+        }
+      }
+    },
+    "edge": {
+      "type": "object",
+      "required": [
+        "from",
+        "to"
+      ],
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "SCC ID of the dependent"
+        },
+        "to": {
+          "type": "string",
+          "description": "SCC ID of the dependency"
+        }
+      }
+    }
+  }
+}

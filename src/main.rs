@@ -1,15 +1,14 @@
 mod crates;
 mod dependencies;
+mod extract;
 mod modules;
-mod test_method_resolution;
+mod schemas;
 mod workspaces;
 
 use anyhow::Result;
 use clap::Parser;
-use ra_ap_base_db::SourceDatabase;
-use ra_ap_hir::{Crate, Semantics};
 
-use crates::visit_crate;
+use extract::extract_symbol_graph;
 use workspaces::load_workspace;
 
 #[derive(Parser, Debug)]
@@ -27,38 +26,31 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    println!("Loading workspace at: {}", args.workspace_path);
+    eprintln!("Loading workspace at: {}", args.workspace_path);
     let db = load_workspace(&args.workspace_path)?;
 
-    // Semantics provides name resolution and type inference for syntax nodes.
-    // We need it to resolve paths to their definitions.
-    let sema = Semantics::new(&db);
+    // Derive workspace name from the path. In a real scenario, we might
+    // read this from Cargo.toml's [workspace] section or the package name.
+    let workspace_name = std::path::Path::new(&args.workspace_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("workspace")
+        .to_string();
 
-    println!("\n=== Workspace Crates ===\n");
+    // Extract the symbol graph from the workspace.
+    let symbol_graph = extract_symbol_graph(&db, &workspace_name);
 
-    // The crate graph includes ALL crates: workspace members plus all
-    // transitive dependencies from crates.io. For tarjanize, we only care
-    // about workspace members (the crates we're analyzing for splitting).
-    let crate_graph = db.crate_graph();
-
-    // Filter to workspace members using CrateOrigin. rust-analyzer tracks
-    // each crate's provenance: Local (workspace members), Library (crates.io
-    // dependencies), Lang (std/core/alloc), or Rustc (compiler crates).
-    let workspace_crates: Vec<_> = crate_graph
-        .iter()
-        .filter(|&krate| crate_graph[krate].origin.is_local())
-        .collect();
-
-    println!(
-        "Found {} workspace crate(s) ({} total including external dependencies):\n",
-        workspace_crates.len(),
-        crate_graph.len()
+    eprintln!(
+        "Extracted {} crate(s) with {} edges",
+        symbol_graph.crates.len(),
+        symbol_graph.edges.len()
     );
 
-    for krate in workspace_crates {
-        let hir_crate = Crate::from(krate);
-        visit_crate(&sema, hir_crate);
-    }
+    // Serialize to JSON and print to stdout.
+    // Using stdout for the JSON allows piping to other tools (jq, etc.)
+    // while keeping status messages on stderr.
+    let json = serde_json::to_string_pretty(&symbol_graph)?;
+    println!("{}", json);
 
     Ok(())
 }

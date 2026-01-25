@@ -3,5 +3,5 @@
 version = 4
 
 [[package]]
-name = "method_resolution"
+name = "dependency_detection"
 version = "0.1.0"
