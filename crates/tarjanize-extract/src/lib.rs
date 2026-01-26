@@ -161,24 +161,19 @@ mod tests {
 
     use super::*;
 
-    #[test]
     /// run() should read a real Cargo project and produce reasonable output.
-    fn test_run() -> anyhow::Result<()> {
-        // Given a real Cargo crate fixture...
+    #[test]
+    fn test_run() {
         let fixture = PathBuf::from("tests/fixtures/minimal_crate");
-
-        // When we run the extraction...
         let mut output = Vec::new();
-        run(&fixture, &mut output)?;
 
-        // Then the output should parse as a symbol graph with the expected
-        // crate. We don't bother checking the full contents here, since we
-        // have test coverage in the submodules.
-        let graph: SymbolGraph = serde_json::from_slice(&output)?;
+        run(&fixture, &mut output).expect("run() should succeed");
+
+        let graph: SymbolGraph = serde_json::from_slice(&output)
+            .expect("run() should output valid JSON");
         assert!(
             graph.crates.contains_key("minimal_crate"),
-            "output should contain minimal_crate"
+            "JSON output should contain minimal_crate"
         );
-        Ok(())
     }
 }

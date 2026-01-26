@@ -62,3 +62,32 @@ pub(crate) fn extract_crate(
 
     Ok((crate_name, module, edges))
 }
+
+#[cfg(test)]
+mod tests {
+    use ra_ap_hir::{Crate, Semantics};
+    use ra_ap_ide_db::RootDatabase;
+    use ra_ap_test_fixture::WithFixture;
+
+    use super::*;
+
+    #[test]
+    fn test_extract_crate_returns_name_and_symbols() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+"#,
+        );
+
+        let krate = Crate::all(&db)
+            .into_iter()
+            .find(|k| k.origin(&db).is_local())
+            .expect("should have a local crate");
+
+        let sema = Semantics::new(&db);
+        let (name, _, _) =
+            extract_crate(&sema, krate).expect("extraction should succeed");
+
+        assert_eq!(name, "test_crate");
+    }
+}

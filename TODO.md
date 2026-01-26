@@ -74,14 +74,18 @@
 
 #### Tests
 
-- [ ] `test_load_nonexistent_path`
-- [ ] `test_load_workspace_and_extract`
+- [x] `test_load_workspace_succeeds`
+- [x] `test_load_workspace_fails_for_nonexistent_path`
 
 ### crates.rs
 
 #### Production Code
 
-- [ ] `extract_crate()`
+- [x] `extract_crate()`
+
+#### Tests
+
+- [x] `test_extract_crate_returns_name_and_symbols`
 
 ### modules.rs
 
@@ -96,7 +100,7 @@
 - [ ] `impl_name()`
 - [ ] `module_def_kind_str()`
 - [ ] `module_def_path()`
-- [ ] `dependency_path()`
+- [ ] `definition_path()`
 - [ ] `impl_path()`
 - [ ] `compute_relative_file_path()`
 - [ ] `extract_visibility()`
@@ -109,8 +113,7 @@
 
 #### Production Code
 
-- [ ] `Dependency` enum + `From` impls
-- [ ] `is_local_dep()`
+- [ ] `is_local_def()`
 - [ ] `is_local()`
 - [ ] `find_dependencies()`
 - [ ] `find_node_in_file()`
@@ -118,6 +121,8 @@
 - [ ] `collect_path_deps()`
 - [ ] `normalize_module_def()`
 - [ ] `collapse_assoc_item()`
+- [ ] `variant_def_to_adt_def()`
+- [ ] `normalize_definition()`
 - [ ] `collect_expr_deps()`
 - [ ] `find_impl_dependencies()`
 - [ ] `ImplDependencies` struct

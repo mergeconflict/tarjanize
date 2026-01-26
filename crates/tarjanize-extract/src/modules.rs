@@ -16,47 +16,21 @@
 use std::collections::{HashMap, HashSet};
 
 use ra_ap_base_db::VfsPath;
-use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::symbols::SymbolCollector;
 use ra_ap_hir::{
     DisplayTarget, HasSource, HasVisibility, HirDisplay, HirFileId, Impl,
     Module as HirModule, ModuleDef, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
+use ra_ap_ide_db::defs::Definition;
 use ra_ap_syntax::AstNode;
 use tarjanize_schemas::{Edge, Module, Symbol, SymbolKind};
 use tracing::warn;
 
 use crate::dependencies::{
-    Dependency, find_dependencies, find_impl_dependencies, is_local,
-    is_local_dep,
+    find_dependencies, find_impl_dependencies, is_local, is_local_def,
 };
 use crate::file_path;
-
-/// Extract the containing module from a ModuleDef.
-///
-/// Most ModuleDef variants have a `.module(db)` method, but the API isn't
-/// uniform (Module IS the module, BuiltinType has no module). This helper
-/// provides a single function that works for all variants.
-///
-/// Returns None for BuiltinType (language primitives like i32, bool).
-pub(crate) fn module_def_module(
-    db: &dyn HirDatabase,
-    def: &ModuleDef,
-) -> Option<HirModule> {
-    match def {
-        ModuleDef::Module(m) => Some(*m),
-        ModuleDef::Function(f) => Some(f.module(db)),
-        ModuleDef::Adt(adt) => Some(adt.module(db)),
-        ModuleDef::Variant(v) => Some(v.module(db)),
-        ModuleDef::Const(c) => Some(c.module(db)),
-        ModuleDef::Static(s) => Some(s.module(db)),
-        ModuleDef::Trait(t) => Some(t.module(db)),
-        ModuleDef::TypeAlias(t) => Some(t.module(db)),
-        ModuleDef::Macro(m) => Some(m.module(db)),
-        ModuleDef::BuiltinType(_) => None,
-    }
-}
 
 /// Extract a module and its contents as a Module.
 ///
@@ -120,18 +94,13 @@ fn build_module_path(
     module: &HirModule,
     crate_name: &str,
 ) -> String {
-    // Collect module names from root to this module by walking up the tree.
-    let mut parts = Vec::new();
-    let mut current = Some(*module);
-
-    while let Some(m) = current {
-        if let Some(name) = m.name(db) {
-            parts.push(name.as_str().to_owned());
-        }
-        current = m.parent(db);
-    }
-
-    parts.reverse();
+    let parts: Vec<_> = module
+        .path_to_root(db)
+        .into_iter()
+        .rev()
+        .filter_map(|m| m.name(db))
+        .map(|n| n.as_str().to_owned())
+        .collect();
 
     if parts.is_empty() {
         crate_name.to_string()
@@ -222,8 +191,8 @@ fn extract_module_def(
     // Collect dependencies for this symbol, filtered to local workspace items.
     let deps = find_dependencies(sema, sym.def);
     for dep in deps {
-        if is_local_dep(db, &dep)
-            && let Some(dep_path) = dependency_path(db, &dep)
+        if is_local_def(db, &dep)
+            && let Some(dep_path) = definition_path(db, &dep)
         {
             edges.insert(Edge {
                 from: symbol_path.clone(),
@@ -304,15 +273,10 @@ fn extract_impl(
     // Per PLAN.md, we collapse these to the impl block - the impl depends on
     // whatever its methods depend on, but the methods aren't separate symbols.
     for item in impl_deps.items {
-        let item_def: ModuleDef = match item {
-            ra_ap_hir::AssocItem::Function(f) => f.into(),
-            ra_ap_hir::AssocItem::Const(c) => c.into(),
-            ra_ap_hir::AssocItem::TypeAlias(t) => t.into(),
-        };
-        let item_deps = find_dependencies(sema, item_def);
+        let item_deps = find_dependencies(sema, item.into());
         for dep in item_deps {
-            if is_local_dep(db, &dep)
-                && let Some(dep_path) = dependency_path(db, &dep)
+            if is_local_def(db, &dep)
+                && let Some(dep_path) = definition_path(db, &dep)
             {
                 edges.insert(Edge {
                     from: symbol_path.clone(),
@@ -379,46 +343,62 @@ fn module_def_kind_str(def: &ModuleDef) -> &'static str {
 ///
 /// Returns None for items without clear paths (e.g., built-in types).
 fn module_def_path(db: &RootDatabase, def: &ModuleDef) -> Option<String> {
-    let module = module_def_module(db, def)?;
+    let name = def.name(db)?;
+    let containing_module = def.module(db)?;
 
-    // Get the crate name.
-    let krate = module.krate(db);
-    let crate_name = krate
+    let crate_name = containing_module
+        .krate(db)
         .display_name(db)
         .map(|n| n.to_string())
         .unwrap_or_else(|| "(unnamed)".to_string());
 
-    // Build the module path.
-    let module_path = build_module_path(db, &module, &crate_name);
+    let module_path = build_module_path(db, &containing_module, &crate_name);
 
-    // Get the item name. Each variant has a different API for getting its name.
-    let name = match def {
-        ModuleDef::Module(m) => m.name(db).map(|n| n.as_str().to_owned()),
-        ModuleDef::Function(f) => Some(f.name(db).as_str().to_owned()),
-        ModuleDef::Adt(adt) => match adt {
-            ra_ap_hir::Adt::Struct(s) => Some(s.name(db).as_str().to_owned()),
-            ra_ap_hir::Adt::Enum(e) => Some(e.name(db).as_str().to_owned()),
-            ra_ap_hir::Adt::Union(u) => Some(u.name(db).as_str().to_owned()),
-        },
-        ModuleDef::Variant(v) => Some(v.name(db).as_str().to_owned()),
-        ModuleDef::Const(c) => c.name(db).map(|n| n.as_str().to_owned()),
-        ModuleDef::Static(s) => Some(s.name(db).as_str().to_owned()),
-        ModuleDef::Trait(t) => Some(t.name(db).as_str().to_owned()),
-        ModuleDef::TypeAlias(t) => Some(t.name(db).as_str().to_owned()),
-        ModuleDef::BuiltinType(_) => None,
-        ModuleDef::Macro(m) => Some(m.name(db).as_str().to_owned()),
-    }?;
-
-    Some(format!("{}::{}", module_path, name))
+    Some(format!("{}::{}", module_path, name.as_str()))
 }
 
-/// Returns the fully-qualified path for a Dependency.
+/// Returns the fully-qualified path for a Definition dependency target.
 ///
-/// This handles both ModuleDefs and Impls.
-fn dependency_path(db: &RootDatabase, dep: &Dependency) -> Option<String> {
-    match dep {
-        Dependency::ModuleDef(def) => module_def_path(db, def),
-        Dependency::Impl(impl_) => impl_path(db, impl_),
+/// This handles the normalized Definition variants that represent valid
+/// dependency targets. Other Definition variants (Module, BuiltinType, Local,
+/// etc.) should have been filtered out by `normalize_definition`.
+fn definition_path(db: &RootDatabase, def: &Definition) -> Option<String> {
+    match def {
+        // Impl blocks use special formatting.
+        Definition::SelfType(impl_) => impl_path(db, impl_),
+
+        // All other valid dependency targets are module-level definitions.
+        // Convert to ModuleDef for path computation.
+        Definition::Function(f) => {
+            module_def_path(db, &ModuleDef::Function(*f))
+        }
+        Definition::Adt(a) => module_def_path(db, &ModuleDef::Adt(*a)),
+        Definition::Const(c) => module_def_path(db, &ModuleDef::Const(*c)),
+        Definition::Static(s) => module_def_path(db, &ModuleDef::Static(*s)),
+        Definition::Trait(t) => module_def_path(db, &ModuleDef::Trait(*t)),
+        Definition::TypeAlias(ta) => {
+            module_def_path(db, &ModuleDef::TypeAlias(*ta))
+        }
+        Definition::Macro(m) => module_def_path(db, &ModuleDef::Macro(*m)),
+
+        // These should have been filtered out by normalize_definition.
+        // Return None rather than panicking to be defensive.
+        Definition::Module(_)
+        | Definition::Crate(_)
+        | Definition::Variant(_)
+        | Definition::Field(_)
+        | Definition::TupleField(_)
+        | Definition::BuiltinType(_)
+        | Definition::BuiltinLifetime(_)
+        | Definition::Local(_)
+        | Definition::GenericParam(_)
+        | Definition::Label(_)
+        | Definition::DeriveHelper(_)
+        | Definition::BuiltinAttr(_)
+        | Definition::ToolModule(_)
+        | Definition::ExternCrateDecl(_)
+        | Definition::InlineAsmRegOrRegClass(_)
+        | Definition::InlineAsmOperand(_) => None,
     }
 }
 

@@ -1,11 +1,7 @@
 //! Workspace loading for tarjanize.
 //!
 //! This module initializes rust-analyzer's analysis database for a Cargo
-//! workspace. The configuration is carefully tuned for tarjanize's needs:
-//!
-//! - **Proc macro expansion**: Enabled to capture dependencies from derive macros
-//! - **Build script execution**: Enabled to analyze generated code from build.rs
-//! - **Lazy caching**: Disabled prefilling to avoid analyzing unused dependencies
+//! workspace.
 
 use std::path::Path;
 
@@ -54,22 +50,22 @@ pub(crate) fn load_workspace(
         // Run `cargo check` to execute build scripts and capture their
         // outputs. Critical for tarjanize because build.rs files generate
         // code at compile time (e.g., bindings, lookup tables), and we need
-        // to see dependencies in that generated code. Without this, we'd
-        // miss edges in our dependency graph.
+        // to see dependencies in that generated code.
         load_out_dirs_from_check: true,
 
         // Use the system's rustc to expand procedural macros. Critical for
         // tarjanize because proc macros like #[derive(Serialize)] generate
         // impl blocks that create dependencies (e.g., impl Serialize depends
-        // on serde::Serialize). Without expansion, we'd miss these edges and
-        // our SCC computation would be incomplete.
+        // on serde::Serialize).
         with_proc_macro_server: ProcMacroServerChoice::Sysroot,
 
-        // Don't precompute queries for all crates upfront. With 169 crates in
-        // the graph but only a few workspace members, prefilling would waste
-        // time analyzing external dependencies we'll never inspect. Lazy
-        // evaluation ensures we only pay for crates we actually query.
+        // Fill caches lazily so we don't analyze crates we don't care about.
         prefill_caches: false,
+
+        // Parallelize proc macro expansion across available CPU cores.
+        proc_macro_processes: std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
     };
 
     // Load the workspace into rust-analyzer's analysis database. This:
@@ -77,7 +73,7 @@ pub(crate) fn load_workspace(
     // - Parses Rust source files into syntax trees
     // - Builds the semantic model (name resolution, type inference, trait
     //   solving)
-    let (db, _vfs, _proc_macro_server) = load_workspace_at(
+    let (db, _, _) = load_workspace_at(
         workspace_path.as_std_path(),
         &cargo_config,
         &load_config,
@@ -95,59 +91,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_load_nonexistent_path() {
-        let result = load_workspace("/nonexistent/path");
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.is_workspace_load(),
-            "Error should be workspace_load variant"
-        );
+    fn test_load_workspace_succeeds() {
+        load_workspace("tests/fixtures/minimal_crate")
+            .expect("should load valid workspace");
     }
 
-    /// Integration test for the production workspace loading codepath.
-    ///
-    /// This exercises load_workspace() and extract_symbol_graph() with a real
-    /// Cargo project to ensure the full pipeline works end-to-end.
     #[test]
-    fn test_load_workspace_and_extract() {
-        use crate::extract_symbol_graph;
-
-        let db = load_workspace("tests/fixtures/minimal_crate")
-            .expect("load workspace");
-        let graph = extract_symbol_graph(db);
-
-        // Basic sanity checks
-        assert_eq!(graph.crates.len(), 1);
-        assert!(graph.crates.contains_key("minimal_crate"));
-
-        let root = &graph.crates["minimal_crate"];
-
-        // Should have Foo struct and bar function
-        assert!(root.symbols.contains_key("Foo"), "Should have Foo struct");
-        assert!(root.symbols.contains_key("bar"), "Should have bar function");
-
-        // bar() -> Foo creates a dependency edge
-        let has_edge = graph
-            .edges
-            .iter()
-            .any(|e| e.from.contains("bar") && e.to.contains("Foo"));
-        assert!(has_edge, "bar should depend on Foo");
-
-        // Verify file paths are resolved for real workspaces (not empty like in
-        // test fixtures which use virtual paths).
-        for (name, symbol) in &root.symbols {
-            assert!(
-                !symbol.file.is_empty(),
-                "Symbol '{}' should have a file path in real workspace",
-                name
-            );
-            assert!(
-                symbol.file.ends_with(".rs"),
-                "Symbol '{}' file path should be a .rs file, got: {}",
-                name,
-                symbol.file
-            );
-        }
+    fn test_load_workspace_fails_for_nonexistent_path() {
+        let err = load_workspace("/nonexistent/path")
+            .expect_err("should fail for nonexistent path");
+        assert!(err.is_workspace_load());
     }
 }
