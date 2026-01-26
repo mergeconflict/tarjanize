@@ -118,8 +118,8 @@ mod tests {
     fn test_load_workspace_and_extract() {
         use crate::extract::extract_symbol_graph;
 
-        let (db, vfs) =
-            load_workspace("tests/fixtures/minimal_crate").expect("load workspace");
+        let (db, vfs) = load_workspace("tests/fixtures/minimal_crate")
+            .expect("load workspace");
         let graph = extract_symbol_graph(&db, &vfs, "minimal_crate");
 
         // Basic sanity checks

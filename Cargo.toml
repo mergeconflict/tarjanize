@@ -6,7 +6,6 @@ edition = "2024"
 [dependencies]
 mimalloc = { version = "0.1.48", features = ["v3"] }
 ra_ap_hir = "0.0.316"
-ra_ap_ide = "0.0.316"
 ra_ap_ide_db = "0.0.316"
 ra_ap_base_db = "0.0.316"
 ra_ap_project_model = "0.0.316"
