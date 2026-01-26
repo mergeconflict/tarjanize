@@ -4,9 +4,9 @@
 //! extraction. It handles crate-specific concerns like extracting the crate
 //! name from Cargo.toml and determining the crate root directory.
 //!
-//! The key insight is that a crate is conceptually just its root module with
-//! some additional metadata. This module extracts that metadata and delegates
-//! the actual symbol extraction to the `modules` module.
+//! A crate is conceptually just its root module with some additional metadata.
+//! This module extracts that metadata and delegates the actual symbol
+//! extraction to the `modules` module.
 
 use std::collections::HashSet;
 
@@ -18,11 +18,14 @@ use crate::error::ExtractError;
 use crate::file_path;
 use crate::modules::extract_module;
 
-/// Extract a crate as a SchemaModule (the crate root module).
+/// Extract a crate as a (name, SchemaModule) pair.
 ///
 /// A crate is represented as its root module, which contains all symbols
 /// and submodules. This unifies crates and modules in the schema - a crate
 /// is just a module with a name from Cargo.toml.
+///
+/// Returns the crate name separately because the schema uses HashMaps keyed
+/// by name rather than storing the name inside the Module struct.
 ///
 /// # Errors
 ///
@@ -34,7 +37,7 @@ pub(crate) fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
     edges: &mut HashSet<Edge>,
-) -> Result<SchemaModule, ExtractError> {
+) -> Result<(String, SchemaModule), ExtractError> {
     let db = sema.db;
 
     // All Cargo workspace crates must have names in Cargo.toml. A missing
@@ -54,11 +57,10 @@ pub(crate) fn extract_crate(
 
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);
-    Ok(extract_module(
-        sema,
-        &crate_root,
-        &root_module,
-        &crate_name,
-        edges,
-    ))
+    let (_, module) =
+        extract_module(sema, &crate_root, &root_module, &crate_name, edges);
+
+    // Return the crate name from Cargo.toml (not the module name, which may
+    // be empty for root modules).
+    Ok((crate_name, module))
 }

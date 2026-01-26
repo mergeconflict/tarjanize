@@ -812,9 +812,9 @@ pub fn uses_inner() -> inner::InnerType {
 
         // Check that submodule is extracted
         assert_eq!(graph.crates.len(), 1);
-        let root = &graph.crates[0];
+        let root = &graph.crates["test_crate"];
         assert!(
-            root.submodules.is_some(),
+            !root.submodules.is_empty(),
             "Root module should have submodules"
         );
     }
@@ -835,10 +835,11 @@ impl MyType {
         let graph = extract_symbol_graph(&db, "test_crate");
 
         // Find the impl symbol
-        let root = &graph.crates[0];
-        let has_inherent_impl =
-            root.symbols.iter().any(|s| s.name == "impl MyType");
-        assert!(has_inherent_impl, "Should have inherent impl 'impl MyType'");
+        let root = &graph.crates["test_crate"];
+        assert!(
+            root.symbols.contains_key("impl MyType"),
+            "Should have inherent impl 'impl MyType'"
+        );
 
         // The inherent impl should depend on its self type
         assert!(
@@ -866,31 +867,37 @@ pub mod inner {
         );
         let graph = extract_symbol_graph(&db, "test_crate");
 
-        let root = &graph.crates[0];
+        let root = &graph.crates["test_crate"];
 
         // Find the public function
-        let pub_fn = root.symbols.iter().find(|s| s.name == "public_fn");
-        assert!(pub_fn.is_some(), "Should have public_fn");
+        assert!(
+            root.symbols.contains_key("public_fn"),
+            "Should have public_fn"
+        );
         if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &pub_fn.unwrap().kind
+            &root.symbols["public_fn"].kind
         {
             assert_eq!(visibility.as_deref(), Some("pub"));
         }
 
         // Find the pub(crate) function
-        let pub_crate = root.symbols.iter().find(|s| s.name == "pub_crate_fn");
-        assert!(pub_crate.is_some(), "Should have pub_crate_fn");
+        assert!(
+            root.symbols.contains_key("pub_crate_fn"),
+            "Should have pub_crate_fn"
+        );
         if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &pub_crate.unwrap().kind
+            &root.symbols["pub_crate_fn"].kind
         {
             assert_eq!(visibility.as_deref(), Some("pub(crate)"));
         }
 
         // Find the private function (should have no visibility)
-        let priv_fn = root.symbols.iter().find(|s| s.name == "private_fn");
-        assert!(priv_fn.is_some(), "Should have private_fn");
+        assert!(
+            root.symbols.contains_key("private_fn"),
+            "Should have private_fn"
+        );
         if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &priv_fn.unwrap().kind
+            &root.symbols["private_fn"].kind
         {
             assert!(
                 visibility.is_none(),
@@ -899,21 +906,17 @@ pub mod inner {
         }
 
         // Find the pub(super) function in inner module
-        let inner = root
-            .submodules
-            .as_ref()
-            .unwrap()
-            .iter()
-            .find(|m| m.name == "inner");
-        assert!(inner.is_some(), "Should have inner module");
-        let pub_super = inner
-            .unwrap()
-            .symbols
-            .iter()
-            .find(|s| s.name == "pub_super_fn");
-        assert!(pub_super.is_some(), "Should have pub_super_fn");
+        assert!(
+            root.submodules.contains_key("inner"),
+            "Should have inner module"
+        );
+        let inner = &root.submodules["inner"];
+        assert!(
+            inner.symbols.contains_key("pub_super_fn"),
+            "Should have pub_super_fn"
+        );
         if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &pub_super.unwrap().kind
+            &inner.symbols["pub_super_fn"].kind
         {
             assert_eq!(
                 visibility.as_deref(),

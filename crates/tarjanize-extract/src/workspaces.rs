@@ -132,15 +132,13 @@ mod tests {
         // Basic sanity checks
         assert_eq!(graph.workspace_name, "minimal_crate");
         assert_eq!(graph.crates.len(), 1);
+        assert!(graph.crates.contains_key("minimal_crate"));
 
-        let root = &graph.crates[0];
-        assert_eq!(root.name, "minimal_crate");
+        let root = &graph.crates["minimal_crate"];
 
         // Should have Foo struct and bar function
-        let symbol_names: Vec<_> =
-            root.symbols.iter().map(|s| s.name.as_str()).collect();
-        assert!(symbol_names.contains(&"Foo"), "Should have Foo struct");
-        assert!(symbol_names.contains(&"bar"), "Should have bar function");
+        assert!(root.symbols.contains_key("Foo"), "Should have Foo struct");
+        assert!(root.symbols.contains_key("bar"), "Should have bar function");
 
         // bar() -> Foo creates a dependency edge
         let has_edge = graph
@@ -151,16 +149,16 @@ mod tests {
 
         // Verify file paths are resolved for real workspaces (not empty like in
         // test fixtures which use virtual paths).
-        for symbol in &root.symbols {
+        for (name, symbol) in &root.symbols {
             assert!(
                 !symbol.file.is_empty(),
                 "Symbol '{}' should have a file path in real workspace",
-                symbol.name
+                name
             );
             assert!(
                 symbol.file.ends_with(".rs"),
                 "Symbol '{}' file path should be a .rs file, got: {}",
-                symbol.name,
+                name,
                 symbol.file
             );
         }

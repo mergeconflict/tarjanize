@@ -4,11 +4,8 @@
 //! and output formats. These types are serialized to JSON and represent the
 //! various artifacts produced by tarjanize's pipeline:
 //!
-//! - **Symbol Graph**: The dependency graph extracted from rust-analyzer
-//! - **Condensed Graph**: The graph after SCC computation (future)
-//! - **Optimized Graph**: The graph after partitioning (future)
-//!
-//! ## Design Principles
+//! - **Symbol Graph**: The full dependency graph extracted from rust-analyzer
+//! - **Condensed Graph**: The condensation graph after SCC computation (TODO)
 //!
 //! The schemas are designed to be:
 //! - **Self-describing**: JSON Schema is auto-generated from Rust types

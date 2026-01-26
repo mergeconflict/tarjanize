@@ -30,7 +30,7 @@ mod error;
 mod modules;
 mod workspaces;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 
@@ -109,11 +109,13 @@ pub fn extract_symbol_graph(
             .collect();
 
         let mut edges = HashSet::new();
-        let mut crates = Vec::new();
+        let mut crates = HashMap::new();
 
         for krate in workspace_crates {
             match extract_crate(&sema, krate, &mut edges) {
-                Ok(crate_module) => crates.push(crate_module),
+                Ok((name, crate_module)) => {
+                    crates.insert(name, crate_module);
+                }
                 Err(e) => {
                     let name = krate
                         .display_name(db)
@@ -243,9 +245,9 @@ pub struct World;
 
         assert_eq!(graph.workspace_name, "test_workspace");
         assert_eq!(graph.crates.len(), 1);
-        assert_eq!(graph.crates[0].name, "test_crate");
+        assert!(graph.crates.contains_key("test_crate"));
         // Should have at least the function and struct.
-        assert!(graph.crates[0].symbols.len() >= 2);
+        assert!(graph.crates["test_crate"].symbols.len() >= 2);
     }
 
     // Test extract_symbol_graph with multiple crates.

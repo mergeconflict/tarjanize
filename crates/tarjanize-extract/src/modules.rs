@@ -13,7 +13,7 @@
 //! This module works closely with `dependencies.rs` which handles the actual
 //! dependency analysis for individual symbols.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ra_ap_base_db::VfsPath;
 use ra_ap_hir::db::HirDatabase;
@@ -60,6 +60,10 @@ pub(crate) fn module_def_module(
 
 /// Extract a module and its contents as a SchemaModule.
 ///
+/// Returns a tuple of (module_name, module). The name is stored separately
+/// because the schema uses HashMaps keyed by name rather than storing the
+/// name inside the Module struct.
+///
 /// This function recursively processes a module, extracting:
 /// - All symbols (ModuleDefs and impl blocks)
 /// - Child submodules
@@ -74,7 +78,7 @@ pub(crate) fn extract_module(
     module: &Module,
     crate_name: &str,
     edges: &mut HashSet<Edge>,
-) -> SchemaModule {
+) -> (String, SchemaModule) {
     let db = sema.db;
 
     // Module name: use crate name for root module, otherwise use module name.
@@ -90,25 +94,21 @@ pub(crate) fn extract_module(
     let symbols =
         extract_symbols(sema, crate_root, module, &module_path, edges);
 
-    // Recursively extract child modules.
-    let children: Vec<_> = module
+    // Recursively extract child modules into a HashMap keyed by name.
+    let submodules: HashMap<String, SchemaModule> = module
         .children(db)
         .map(|child| {
             extract_module(sema, crate_root, &child, crate_name, edges)
         })
         .collect();
 
-    let submodules = if children.is_empty() {
-        None
-    } else {
-        Some(children)
-    };
-
-    SchemaModule {
-        name: module_name,
-        symbols,
-        submodules,
-    }
+    (
+        module_name,
+        SchemaModule {
+            symbols,
+            submodules,
+        },
+    )
 }
 
 /// Build the fully-qualified path to a module (e.g., "mycrate::foo::bar").
@@ -141,15 +141,19 @@ fn build_module_path(
 }
 
 /// Extract all symbols from a module (ModuleDefs and impl blocks).
+///
+/// Returns a HashMap keyed by symbol name. Multiple impl blocks with the same
+/// signature (e.g., two `impl Foo` blocks) are merged into a single Symbol
+/// with combined cost.
 fn extract_symbols(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
     module: &Module,
     module_path: &str,
     edges: &mut HashSet<Edge>,
-) -> Vec<Symbol> {
+) -> HashMap<String, Symbol> {
     let db = sema.db;
-    let mut symbols = Vec::new();
+    let mut symbols = HashMap::new();
 
     // Extract ModuleDef symbols using SymbolCollector.
     // SymbolCollector gathers all named items defined in this module.
@@ -157,27 +161,34 @@ fn extract_symbols(
     let collected = SymbolCollector::new_module(db, *module, false);
 
     for sym in collected {
-        if let Some(symbol) =
+        if let Some((name, symbol)) =
             extract_module_def(sema, crate_root, &sym, module_path, edges)
         {
-            symbols.push(symbol);
+            symbols.insert(name, symbol);
         }
     }
 
     // Extract impl blocks separately - they're not ModuleDefs but are still
     // important compilation units with their own dependencies.
+    // Multiple impl blocks with the same name are merged (costs summed).
     for impl_ in module.impl_defs(db) {
-        if let Some(symbol) =
+        if let Some((name, symbol)) =
             extract_impl(sema, crate_root, impl_, module_path, edges)
         {
-            symbols.push(symbol);
+            symbols
+                .entry(name)
+                .and_modify(|existing| {
+                    // Merge: sum the costs. Keep the existing file and kind.
+                    existing.cost += symbol.cost;
+                })
+                .or_insert(symbol);
         }
     }
 
     symbols
 }
 
-/// Extract a single ModuleDef as a Symbol.
+/// Extract a single ModuleDef as a (name, Symbol) pair.
 ///
 /// Returns None for items we skip (e.g., built-in types).
 fn extract_module_def(
@@ -186,7 +197,7 @@ fn extract_module_def(
     sym: &ra_ap_hir::symbols::FileSymbol,
     module_path: &str,
     edges: &mut HashSet<Edge>,
-) -> Option<Symbol> {
+) -> Option<(String, Symbol)> {
     let db = sema.db;
 
     let kind = module_def_kind_str(&sym.def);
@@ -224,25 +235,27 @@ fn extract_module_def(
     // Extract visibility from the ModuleDef.
     let visibility = extract_visibility(db, &sym.def);
 
-    Some(Symbol {
+    Some((
         name,
-        file,
-        cost,
-        kind: SymbolKind::ModuleDef {
-            kind: kind.to_string(),
-            visibility,
+        Symbol {
+            file,
+            cost,
+            kind: SymbolKind::ModuleDef {
+                kind: kind.to_string(),
+                visibility,
+            },
         },
-    })
+    ))
 }
 
-/// Extract an impl block as a Symbol.
+/// Extract an impl block as a (name, Symbol) pair.
 fn extract_impl(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
     impl_: Impl,
     module_path: &str,
     edges: &mut HashSet<Edge>,
-) -> Option<Symbol> {
+) -> Option<(String, Symbol)> {
     let db = sema.db;
 
     let name = impl_name(db, &impl_);
@@ -309,15 +322,17 @@ fn extract_impl(
         }
     }
 
-    Some(Symbol {
+    Some((
         name,
-        file,
-        cost,
-        kind: SymbolKind::Impl {
-            self_type: self_type_path,
-            trait_: trait_path,
+        Symbol {
+            file,
+            cost,
+            kind: SymbolKind::Impl {
+                self_type: self_type_path,
+                trait_: trait_path,
+            },
         },
-    })
+    ))
 }
 
 /// Build the display name for an impl block.
@@ -523,19 +538,17 @@ make_fn!(generated_function);
         let graph = extract_symbol_graph(&db, "test_crate");
 
         // Find the generated function
-        let root = &graph.crates[0];
-        let generated =
-            root.symbols.iter().find(|s| s.name == "generated_function");
+        let root = &graph.crates["test_crate"];
 
         assert!(
-            generated.is_some(),
+            root.symbols.contains_key("generated_function"),
             "Should find macro-generated function. Found symbols: {:?}",
-            root.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+            root.symbols.keys().collect::<Vec<_>>()
         );
 
         // File path should trace back to the source file containing the macro
         // invocation, not be empty.
-        let symbol = generated.unwrap();
+        let symbol = &root.symbols["generated_function"];
         assert_eq!(
             symbol.file, "lib.rs",
             "Macro-generated symbol should have file path relative to crate root"

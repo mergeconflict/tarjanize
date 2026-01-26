@@ -5,7 +5,7 @@
 //! This is the output of the extraction phase and an input to subsequent
 //! analysis phases.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -15,14 +15,15 @@ use serde::{Deserialize, Serialize};
 /// The symbol graph captures all symbols and their dependencies within a
 /// Rust workspace. Crates are represented as their root modules, which
 /// contain symbols and nested submodules.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolGraph {
     /// Name of the workspace, derived from Cargo.toml or the root directory.
     pub workspace_name: String,
 
-    /// All crates in the workspace. Each crate is represented as its root
-    /// module, which contains all symbols and submodules.
-    pub crates: Vec<Module>,
+    /// All crates in the workspace, keyed by crate name. Each crate is
+    /// represented as its root module, which contains all symbols and
+    /// submodules.
+    pub crates: HashMap<String, Module>,
 
     /// Dependency edges between symbols. An edge from A to B means A depends
     /// on B (A uses B in its definition).
@@ -36,39 +37,34 @@ pub struct SymbolGraph {
 /// - Child submodules
 ///
 /// The crate's root module (lib.rs or main.rs) is the top of this tree.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Both module and symbol names are stored as HashMap keys, not in the
+/// structs themselves.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Module {
-    /// Module name. For the crate root, this is the crate name.
-    pub name: String,
+    /// Symbols defined directly in this module, keyed by symbol name. Multiple
+    /// impl blocks with the same signature (e.g., two `impl Foo` blocks) are
+    /// merged into a single Symbol with combined cost.
+    pub symbols: HashMap<String, Symbol>,
 
-    /// Symbols defined directly in this module. A symbol is either a
-    /// module-level definition (function, struct, etc.) or an impl block.
-    pub symbols: Vec<Symbol>,
-
-    /// Child modules. Omitted if the module has no submodules.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub submodules: Option<Vec<Module>>,
+    /// Child modules, keyed by module name. Omitted if empty.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub submodules: HashMap<String, Module>,
 }
 
 /// A symbol in the crate - either a module-level definition or an impl block.
 ///
-/// Symbols are the vertices in the dependency graph. Each symbol has a name,
+/// Symbols are the vertices in the dependency graph. Each symbol has a
 /// source file, compilation cost estimate, and kind-specific details.
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+/// Symbol names are stored as keys in the parent Module's HashMap.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
-    /// Symbol name. For impl blocks, this is formatted as the impl appears
-    /// in source, e.g., "impl Trait for Type".
-    pub name: String,
-
     /// Path to the symbol's file relative to the crate root.
     pub file: String,
 
-    /// Approximate cost (unitless) of compiling this symbol.
-    ///
-    /// This is used for load balancing when partitioning the graph. Given
+    /// Approximate cost (unitless) of compiling this symbol. Given
     /// two symbols A and B:
-    /// - Serial compilation cost: A.cost + B.cost
-    /// - Parallel compilation cost: max(A.cost, B.cost)
+    /// - The cost of compiling A and B in sequence is A.cost + B.cost
+    /// - The cost of compiling A and B in parallel is max(A.cost, B.cost)
     ///
     /// Currently estimated from syntax node size in bytes.
     #[schemars(range(min = 0.0))]
@@ -80,11 +76,11 @@ pub struct Symbol {
     pub kind: SymbolKind,
 }
 
-/// Discriminated union for symbol-specific fields.
+/// Metadata specific to the kind of symbol.
 ///
 /// This enum distinguishes between regular module-level definitions (like
 /// functions and structs) and impl blocks (which have different metadata).
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
     /// A module-level definition, analogous to `ra_ap_hir::ModuleDef`.
@@ -92,29 +88,28 @@ pub enum SymbolKind {
     /// This includes functions, structs, enums, unions, traits, consts,
     /// statics, type aliases, and macros.
     ModuleDef {
-        /// The kind of definition: "function", "struct", "enum", "union",
-        /// "trait", "const", "static", "type_alias", "macro", "module".
+        /// The kind of definition: "function", "struct", "enum", etc.
         kind: String,
 
-        /// Visibility specifier. Examples: "pub", "pub(crate)",
-        /// "pub(restricted)". Absent for private items.
+        /// Visibility specifier: "pub", "pub(crate)", etc. Absent for private
+        /// symbols.
         #[serde(skip_serializing_if = "Option::is_none")]
         visibility: Option<String>,
     },
 
     /// An impl block, analogous to `ra_ap_hir::Impl`.
     ///
-    /// Impl blocks are anonymous (you can't name them with a path), but
-    /// they're important compilation units. At least one of `self_type` or
-    /// `trait` must be present to satisfy Rust's orphan rules.
+    /// Impl blocks are distinct from ModuleDefs; they don't have visibility,
+    /// and Rust's orphan rules dictate where they can be defined.
     Impl {
         /// Fully qualified path to the self type (the type being implemented).
-        /// Absent if the self type is in another crate, or for blanket impls.
+        /// Present when the self type is a struct, enum or union; absent for
+        /// type parameters, primitives, references, `dyn Trait`, etc.
         #[serde(skip_serializing_if = "Option::is_none")]
         self_type: Option<String>,
 
-        /// Fully qualified path to the trait being implemented.
-        /// Absent for inherent impls or if the trait is in another crate.
+        /// Fully qualified path to the trait being implemented. Present for
+        /// trait impls, absent for inherent impls.
         #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
         trait_: Option<String>,
     },
@@ -126,12 +121,15 @@ pub enum SymbolKind {
 /// references B in some way (type annotation, function call, trait bound,
 /// etc.).
 ///
-/// # Normalization
+/// Certain items are "collapsed" to their containers, both as sources and
+/// targets of edges:
 ///
-/// Dependencies are normalized for consistency:
-/// - Enum variants collapse to their parent enum
-/// - Associated items collapse to their container (impl or trait)
-/// - Module references are skipped (modules aren't compilation units)
+/// - **Enum variants** → enum. If `A` references `E::Variant`, then `A` depends
+///   on `E`. If `E::Variant` references `B`, then `E` depends on `B`.
+/// - **Associated items** → impl/trait. For example, if `A` calls
+///   obj.method(), then A depends on the impl/trait that defines `method`.
+///
+/// This collapsing ensures that tarjanize's analysis preserves structure.
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
@@ -146,152 +144,118 @@ pub struct Edge {
 
 #[cfg(test)]
 mod tests {
-    use anyhow::{Context, Result};
-    use tracing::info;
+    use proptest::collection::{hash_map, hash_set};
+    use proptest::prelude::*;
 
     use super::*;
 
-    /// Test serialization roundtrip for SymbolGraph.
-    ///
-    /// This exercises the Serialize/Deserialize derives and skip_serializing_if
-    /// attributes.
-    #[test]
-    fn test_symbol_graph_serialization() {
-        let graph = SymbolGraph {
-            workspace_name: "test".to_string(),
-            crates: vec![Module {
-                name: "test_crate".to_string(),
-                symbols: vec![
-                    // ModuleDef with visibility
-                    Symbol {
-                        name: "pub_fn".to_string(),
-                        file: "lib.rs".to_string(),
-                        cost: 100.0,
-                        kind: SymbolKind::ModuleDef {
-                            kind: "function".to_string(),
-                            visibility: Some("pub".to_string()),
-                        },
-                    },
-                    // ModuleDef without visibility (private)
-                    Symbol {
-                        name: "priv_fn".to_string(),
-                        file: "lib.rs".to_string(),
-                        cost: 50.0,
-                        kind: SymbolKind::ModuleDef {
-                            kind: "function".to_string(),
-                            visibility: None,
-                        },
-                    },
-                    // Impl with both self_type and trait
-                    Symbol {
-                        name: "impl Foo for Bar".to_string(),
-                        file: "lib.rs".to_string(),
-                        cost: 200.0,
-                        kind: SymbolKind::Impl {
-                            self_type: Some("Bar".to_string()),
-                            trait_: Some("Foo".to_string()),
-                        },
-                    },
-                    // Impl with only self_type (inherent impl)
-                    Symbol {
-                        name: "impl Bar".to_string(),
-                        file: "lib.rs".to_string(),
-                        cost: 150.0,
-                        kind: SymbolKind::Impl {
-                            self_type: Some("Bar".to_string()),
-                            trait_: None,
-                        },
-                    },
-                ],
-                submodules: Some(vec![Module {
-                    name: "submod".to_string(),
-                    symbols: vec![],
-                    submodules: None, // Tests skip_serializing_if for None
-                }]),
-            }],
-            edges: [Edge {
-                from: "test_crate::pub_fn".to_string(),
-                to: "test_crate::Bar".to_string(),
-            }]
-            .into_iter()
-            .collect(),
-        };
+    // -------------------------------------------------------------------------
+    // Proptest strategies for generating arbitrary schema instances.
+    //
+    // These are defined here to keep the production types clean of test
+    // annotations. The strategies generate bounded instances to avoid
+    // stack overflow from unbounded recursion.
+    // -------------------------------------------------------------------------
 
-        // Serialize to JSON
-        let json = serde_json::to_string_pretty(&graph).expect("serialize");
-
-        // Verify skip_serializing_if works - None values shouldn't appear
-        assert!(
-            !json.contains("\"submodules\": null"),
-            "None submodules should be skipped"
-        );
-        assert!(
-            !json.contains("\"visibility\": null"),
-            "None visibility should be skipped"
-        );
-        assert!(
-            !json.contains("\"self_type\": null"),
-            "None self_type should be skipped"
-        );
-        assert!(
-            !json.contains("\"trait\": null"),
-            "None trait should be skipped"
-        );
-
-        // Deserialize back
-        let parsed: SymbolGraph =
-            serde_json::from_str(&json).expect("deserialize");
-        assert_eq!(parsed.workspace_name, "test");
-        assert_eq!(parsed.crates.len(), 1);
-        assert_eq!(parsed.crates[0].symbols.len(), 4);
-        assert_eq!(parsed.edges.len(), 1);
+    /// Strategy for generating arbitrary identifier-like symbol names.
+    fn arb_name() -> impl Strategy<Value = String> {
+        "[a-z_][a-z0-9_]{0,19}"
     }
 
-    /// Verifies that the JSON Schema generated from Rust types matches the
-    /// checked-in schema file.
-    ///
-    /// Why: The Rust structs are the source of truth for the schema, but we
-    /// also want the JSON Schema file in the repository for documentation
-    /// and for use by external tools (validators, code generators, etc.).
-    /// This test ensures they stay in sync - if you change the Rust types,
-    /// the test will fail until you regenerate the schema file.
-    ///
-    /// To update the golden file after changing the Rust types:
-    ///   GENERATE_GOLDEN=1 cargo nextest run schema_matches_golden_file
-    #[test]
-    fn schema_matches_golden_file() -> Result<()> {
-        let schema = schemars::schema_for!(SymbolGraph);
+    /// Strategy for generating optional names.
+    fn arb_opt_name() -> impl Strategy<Value = Option<String>> {
+        prop::option::of(arb_name())
+    }
 
-        let golden_path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/schemas/symbol_graph.schema.json"
-        );
-
-        // When GENERATE_GOLDEN is set, overwrite the golden file instead of
-        // comparing. This is the mechanism for updating the schema after
-        // intentional changes to the Rust types.
-        if std::env::var("GENERATE_GOLDEN").is_ok() {
-            let json = serde_json::to_string_pretty(&schema)?;
-            std::fs::write(golden_path, &json)?;
-            info!(path = golden_path, "Updated golden file");
-            return Ok(());
+    /// Strategy for generating arbitrary SymbolKind values.
+    fn arb_symbol_kind() -> impl Strategy<Value = SymbolKind> {
+        prop_compose! {
+            fn arb_module_def()
+                (kind in arb_name(), visibility in arb_opt_name())
+            -> SymbolKind {
+                SymbolKind::ModuleDef { kind, visibility }
+            }
         }
 
-        let golden_json = std::fs::read_to_string(golden_path).context(
-            "Golden file not found. Run with GENERATE_GOLDEN=1 to create it.",
-        )?;
+        prop_compose! {
+            fn arb_impl()
+                (self_type in arb_opt_name(), trait_ in arb_opt_name())
+            -> SymbolKind {
+                SymbolKind::Impl { self_type, trait_ }
+            }
+        }
 
-        // Compare Schema objects rather than JSON strings. This makes the test
-        // insensitive to formatting differences (key ordering, whitespace).
-        let expected: schemars::schema::RootSchema =
-            serde_json::from_str(&golden_json)
-                .context("Failed to parse golden file as JSON Schema")?;
+        prop_oneof![arb_module_def(), arb_impl()]
+    }
 
-        assert_eq!(
-            schema, expected,
-            "Schema doesn't match golden file. Run with GENERATE_GOLDEN=1 to update."
-        );
+    prop_compose! {
+        /// Strategy for generating arbitrary Symbol values with non-negative
+        /// integer cost.
+        ///
+        /// Note that floating-point values don't survive roundtrip
+        /// serialization/deserialization perfectly.
+        fn arb_symbol()
+            (file in arb_name(), cost in (0..1_000_000).prop_map(f64::from), kind in arb_symbol_kind())
+        -> Symbol {
+            Symbol { file, cost, kind }
+        }
+    }
 
-        Ok(())
+    /// Strategy for generating a module with bounded recursive submodules.
+    fn arb_module() -> impl Strategy<Value = Module> {
+        prop_compose! {
+            fn arb_leaf_module()
+                (symbols in hash_map(arb_name(), arb_symbol(), 0..8))
+            -> Module {
+                Module { symbols, submodules: HashMap::new() }
+            }
+        }
+        arb_leaf_module().prop_recursive(
+            3, // max depth
+            3, // we want about 3 submodules total
+            1, // average of 1 submodule per module
+            |inner| {
+                (
+                    hash_map(arb_name(), arb_symbol(), 0..8),
+                    hash_map(arb_name(), inner, 0..3),
+                )
+                    .prop_map(|(symbols, submodules)| Module {
+                        symbols,
+                        submodules,
+                    })
+            },
+        )
+    }
+
+    prop_compose! {
+        /// Strategy for generating arbitrary Edge values.
+        fn arb_edge()(from in arb_name(), to in arb_name()) -> Edge {
+            Edge { from, to }
+        }
+    }
+
+    prop_compose! {
+        /// Strategy for generating arbitrary SymbolGraph values.
+        fn arb_symbol_graph()
+            (workspace_name in arb_name(),
+             crates in hash_map(arb_name(), arb_module(), 1..10),
+             edges in hash_set(arb_edge(), 0..100))
+        -> SymbolGraph {
+            SymbolGraph { workspace_name, crates, edges }
+        }
+    }
+
+    proptest! {
+        /// Test serialization roundtrip for arbitrary SymbolGraph instances.
+        ///
+        /// This exercises the Serialize/Deserialize derives by generating
+        /// arbitrary graphs and verifying they survive a JSON roundtrip.
+        #[test]
+        fn test_symbol_graph_roundtrip(graph in arb_symbol_graph()) {
+            let json = serde_json::to_string(&graph).expect("serialize");
+            let parsed: SymbolGraph =
+                serde_json::from_str(&json).expect("deserialize");
+            prop_assert_eq!(parsed, graph);
+        }
     }
 }

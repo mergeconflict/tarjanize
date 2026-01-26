@@ -55,7 +55,7 @@ fn main() -> Result<()> {
             workspace_path,
             output,
         } => {
-            // Lock stdout once upfront rather than on each write call.
+            // Lock stdout once up front rather than on each write call.
             // Stdout must outlive the lock, so we bind it here first.
             let stdout = std::io::stdout();
             let mut writer: Box<dyn Write> = match output {

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 4997deac09de95ac97490b6d3e78d79149fc0e4a22c70b62281da18d6d4e9683 # shrinks to graph = SymbolGraph { workspace_name: "_", crates: {"a": Module { symbols: {"a": Symbol { file: "a", cost: 1.1667857884449827e308, kind: ModuleDef { kind: "_", visibility: None } }}, submodules: {} }}, edges: {} }

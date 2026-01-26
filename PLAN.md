@@ -643,7 +643,7 @@ An SCC is merged into its dependents' crate **if all its dependents are already 
 
 **Important**: To achieve this near-linear time bound, the union-find implementation must use both **path compression** and **union-by-rank** (or union-by-size). See Tarjan & van Leeuwen (1984) for the analysis, or Cormen et al. *Introduction to Algorithms* Chapter 21.
 
-The key insight is processing order: by processing top-down (dependents before their dependencies), we know the final set assignment of all dependents before deciding whether to merge.
+Processing order matters: by going top-down (dependents before their dependencies), we know the final set assignment of all dependents before deciding whether to merge.
 
 ### Visualizing Union-Find Merging
 
@@ -829,7 +829,7 @@ theorem union_find_merge_acyclic (G : Graph α) [Fintype α]
   sorry -- TO PROVE (by induction on topoOrder using merge_preserves_acyclicity)
 
 -- Theorem 2: Optimality (max critical path cost is minimized)
--- Key insight: merging x when all dependents are in set S doesn't increase critical path,
+-- Note: merging x when all dependents are in set S doesn't increase critical path,
 -- because x must be compiled before anything in S anyway
 theorem union_find_merge_optimal (G : Graph α) [Fintype α]
     (hdag : G.Acyclic) (topoOrder : List α) (htopo : IsTopoOrder G topoOrder)
