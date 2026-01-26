@@ -20,11 +20,11 @@ use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::symbols::SymbolCollector;
 use ra_ap_hir::{
     DisplayTarget, HasSource, HasVisibility, HirDisplay, HirFileId, Impl,
-    Module, ModuleDef, Semantics,
+    Module as HirModule, ModuleDef, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_syntax::AstNode;
-use tarjanize_schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
+use tarjanize_schemas::{Edge, Module, Symbol, SymbolKind};
 use tracing::warn;
 
 use crate::dependencies::{
@@ -43,7 +43,7 @@ use crate::file_path;
 pub(crate) fn module_def_module(
     db: &dyn HirDatabase,
     def: &ModuleDef,
-) -> Option<Module> {
+) -> Option<HirModule> {
     match def {
         ModuleDef::Module(m) => Some(*m),
         ModuleDef::Function(f) => Some(f.module(db)),
@@ -58,7 +58,7 @@ pub(crate) fn module_def_module(
     }
 }
 
-/// Extract a module and its contents as a SchemaModule.
+/// Extract a module and its contents as a Module.
 ///
 /// Returns a tuple of (module_name, module). The name is stored separately
 /// because the schema uses HashMaps keyed by name rather than storing the
@@ -75,10 +75,10 @@ pub(crate) fn module_def_module(
 pub(crate) fn extract_module(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
-    module: &Module,
+    module: &HirModule,
     crate_name: &str,
     edges: &mut HashSet<Edge>,
-) -> (String, SchemaModule) {
+) -> (String, Module) {
     let db = sema.db;
 
     // Module name: use crate name for root module, otherwise use module name.
@@ -95,7 +95,7 @@ pub(crate) fn extract_module(
         extract_symbols(sema, crate_root, module, &module_path, edges);
 
     // Recursively extract child modules into a HashMap keyed by name.
-    let submodules: HashMap<String, SchemaModule> = module
+    let submodules: HashMap<String, Module> = module
         .children(db)
         .map(|child| {
             extract_module(sema, crate_root, &child, crate_name, edges)
@@ -104,7 +104,7 @@ pub(crate) fn extract_module(
 
     (
         module_name,
-        SchemaModule {
+        Module {
             symbols,
             submodules,
         },
@@ -117,7 +117,7 @@ pub(crate) fn extract_module(
 /// because we need stable, consistent identifiers for the dependency graph.
 fn build_module_path(
     db: &RootDatabase,
-    module: &Module,
+    module: &HirModule,
     crate_name: &str,
 ) -> String {
     // Collect module names from root to this module by walking up the tree.
@@ -148,7 +148,7 @@ fn build_module_path(
 fn extract_symbols(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
-    module: &Module,
+    module: &HirModule,
     module_path: &str,
     edges: &mut HashSet<Edge>,
 ) -> HashMap<String, Symbol> {
@@ -535,7 +535,7 @@ macro_rules! make_fn {
 make_fn!(generated_function);
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Find the generated function
         let root = &graph.crates["test_crate"];

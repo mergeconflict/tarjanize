@@ -40,6 +40,9 @@ jobs:
       - name: Run tests
         run: cargo nextest run
 
+      - name: Run doc tests
+        run: cargo test --doc
+
   # Security audit for vulnerable dependencies
   audit:
     name: Security Audit

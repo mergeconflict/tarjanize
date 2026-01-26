@@ -10,6 +10,7 @@ cargo build                     # Full build
 cargo nextest run               # Run all tests
 cargo nextest run <name>        # Run tests matching name
 cargo nextest run -E 'test(foo)'  # Run tests matching expression
+cargo test --doc                # Run doc tests (nextest doesn't run these)
 cargo llvm-cov nextest          # Run tests with coverage report
 cargo fmt                       # Format code (80-char lines, edition 2024)
 cargo clippy                    # Lint
@@ -55,15 +56,13 @@ tarjanize/
     │   └── src/main.rs
     │
     ├── tarjanize-schemas/   # Schema definitions for all phases
-    │   ├── src/
-    │   │   ├── lib.rs
-    │   │   └── symbol_graph.rs
-    │   └── schemas/         # Golden JSON Schema files
-    │       └── symbol_graph.schema.json
+    │   └── src/
+    │       ├── lib.rs
+    │       └── symbol_graph.rs
     │
     └── tarjanize-extract/   # Phase 1: Symbol graph extraction
         ├── src/
-        │   ├── lib.rs       # Public API: run(), extract_symbol_graph(), load_workspace()
+        │   ├── lib.rs       # Public API: run()
         │   ├── error.rs     # ExtractError (per M-ERRORS-CANONICAL-STRUCTS)
         │   ├── workspaces.rs
         │   ├── crates.rs
@@ -81,7 +80,7 @@ tarjanize/
 - **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Edge` types with serde and JSON Schema support
 
 **tarjanize-extract** (library)
-- **lib.rs** - Public API: `run()`, `extract_symbol_graph()`, re-exports schema types
+- **lib.rs** - Public API: `run()`, re-exports `ExtractError` and schema types
 - **error.rs** - `ExtractError` with backtrace, `ErrorKind` enum, and `is_xxx()` helpers
 - **workspaces.rs** - `load_workspace()` configures rust-analyzer with proc macro expansion and build.rs analysis
 - **crates.rs** - `extract_crate()` extracts a crate as its root module
@@ -113,13 +112,6 @@ pub fn my_function() {}
 ```
 
 Test files target one property at a time (e.g., `test_fixture_fn_param_type`, `test_fixture_trait_supertrait`).
-
-### Golden File Testing
-
-Schema files are verified against golden files to ensure stability. To update after intentional schema changes:
-```bash
-GENERATE_GOLDEN=1 cargo nextest run schema_matches_golden_file
-```
 
 ### Integration Test Fixtures
 

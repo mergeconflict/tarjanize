@@ -17,9 +17,6 @@ use serde::{Deserialize, Serialize};
 /// contain symbols and nested submodules.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolGraph {
-    /// Name of the workspace, derived from Cargo.toml or the root directory.
-    pub workspace_name: String,
-
     /// All crates in the workspace, keyed by crate name. Each crate is
     /// represented as its root module, which contains all symbols and
     /// submodules.
@@ -237,11 +234,10 @@ mod tests {
     prop_compose! {
         /// Strategy for generating arbitrary SymbolGraph values.
         fn arb_symbol_graph()
-            (workspace_name in arb_name(),
-             crates in hash_map(arb_name(), arb_module(), 1..10),
+            (crates in hash_map(arb_name(), arb_module(), 1..10),
              edges in hash_set(arb_edge(), 0..100))
         -> SymbolGraph {
-            SymbolGraph { workspace_name, crates, edges }
+            SymbolGraph { crates, edges }
         }
     }
 

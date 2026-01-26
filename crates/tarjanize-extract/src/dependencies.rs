@@ -626,7 +626,7 @@ pub fn caller_fn() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "caller_fn", "target_fn"),
@@ -647,7 +647,7 @@ pub struct ContainerType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "ContainerType", "TargetType"),
@@ -666,7 +666,7 @@ pub trait MyTrait {}
 pub fn generic_fn<T: MyTrait>(_x: T) {}
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "generic_fn", "MyTrait"),
@@ -691,7 +691,7 @@ impl MyTrait for MyType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // The impl should depend on both the trait and the self type
         assert!(
@@ -725,7 +725,7 @@ pub fn calls_dep_fn() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_workspace");
+        let graph = extract_symbol_graph(db);
 
         // Should have edges to the external crate items
         assert!(
@@ -751,7 +751,7 @@ pub const MY_CONST: Option<TargetType> = None;
 pub static MY_STATIC: Option<TargetType> = None;
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Const and static should depend on their type
         assert!(
@@ -775,7 +775,7 @@ pub struct TargetType;
 pub type MyAlias = TargetType;
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "MyAlias", "TargetType"),
@@ -798,7 +798,7 @@ pub fn uses_inner() -> inner::InnerType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Function should depend on the inner module's type
         assert!(
@@ -832,7 +832,7 @@ impl MyType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Find the impl symbol
         let root = &graph.crates["test_crate"];
@@ -865,7 +865,7 @@ pub mod inner {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         let root = &graph.crates["test_crate"];
 
@@ -940,7 +940,7 @@ pub struct ParamType;
 pub fn fn_with_param(_x: ParamType) {}
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "fn_with_param", "ParamType"),
@@ -960,7 +960,7 @@ pub fn fn_with_return() -> ReturnType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "fn_with_return", "ReturnType"),
@@ -980,7 +980,7 @@ pub fn fn_uses_type_in_body() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "fn_uses_type_in_body", "BodyType"),
@@ -1001,7 +1001,7 @@ where
 {}
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "fn_with_where", "WhereTrait"),
@@ -1025,7 +1025,7 @@ pub struct StructWithBound<T: BoundTrait> {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "StructWithBound", "BoundTrait"),
@@ -1048,7 +1048,7 @@ where
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "StructWithWhere", "WhereTrait"),
@@ -1072,7 +1072,7 @@ pub enum EnumWithTuple {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "EnumWithTuple", "VariantType"),
@@ -1092,7 +1092,7 @@ pub enum EnumWithStruct {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "EnumWithStruct", "FieldType"),
@@ -1112,7 +1112,7 @@ pub enum EnumWithBound<T: BoundTrait> {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "EnumWithBound", "BoundTrait"),
@@ -1132,7 +1132,7 @@ pub union UnionWithField {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "UnionWithField", "FieldType"),
@@ -1154,7 +1154,7 @@ pub trait Supertrait {}
 pub trait SubTrait: Supertrait {}
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "SubTrait", "Supertrait"),
@@ -1174,7 +1174,7 @@ pub trait TraitWithAssocBound {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "TraitWithAssocBound", "BoundTrait"),
@@ -1199,7 +1199,7 @@ pub trait TraitWithDefault {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Default method body type
         assert!(
@@ -1225,7 +1225,7 @@ pub trait TraitWithDefaultConst {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(&graph.edges, "TraitWithDefaultConst", "ConstType"),
@@ -1255,7 +1255,7 @@ impl SelfType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Method body type (collapsed to impl)
         assert!(
@@ -1286,7 +1286,7 @@ impl TraitWithAssoc for ImplType {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         assert!(
             has_edge(
@@ -1319,7 +1319,7 @@ pub fn caller() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Method call should resolve to the impl, not the method directly
         assert!(
@@ -1349,7 +1349,7 @@ pub fn caller() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Method call should resolve to the impl
         assert!(
@@ -1381,7 +1381,7 @@ pub fn constructs_variant() -> MyEnum {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Edges should be to MyEnum, NOT to MyEnum::VariantA or MyEnum::VariantB
         assert!(
@@ -1425,7 +1425,7 @@ pub fn calls_inner_fn() {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Should have edges to inner items
         assert!(
@@ -1470,7 +1470,7 @@ pub fn uses_assoc_const() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Should depend on the trait, not the const directly
         assert!(
@@ -1515,7 +1515,7 @@ pub fn calls_ref_impl(x: &Target) {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Should have proper impl name with &
         assert!(
@@ -1548,7 +1548,7 @@ pub fn calls_mut_ref_impl(x: &mut Target) {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Should have proper impl name with &mut
         assert!(
@@ -1579,7 +1579,7 @@ pub struct UsesStdOnly {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Functions/structs using only std types should have no local dependencies
         let fn_edges: Vec<_> = graph
@@ -1626,7 +1626,7 @@ pub const CONST_CALLS_FN: i32 = helper();
 const fn helper() -> i32 { 42 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Const type annotation creates dependency
         assert!(
@@ -1655,7 +1655,7 @@ pub static STATIC_CALLS_FN: i32 = helper();
 const fn helper() -> i32 { 42 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Static type annotation creates dependency
         assert!(
@@ -1681,7 +1681,7 @@ pub struct Wrapper<T>(T);
 pub type MyAlias = Wrapper<Inner>;
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Type alias depends on both the wrapper and inner type
         assert!(
@@ -1722,7 +1722,7 @@ pub fn caller() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Calling a default method resolves to the trait (since the impl
         // doesn't override it, the method lives on the trait)
@@ -1755,7 +1755,7 @@ pub fn uses_assoc_const() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Using an associated const should collapse to the impl
         assert!(
@@ -1785,7 +1785,7 @@ pub fn uses_assoc_type() -> <MyType as MyTrait>::Output {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Using an associated type should create dependency on the trait
         // (the path <MyType as MyTrait>::Output resolves through the trait)
@@ -1807,7 +1807,7 @@ pub trait TraitWithConst {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Trait's default const value type should create dependency
         assert!(
@@ -1835,7 +1835,7 @@ pub fn uses_const() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Function should depend on the const it uses
         assert!(
@@ -1856,7 +1856,7 @@ pub fn uses_static() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Function should depend on the static it uses
         assert!(
@@ -1877,7 +1877,7 @@ pub fn uses_alias(x: MyAlias) -> MyAlias {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Function should depend on the type alias it uses
         assert!(
@@ -1904,7 +1904,7 @@ pub fn caller() -> i32 {
 }
 "#,
         );
-        let graph = extract_symbol_graph(&db, "test_crate");
+        let graph = extract_symbol_graph(db);
 
         // Calling associated function via path should depend on the impl
         assert!(

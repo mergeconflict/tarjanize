@@ -12,32 +12,24 @@ use std::collections::HashSet;
 
 use ra_ap_hir::{Crate, Semantics};
 use ra_ap_ide_db::RootDatabase;
-use tarjanize_schemas::{Edge, Module as SchemaModule};
+use tarjanize_schemas::{Edge, Module};
 
 use crate::error::ExtractError;
 use crate::file_path;
 use crate::modules::extract_module;
 
-/// Extract a crate as a (name, SchemaModule) pair.
+/// Extract a crate as a (name, module, edges) tuple.
 ///
 /// A crate is represented as its root module, which contains all symbols
 /// and submodules. This unifies crates and modules in the schema - a crate
 /// is just a module with a name from Cargo.toml.
 ///
-/// Returns the crate name separately because the schema uses HashMaps keyed
-/// by name rather than storing the name inside the Module struct.
-///
-/// # Errors
-///
-/// Returns [`ExtractError`] if:
-/// - The crate has no display name ([`ExtractError::is_crate_name_missing`])
-/// - The crate root file path cannot be resolved ([`ExtractError::is_file_path_not_found`])
-/// - The crate root file has no parent directory ([`ExtractError::is_crate_root_no_parent`])
+/// Returns edges separately to support parallel extraction - each crate's
+/// edges are collected independently and merged by the caller.
 pub(crate) fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
-    edges: &mut HashSet<Edge>,
-) -> Result<(String, SchemaModule), ExtractError> {
+) -> Result<(String, Module, HashSet<Edge>), ExtractError> {
     let db = sema.db;
 
     // All Cargo workspace crates must have names in Cargo.toml. A missing
@@ -55,12 +47,18 @@ pub(crate) fn extract_crate(
         .parent()
         .ok_or_else(|| ExtractError::crate_root_no_parent(&crate_name))?;
 
+    // Collect edges for this crate into a local set.
+    let mut edges = HashSet::new();
+
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);
-    let (_, module) =
-        extract_module(sema, &crate_root, &root_module, &crate_name, edges);
+    let (_, module) = extract_module(
+        sema,
+        &crate_root,
+        &root_module,
+        &crate_name,
+        &mut edges,
+    );
 
-    // Return the crate name from Cargo.toml (not the module name, which may
-    // be empty for root modules).
-    Ok((crate_name, module))
+    Ok((crate_name, module, edges))
 }

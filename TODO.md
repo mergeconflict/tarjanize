@@ -39,23 +39,13 @@
 
 #### Production Code
 
-- [ ] `file_path()`
-- [ ] `extract_symbol_graph()`
-- [ ] `run()`
-- [ ] `read_workspace_name()`
+- [x] `file_path()`
+- [x] `extract_symbol_graph()`
+- [x] `run()`
 
 #### Tests
 
-- [ ] `test_extract_symbol_graph_basic`
-- [ ] `test_extract_symbol_graph_multi_crate`
-- [ ] `test_file_path_valid`
-- [ ] `test_read_workspace_name_with_package`
-- [ ] `test_read_workspace_name_nonexistent`
-- [ ] `test_read_workspace_name_no_cargo_toml`
-- [ ] `test_run_with_fixture`
-- [ ] `test_run_invalid_path`
-- [ ] `test_run_virtual_workspace_fallback`
-- [ ] `test_read_workspace_name_virtual_workspace`
+- [x] `test_extract_symbol_graph_basic`
 
 ### error.rs
 
@@ -80,7 +70,7 @@
 
 #### Production Code
 
-- [ ] `load_workspace()`
+- [x] `load_workspace()`
 
 #### Tests
 
