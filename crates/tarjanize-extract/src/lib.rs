@@ -34,21 +34,19 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::Path;
 
+use crates::extract_crate;
 use ra_ap_base_db::{FileId, SourceDatabase};
 use ra_ap_hir::{Crate, Semantics, attach_db};
 use ra_ap_ide_db::RootDatabase;
+// Re-export schema types for convenience.
+#[doc(inline)]
+pub use tarjanize_schemas::{Edge, Module, Symbol, SymbolGraph, SymbolKind};
 use tracing::{info, warn};
 
 #[doc(inline)]
 pub use crate::error::ExtractError;
 #[doc(inline)]
 pub use crate::workspaces::load_workspace;
-
-// Re-export schema types for convenience.
-#[doc(inline)]
-pub use tarjanize_schemas::{Edge, Module, Symbol, SymbolGraph, SymbolKind};
-
-use crates::extract_crate;
 
 /// Look up the filesystem path for a file ID.
 ///
@@ -223,10 +221,12 @@ fn read_workspace_name(workspace_path: &Path) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::PathBuf;
+
     use ra_ap_hir::Crate as HirCrate;
     use ra_ap_test_fixture::WithFixture;
-    use std::path::PathBuf;
+
+    use super::*;
 
     // Test extract_symbol_graph with a simple fixture.
     #[test]
@@ -289,8 +289,8 @@ pub fn foo() {}
     // Test read_workspace_name with a real fixture.
     #[test]
     fn test_read_workspace_name_with_package() {
-        let fixture_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal_crate");
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/minimal_crate");
         let name = read_workspace_name(&fixture_path);
         assert_eq!(name, Some("minimal_crate".to_string()));
     }
@@ -313,8 +313,8 @@ pub fn foo() {}
     // Test run() with a real fixture.
     #[test]
     fn test_run_with_fixture() {
-        let fixture_path =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/minimal_crate");
+        let fixture_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/minimal_crate");
         let mut output = Vec::new();
 
         let result = run(&fixture_path, &mut output);

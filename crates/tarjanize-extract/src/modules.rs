@@ -16,21 +16,47 @@
 use std::collections::HashSet;
 
 use ra_ap_base_db::VfsPath;
+use ra_ap_hir::db::HirDatabase;
+use ra_ap_hir::symbols::SymbolCollector;
 use ra_ap_hir::{
     DisplayTarget, HasSource, HasVisibility, HirDisplay, HirFileId, Impl,
-    Module, ModuleDef, Semantics, symbols::SymbolCollector,
+    Module, ModuleDef, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_syntax::AstNode;
-use tracing::warn;
-
 use tarjanize_schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
+use tracing::warn;
 
 use crate::dependencies::{
     Dependency, find_dependencies, find_impl_dependencies, is_local,
     is_local_dep,
 };
 use crate::file_path;
+
+/// Extract the containing module from a ModuleDef.
+///
+/// Most ModuleDef variants have a `.module(db)` method, but the API isn't
+/// uniform (Module IS the module, BuiltinType has no module). This helper
+/// provides a single function that works for all variants.
+///
+/// Returns None for BuiltinType (language primitives like i32, bool).
+pub(crate) fn module_def_module(
+    db: &dyn HirDatabase,
+    def: &ModuleDef,
+) -> Option<Module> {
+    match def {
+        ModuleDef::Module(m) => Some(*m),
+        ModuleDef::Function(f) => Some(f.module(db)),
+        ModuleDef::Adt(adt) => Some(adt.module(db)),
+        ModuleDef::Variant(v) => Some(v.module(db)),
+        ModuleDef::Const(c) => Some(c.module(db)),
+        ModuleDef::Static(s) => Some(s.module(db)),
+        ModuleDef::Trait(t) => Some(t.module(db)),
+        ModuleDef::TypeAlias(t) => Some(t.module(db)),
+        ModuleDef::Macro(m) => Some(m.module(db)),
+        ModuleDef::BuiltinType(_) => None,
+    }
+}
 
 /// Extract a module and its contents as a SchemaModule.
 ///
@@ -42,7 +68,7 @@ use crate::file_path;
 /// The crate_name parameter is used to build fully-qualified paths for edges.
 /// The crate_root is the directory containing the crate's lib.rs/main.rs,
 /// used to compute relative file paths for symbols.
-pub fn extract_module(
+pub(crate) fn extract_module(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
     module: &Module,
@@ -219,21 +245,7 @@ fn extract_impl(
 ) -> Option<Symbol> {
     let db = sema.db;
 
-    // Build the impl name (e.g., "impl Trait for Type" or "impl Type").
-    // We use HirDisplay to get proper type names including generics, references,
-    // slices, trait objects, etc. This ensures unique names for impls like
-    // `impl<T> Foo for &T` vs `impl<T> Foo for Box<T>`.
-    let self_ty = impl_.self_ty(db);
-    let display_target =
-        DisplayTarget::from_crate(db, impl_.module(db).krate(db).into());
-    let self_ty_name = self_ty.display(db, display_target).to_string();
-
-    let name = if let Some(trait_) = impl_.trait_(db) {
-        format!("impl {} for {}", trait_.name(db).as_str(), self_ty_name)
-    } else {
-        format!("impl {}", self_ty_name)
-    };
-
+    let name = impl_name(db, &impl_);
     let symbol_path = format!("{}::{}", module_path, name);
 
     // Compute file path and cost from the impl's source.
@@ -253,9 +265,10 @@ fn extract_impl(
 
     // Extract self_type and trait paths for the schema.
     // These are used to enforce the orphan rule during analysis.
-    let self_type_path = self_ty
+    let self_type_path = impl_
+        .self_ty(db)
         .as_adt()
-        .and_then(|adt| module_def_path(db, &adt.into()));
+        .and_then(|adt| module_def_path(db, &ModuleDef::Adt(adt)));
 
     let trait_path = impl_
         .trait_(db)
@@ -307,6 +320,26 @@ fn extract_impl(
     })
 }
 
+/// Build the display name for an impl block.
+///
+/// Uses HirDisplay to get proper type names including generics, references,
+/// slices, trait objects, etc. This ensures unique names for impls like
+/// `impl<T> Foo for &T` vs `impl<T> Foo for Box<T>`.
+///
+/// Returns names like "impl Trait for Type" or "impl Type" for inherent impls.
+fn impl_name(db: &RootDatabase, impl_: &Impl) -> String {
+    let self_ty = impl_.self_ty(db);
+    let display_target =
+        DisplayTarget::from_crate(db, impl_.module(db).krate(db).into());
+    let self_ty_name = self_ty.display(db, display_target).to_string();
+
+    if let Some(trait_) = impl_.trait_(db) {
+        format!("impl {} for {}", trait_.name(db).as_str(), self_ty_name)
+    } else {
+        format!("impl {}", self_ty_name)
+    }
+}
+
 /// Returns the kind string for a ModuleDef.
 fn module_def_kind_str(def: &ModuleDef) -> &'static str {
     match def {
@@ -331,19 +364,7 @@ fn module_def_kind_str(def: &ModuleDef) -> &'static str {
 ///
 /// Returns None for items without clear paths (e.g., built-in types).
 fn module_def_path(db: &RootDatabase, def: &ModuleDef) -> Option<String> {
-    // Get the module containing this def.
-    let module = match def {
-        ModuleDef::Module(m) => Some(*m),
-        ModuleDef::Function(f) => Some(f.module(db)),
-        ModuleDef::Adt(adt) => Some(adt.module(db)),
-        ModuleDef::Variant(v) => Some(v.module(db)),
-        ModuleDef::Const(c) => Some(c.module(db)),
-        ModuleDef::Static(s) => Some(s.module(db)),
-        ModuleDef::Trait(t) => Some(t.module(db)),
-        ModuleDef::TypeAlias(t) => Some(t.module(db)),
-        ModuleDef::BuiltinType(_) => None,
-        ModuleDef::Macro(m) => Some(m.module(db)),
-    }?;
+    let module = module_def_module(db, def)?;
 
     // Get the crate name.
     let krate = module.krate(db);
@@ -355,7 +376,7 @@ fn module_def_path(db: &RootDatabase, def: &ModuleDef) -> Option<String> {
     // Build the module path.
     let module_path = build_module_path(db, &module, &crate_name);
 
-    // Get the item name.
+    // Get the item name. Each variant has a different API for getting its name.
     let name = match def {
         ModuleDef::Module(m) => m.name(db).map(|n| n.as_str().to_owned()),
         ModuleDef::Function(f) => Some(f.name(db).as_str().to_owned()),
@@ -399,20 +420,9 @@ fn impl_path(db: &RootDatabase, impl_: &ra_ap_hir::Impl) -> Option<String> {
         .unwrap_or_else(|| "(unnamed)".to_string());
 
     let module_path = build_module_path(db, &module, &crate_name);
+    let name = impl_name(db, impl_);
 
-    // Build the impl name (e.g., "impl Trait for Type" or "impl Type").
-    // Use HirDisplay for proper type names (same as extract_impl).
-    let self_ty = impl_.self_ty(db);
-    let display_target = DisplayTarget::from_crate(db, krate.into());
-    let self_ty_name = self_ty.display(db, display_target).to_string();
-
-    let impl_name = if let Some(trait_) = impl_.trait_(db) {
-        format!("impl {} for {}", trait_.name(db).as_str(), self_ty_name)
-    } else {
-        format!("impl {}", self_ty_name)
-    };
-
-    Some(format!("{}::{}", module_path, impl_name))
+    Some(format!("{}::{}", module_path, name))
 }
 
 /// Compute the file path relative to the crate root.

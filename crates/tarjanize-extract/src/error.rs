@@ -182,8 +182,9 @@ impl From<serde_json::Error> for ExtractError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::error::Error;
+
+    use super::*;
 
     // Test file_path_not_found error variant.
     #[test]
@@ -255,7 +256,8 @@ mod tests {
     #[test]
     fn test_serialization_from() {
         // Create an invalid JSON to trigger a parse error.
-        let json_err = serde_json::from_str::<String>("not valid json").unwrap_err();
+        let json_err =
+            serde_json::from_str::<String>("not valid json").unwrap_err();
         let err = ExtractError::from(json_err);
 
         assert!(err.is_serialization());
@@ -272,7 +274,8 @@ mod tests {
     // Test io error variant via From impl.
     #[test]
     fn test_io_from() {
-        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
+        let io_err =
+            std::io::Error::new(std::io::ErrorKind::NotFound, "file not found");
         let err = ExtractError::from(io_err);
 
         assert!(err.is_io());

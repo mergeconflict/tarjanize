@@ -30,13 +30,16 @@
 
 use std::collections::HashSet;
 
+use ra_ap_hir::db::HirDatabase;
 use ra_ap_hir::{
-    AsAssocItem, AssocItemContainer, HasSource, Impl, ModuleDef,
-    PathResolution, Semantics, db::HirDatabase,
+    AsAssocItem, AssocItemContainer, HasSource, HirFileId, Impl, ModuleDef,
+    PathResolution, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_syntax::{AstNode, SyntaxNode, ast};
 use tracing::warn;
+
+use crate::modules::module_def_module;
 
 /// A dependency target - either a module-level definition or an impl block.
 ///
@@ -46,7 +49,7 @@ use tracing::warn;
 /// Derives Copy because ModuleDef and Impl are both Copy (they're just IDs
 /// wrapping integers). Derives Hash/Eq to enable deduplication via HashSet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Dependency {
+pub(crate) enum Dependency {
     ModuleDef(ModuleDef),
     Impl(Impl),
 }
@@ -64,7 +67,7 @@ impl From<Impl> for Dependency {
 }
 
 /// Check if a Dependency belongs to a local (workspace) crate.
-pub fn is_local_dep(db: &dyn HirDatabase, dep: &Dependency) -> bool {
+pub(crate) fn is_local_dep(db: &dyn HirDatabase, dep: &Dependency) -> bool {
     match dep {
         Dependency::ModuleDef(def) => is_local(db, def),
         Dependency::Impl(impl_) => {
@@ -80,31 +83,10 @@ pub fn is_local_dep(db: &dyn HirDatabase, dep: &Dependency) -> bool {
 /// For tarjanize, we don't care about dependencies on external crates (std,
 /// crates.io deps) since those are already separate crates. We only need to
 /// track dependencies between items *within* the workspace we're splitting.
-pub fn is_local(db: &dyn HirDatabase, def: &ModuleDef) -> bool {
-    // Every item lives in a module, and every module belongs to a crate.
-    // We get the module, then check if its crate is local (workspace member)
-    // vs external (crates.io, std, etc.).
-    //
-    // Each ModuleDef variant has a different API for getting its module:
-    // - Module IS the module
-    // - Everything else has a .module(db) method
-    // - BuiltinType (i32, bool, etc.) has no module - it's a language primitive
-    let module = match def {
-        ModuleDef::Module(m) => Some(*m),
-        ModuleDef::Function(f) => Some(f.module(db)),
-        ModuleDef::Adt(adt) => Some(adt.module(db)),
-        ModuleDef::Variant(v) => Some(v.module(db)),
-        ModuleDef::Const(c) => Some(c.module(db)),
-        ModuleDef::Static(s) => Some(s.module(db)),
-        ModuleDef::Trait(t) => Some(t.module(db)),
-        ModuleDef::TypeAlias(t) => Some(t.module(db)),
-        ModuleDef::Macro(m) => Some(m.module(db)),
-        ModuleDef::BuiltinType(_) => None,
-    };
-
+pub(crate) fn is_local(db: &dyn HirDatabase, def: &ModuleDef) -> bool {
     // CrateOrigin tracks where a crate came from: Local (workspace), Library
     // (crates.io), Lang (std/core/alloc), or Rustc (compiler internals).
-    module
+    module_def_module(db, def)
         .map(|m| m.krate(db).origin(db).is_local())
         .unwrap_or(false)
 }
@@ -115,14 +97,15 @@ pub fn is_local(db: &dyn HirDatabase, def: &ModuleDef) -> bool {
 /// etc.), we find every other item it references in its definition.
 ///
 /// ## What we capture
-/// - Path references: `Foo`, `bar()`, `mod::Type` - covers ~95% of dependencies
+/// - Path references: `Foo`, `bar()`, `mod::Type`
 /// - Method calls: `x.method()` - requires special handling (no visible path)
 ///
 /// ## What we skip (intentionally)
 /// - Implicit std trait deps: `await` (Future), `?` (Try), `for` (IntoIterator),
 ///   `[]` (Index), operators (Add/Sub/etc). These resolve to std library items
 ///   which are foreign and filtered out anyway.
-/// - `#[derive(...)]`: Creates trait deps, but derive traits are typically foreign.
+/// - `#[derive(...)]` attributes: Not analyzed here, but the generated impl
+///   blocks are captured separately via `module.impl_defs()` in `extract_symbols`.
 /// - `macro_rules!` bodies: Token trees without hygiene context; can't resolve.
 ///
 /// ## Collapsing to containers
@@ -162,104 +145,54 @@ pub fn find_dependencies(
     let db = sema.db;
     let mut deps = HashSet::new();
 
-    // For each item type, we need to:
-    // 1. Get its source syntax node via HasSource::source()
-    // 2. Register the file with Semantics via parse_or_expand()
-    // 3. Find our node in the registered tree via find_node_in_file()
-    // 4. Walk the syntax tree collecting dependencies
+    // For each item type, we get its source and collect dependencies.
+    // The collect_deps_from helper handles the parse_or_expand dance needed
+    // to make Semantics work with the source nodes.
     //
-    // Why this dance? HasSource::source() returns a node from rust-analyzer's
-    // internal tree, but Semantics::resolve_path() only works on nodes from
-    // trees that Semantics has "seen" via parse() or parse_or_expand(). If we
-    // try to resolve paths on the raw source node, we get a panic. So we:
-    // - Call parse_or_expand() to register the file with Semantics
-    // - Find our node in that registered tree by matching text ranges
-    //
-    // This is repetitive because each ModuleDef variant's source() returns a
-    // different AST type (ast::Fn, ast::Struct, etc.), and Rust doesn't have
-    // a trait that abstracts over "thing with syntax". A macro could reduce
-    // the boilerplate, but wouldn't add clarity.
+    // Why different branches? Each ModuleDef variant's source() returns a
+    // different AST type. We could use a macro, but explicit matching gives
+    // clear compiler errors if rust-analyzer adds new variants.
     match def {
         ModuleDef::Function(func) => {
-            if let Some(source) = func.source(db) {
-                let root = sema.parse_or_expand(source.file_id);
-                if let Some(node) =
-                    find_node_in_file(&root, source.value.syntax())
-                {
-                    collect_path_deps(sema, &node, &mut deps);
-                }
+            if let Some(src) = func.source(db) {
+                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
             }
         }
         ModuleDef::Adt(adt) => match adt {
             ra_ap_hir::Adt::Struct(s) => {
-                if let Some(source) = s.source(db) {
-                    let root = sema.parse_or_expand(source.file_id);
-                    if let Some(node) =
-                        find_node_in_file(&root, source.value.syntax())
-                    {
-                        collect_path_deps(sema, &node, &mut deps);
-                    }
+                if let Some(src) = s.source(db) {
+                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
                 }
             }
             ra_ap_hir::Adt::Enum(e) => {
-                if let Some(source) = e.source(db) {
-                    let root = sema.parse_or_expand(source.file_id);
-                    if let Some(node) =
-                        find_node_in_file(&root, source.value.syntax())
-                    {
-                        collect_path_deps(sema, &node, &mut deps);
-                    }
+                if let Some(src) = e.source(db) {
+                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
                 }
             }
             ra_ap_hir::Adt::Union(u) => {
-                if let Some(source) = u.source(db) {
-                    let root = sema.parse_or_expand(source.file_id);
-                    if let Some(node) =
-                        find_node_in_file(&root, source.value.syntax())
-                    {
-                        collect_path_deps(sema, &node, &mut deps);
-                    }
+                if let Some(src) = u.source(db) {
+                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
                 }
             }
         },
         ModuleDef::Const(c) => {
-            if let Some(source) = c.source(db) {
-                let root = sema.parse_or_expand(source.file_id);
-                if let Some(node) =
-                    find_node_in_file(&root, source.value.syntax())
-                {
-                    collect_path_deps(sema, &node, &mut deps);
-                }
+            if let Some(src) = c.source(db) {
+                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
             }
         }
         ModuleDef::Static(s) => {
-            if let Some(source) = s.source(db) {
-                let root = sema.parse_or_expand(source.file_id);
-                if let Some(node) =
-                    find_node_in_file(&root, source.value.syntax())
-                {
-                    collect_path_deps(sema, &node, &mut deps);
-                }
+            if let Some(src) = s.source(db) {
+                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
             }
         }
         ModuleDef::Trait(t) => {
-            if let Some(source) = t.source(db) {
-                let root = sema.parse_or_expand(source.file_id);
-                if let Some(node) =
-                    find_node_in_file(&root, source.value.syntax())
-                {
-                    collect_path_deps(sema, &node, &mut deps);
-                }
+            if let Some(src) = t.source(db) {
+                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
             }
         }
         ModuleDef::TypeAlias(t) => {
-            if let Some(source) = t.source(db) {
-                let root = sema.parse_or_expand(source.file_id);
-                if let Some(node) =
-                    find_node_in_file(&root, source.value.syntax())
-                {
-                    collect_path_deps(sema, &node, &mut deps);
-                }
+            if let Some(src) = t.source(db) {
+                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
             }
         }
 
@@ -268,9 +201,9 @@ pub fn find_dependencies(
         // for tarjanize purposes - they're just visibility aliases.
         ModuleDef::Module(_) => {}
 
-        // Enum variants are analyzed as part of their parent Enum - we don't
-        // need variant-level granularity since variants can't be split from
-        // their enum anyway.
+        // Enum variants don't need separate analysis. When we analyze the parent
+        // enum, we walk its entire syntax tree including all variant definitions,
+        // so dependencies like `Foo` in `enum E { V(Foo) }` are captured there.
         ModuleDef::Variant(_) => {}
 
         // macro_rules! bodies are token trees without hygiene context - we can't
@@ -311,6 +244,29 @@ fn find_node_in_file(
         );
     }
     result
+}
+
+/// Collect dependencies from a source node.
+///
+/// This is the common pattern for extracting dependencies from any HIR item:
+/// 1. Get the source via HasSource::source()
+/// 2. Register the file with Semantics via parse_or_expand()
+/// 3. Find our node in the registered tree via find_node_in_file()
+/// 4. Walk the syntax tree collecting dependencies
+///
+/// The file_id and syntax parameters come from `item.source(db)` - we take
+/// them separately because each HIR type's source() returns a different AST
+/// type, but they all implement AstNode with .syntax().
+fn collect_deps_from<T: AstNode>(
+    sema: &Semantics<'_, RootDatabase>,
+    file_id: HirFileId,
+    syntax: &T,
+    deps: &mut HashSet<Dependency>,
+) {
+    let root = sema.parse_or_expand(file_id);
+    if let Some(node) = find_node_in_file(&root, syntax.syntax()) {
+        collect_path_deps(sema, &node, deps);
+    }
 }
 
 /// Walk a syntax tree and collect all references that resolve to dependencies.

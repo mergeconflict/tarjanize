@@ -12,7 +12,6 @@ use std::collections::HashSet;
 
 use ra_ap_hir::{Crate, Semantics};
 use ra_ap_ide_db::RootDatabase;
-
 use tarjanize_schemas::{Edge, Module as SchemaModule};
 
 use crate::error::ExtractError;
@@ -31,7 +30,7 @@ use crate::modules::extract_module;
 /// - The crate has no display name ([`ExtractError::is_crate_name_missing`])
 /// - The crate root file path cannot be resolved ([`ExtractError::is_file_path_not_found`])
 /// - The crate root file has no parent directory ([`ExtractError::is_crate_root_no_parent`])
-pub fn extract_crate(
+pub(crate) fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
     edges: &mut HashSet<Edge>,

@@ -146,9 +146,10 @@ pub struct Edge {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use anyhow::{Context, Result};
     use tracing::info;
+
+    use super::*;
 
     /// Test serialization roundtrip for SymbolGraph.
     ///
