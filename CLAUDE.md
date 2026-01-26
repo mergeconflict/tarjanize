@@ -35,6 +35,8 @@ Phase 5: Generate Report             → report.md
 
 ## Code Style
 
+**Always use `/rust-development`** when writing or reviewing Rust code. This skill enforces Microsoft Pragmatic Rust Guidelines. Ask the project maintainer for the skill files.
+
 **Comments are mandatory.** Every function, struct, enum, and non-trivial code block must have comments that explain:
 1. **What** the code does
 2. **Why** it's necessary - the reasoning, constraints, or design decisions that led to this approach

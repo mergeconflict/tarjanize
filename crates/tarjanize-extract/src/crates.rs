@@ -27,9 +27,10 @@ use crate::modules::extract_module;
 ///
 /// # Errors
 ///
-/// Returns an error if:
-/// - The crate root file path cannot be resolved
-/// - The crate root file has no parent directory
+/// Returns [`ExtractError`] if:
+/// - The crate has no display name ([`ExtractError::is_crate_name_missing`])
+/// - The crate root file path cannot be resolved ([`ExtractError::is_file_path_not_found`])
+/// - The crate root file has no parent directory ([`ExtractError::is_crate_root_no_parent`])
 pub fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
@@ -37,10 +38,12 @@ pub fn extract_crate(
 ) -> Result<SchemaModule, ExtractError> {
     let db = sema.db;
 
+    // All Cargo workspace crates must have names in Cargo.toml. A missing
+    // display name indicates a non-Cargo build system or synthetic crate.
     let crate_name = krate
         .display_name(db)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "(unnamed)".to_string());
+        .ok_or_else(ExtractError::crate_name_missing)?
+        .to_string();
 
     // Get the crate root directory for computing relative file paths.
     // The crate root file is lib.rs or main.rs; its parent is the crate root dir.

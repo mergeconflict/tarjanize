@@ -575,7 +575,7 @@ fn collect_expr_deps(
 ///     // ... process method dependencies
 /// }
 /// ```
-pub fn find_impl_dependencies(
+pub(crate) fn find_impl_dependencies(
     db: &dyn HirDatabase,
     impl_: Impl,
 ) -> ImplDependencies {
@@ -610,7 +610,7 @@ pub fn find_impl_dependencies(
 
 /// The result of analyzing an impl block's dependencies.
 #[derive(Debug)]
-pub struct ImplDependencies {
+pub(crate) struct ImplDependencies {
     /// Direct dependencies from the impl declaration itself (self type, trait).
     pub deps: Vec<ModuleDef>,
 

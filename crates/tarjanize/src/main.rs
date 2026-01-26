@@ -62,7 +62,7 @@ fn main() -> Result<()> {
                 Some(path) => Box::new(BufWriter::new(File::create(path)?)),
                 None => Box::new(stdout.lock()),
             };
-            tarjanize_extract::run(&workspace_path, &mut writer)?;
+            tarjanize_extract::run(&workspace_path, &mut *writer)?;
             Ok(())
         }
     }

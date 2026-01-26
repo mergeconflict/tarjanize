@@ -1,0 +1,4 @@
+# Virtual workspace with no root package - tests fallback to directory name.
+[workspace]
+members = ["crates/member_a"]
+resolver = "2"
