@@ -41,13 +41,50 @@ Phase 5: Generate Report             → report.md
 
 Don't just describe the mechanics; justify the existence and design of the code.
 
-## Module Structure
+## Workspace Structure
 
-- **main.rs** - Entry point; loads workspace, iterates crates
+This is a pure virtual workspace - all crates live under `crates/`.
+
+```
+tarjanize/
+├── Cargo.toml               # Virtual workspace manifest
+└── crates/
+    ├── tarjanize/           # CLI binary
+    │   └── src/main.rs
+    │
+    ├── tarjanize-schemas/   # Schema definitions for all phases
+    │   ├── src/
+    │   │   ├── lib.rs
+    │   │   └── symbol_graph.rs
+    │   └── schemas/         # Golden JSON Schema files
+    │       └── symbol_graph.schema.json
+    │
+    └── tarjanize-extract/   # Phase 1: Symbol graph extraction
+        ├── src/
+        │   ├── lib.rs       # Public API: run(), extract_symbol_graph(), load_workspace()
+        │   ├── error.rs     # ExtractError (per M-ERRORS-CANONICAL-STRUCTS)
+        │   ├── workspaces.rs
+        │   ├── crates.rs
+        │   ├── modules.rs
+        │   └── dependencies.rs
+        └── tests/fixtures/  # Integration test fixtures
+```
+
+## Crate Details
+
+**tarjanize** (binary)
+- **main.rs** - CLI entry point; parses args, calls `tarjanize_extract::run()`
+
+**tarjanize-schemas** (library)
+- **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Edge` types with serde and JSON Schema support
+
+**tarjanize-extract** (library)
+- **lib.rs** - Public API: `run()`, `extract_symbol_graph()`, re-exports schema types
+- **error.rs** - `ExtractError` with backtrace, `ErrorKind` enum, and `is_xxx()` helpers
 - **workspaces.rs** - `load_workspace()` configures rust-analyzer with proc macro expansion and build.rs analysis
-- **crates.rs** - `visit_crate()` enumerates modules in a crate
-- **modules.rs** - `visit_module()` collects symbols and their dependencies via `SymbolCollector`
-- **dependencies.rs** - Core dependency extraction: `find_dependencies()` walks syntax trees, `is_local()` filters to workspace members
+- **crates.rs** - `extract_crate()` extracts a crate as its root module
+- **modules.rs** - `extract_module()` collects symbols recursively via `SymbolCollector`
+- **dependencies.rs** - `find_dependencies()` walks syntax trees, `is_local()` filters to workspace members
 
 ## Key Patterns
 
@@ -63,6 +100,8 @@ Don't just describe the mechanics; justify the existence and design of the code.
 
 **Coverage requirement:** All modules except `main.rs` must maintain ≥90% line coverage. Run `cargo llvm-cov nextest` to check. The `main.rs` file is excluded because it's the CLI entry point and not exercised by unit tests.
 
+### Fixture-Based Unit Tests
+
 Tests use `ra_ap_test_fixture` for fast, in-memory fixture-based testing. Each test creates an in-memory database with the fixture syntax:
 ```rust
 let db = RootDatabase::with_files(r#"
@@ -72,6 +111,17 @@ pub fn my_function() {}
 ```
 
 Test files target one property at a time (e.g., `test_fixture_fn_param_type`, `test_fixture_trait_supertrait`).
+
+### Golden File Testing
+
+Schema files are verified against golden files to ensure stability. To update after intentional schema changes:
+```bash
+GENERATE_GOLDEN=1 cargo nextest run schema_matches_golden_file
+```
+
+### Integration Test Fixtures
+
+Real Cargo projects in `tests/fixtures/` are used for integration tests. Each fixture must have an empty `[workspace]` table in its Cargo.toml to prevent being detected as part of the parent workspace.
 
 ## Static Verification
 

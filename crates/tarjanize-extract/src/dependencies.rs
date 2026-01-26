@@ -623,14 +623,15 @@ pub struct ImplDependencies {
 mod tests {
     use ra_ap_ide_db::RootDatabase;
     use ra_ap_test_fixture::WithFixture;
+    use tarjanize_schemas::Edge;
     use tracing::debug;
 
-    use crate::extract::{DatabaseFileResolver, extract_symbol_graph};
+    use crate::extract_symbol_graph;
 
     /// Helper to check if an edge exists in the symbol graph.
     /// The `from` and `to` are substrings that must appear in the edge paths.
     fn has_edge(
-        edges: &std::collections::HashSet<crate::schemas::Edge>,
+        edges: &std::collections::HashSet<Edge>,
         from: &str,
         to: &str,
     ) -> bool {
@@ -644,7 +645,7 @@ mod tests {
         dead_code,
         reason = "debugging helper, uncomment print_edges call to use"
     )]
-    fn print_edges(edges: &std::collections::HashSet<crate::schemas::Edge>) {
+    fn print_edges(edges: &std::collections::HashSet<Edge>) {
         let mut sorted: Vec<_> = edges.iter().collect();
         sorted.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
         for edge in sorted {
@@ -669,8 +670,7 @@ pub fn caller_fn() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "caller_fn", "target_fn"),
@@ -691,8 +691,7 @@ pub struct ContainerType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "ContainerType", "TargetType"),
@@ -711,8 +710,7 @@ pub trait MyTrait {}
 pub fn generic_fn<T: MyTrait>(_x: T) {}
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "generic_fn", "MyTrait"),
@@ -737,8 +735,7 @@ impl MyTrait for MyType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // The impl should depend on both the trait and the self type
         assert!(
@@ -772,8 +769,7 @@ pub fn calls_dep_fn() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_workspace");
+        let graph = extract_symbol_graph(&db, "test_workspace");
 
         // Should have edges to the external crate items
         assert!(
@@ -799,8 +795,7 @@ pub const MY_CONST: Option<TargetType> = None;
 pub static MY_STATIC: Option<TargetType> = None;
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Const and static should depend on their type
         assert!(
@@ -824,8 +819,7 @@ pub struct TargetType;
 pub type MyAlias = TargetType;
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "MyAlias", "TargetType"),
@@ -848,8 +842,7 @@ pub fn uses_inner() -> inner::InnerType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Function should depend on the inner module's type
         assert!(
@@ -883,8 +876,7 @@ impl MyType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Find the impl symbol
         let root = &graph.crates[0];
@@ -916,15 +908,14 @@ pub mod inner {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         let root = &graph.crates[0];
 
         // Find the public function
         let pub_fn = root.symbols.iter().find(|s| s.name == "public_fn");
         assert!(pub_fn.is_some(), "Should have public_fn");
-        if let crate::schemas::SymbolKind::ModuleDef { visibility, .. } =
+        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
             &pub_fn.unwrap().kind
         {
             assert_eq!(visibility.as_deref(), Some("pub"));
@@ -933,7 +924,7 @@ pub mod inner {
         // Find the pub(crate) function
         let pub_crate = root.symbols.iter().find(|s| s.name == "pub_crate_fn");
         assert!(pub_crate.is_some(), "Should have pub_crate_fn");
-        if let crate::schemas::SymbolKind::ModuleDef { visibility, .. } =
+        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
             &pub_crate.unwrap().kind
         {
             assert_eq!(visibility.as_deref(), Some("pub(crate)"));
@@ -942,7 +933,7 @@ pub mod inner {
         // Find the private function (should have no visibility)
         let priv_fn = root.symbols.iter().find(|s| s.name == "private_fn");
         assert!(priv_fn.is_some(), "Should have private_fn");
-        if let crate::schemas::SymbolKind::ModuleDef { visibility, .. } =
+        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
             &priv_fn.unwrap().kind
         {
             assert!(
@@ -965,7 +956,7 @@ pub mod inner {
             .iter()
             .find(|s| s.name == "pub_super_fn");
         assert!(pub_super.is_some(), "Should have pub_super_fn");
-        if let crate::schemas::SymbolKind::ModuleDef { visibility, .. } =
+        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
             &pub_super.unwrap().kind
         {
             assert_eq!(
@@ -990,8 +981,7 @@ pub struct ParamType;
 pub fn fn_with_param(_x: ParamType) {}
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "fn_with_param", "ParamType"),
@@ -1011,8 +1001,7 @@ pub fn fn_with_return() -> ReturnType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "fn_with_return", "ReturnType"),
@@ -1032,8 +1021,7 @@ pub fn fn_uses_type_in_body() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "fn_uses_type_in_body", "BodyType"),
@@ -1054,8 +1042,7 @@ where
 {}
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "fn_with_where", "WhereTrait"),
@@ -1079,8 +1066,7 @@ pub struct StructWithBound<T: BoundTrait> {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "StructWithBound", "BoundTrait"),
@@ -1103,8 +1089,7 @@ where
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "StructWithWhere", "WhereTrait"),
@@ -1128,8 +1113,7 @@ pub enum EnumWithTuple {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "EnumWithTuple", "VariantType"),
@@ -1149,8 +1133,7 @@ pub enum EnumWithStruct {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "EnumWithStruct", "FieldType"),
@@ -1170,8 +1153,7 @@ pub enum EnumWithBound<T: BoundTrait> {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "EnumWithBound", "BoundTrait"),
@@ -1191,8 +1173,7 @@ pub union UnionWithField {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "UnionWithField", "FieldType"),
@@ -1214,8 +1195,7 @@ pub trait Supertrait {}
 pub trait SubTrait: Supertrait {}
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "SubTrait", "Supertrait"),
@@ -1235,8 +1215,7 @@ pub trait TraitWithAssocBound {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "TraitWithAssocBound", "BoundTrait"),
@@ -1261,8 +1240,7 @@ pub trait TraitWithDefault {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Default method body type
         assert!(
@@ -1288,8 +1266,7 @@ pub trait TraitWithDefaultConst {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(&graph.edges, "TraitWithDefaultConst", "ConstType"),
@@ -1319,8 +1296,7 @@ impl SelfType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Method body type (collapsed to impl)
         assert!(
@@ -1351,8 +1327,7 @@ impl TraitWithAssoc for ImplType {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         assert!(
             has_edge(
@@ -1385,8 +1360,7 @@ pub fn caller() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Method call should resolve to the impl, not the method directly
         assert!(
@@ -1416,8 +1390,7 @@ pub fn caller() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Method call should resolve to the impl
         assert!(
@@ -1449,8 +1422,7 @@ pub fn constructs_variant() -> MyEnum {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Edges should be to MyEnum, NOT to MyEnum::VariantA or MyEnum::VariantB
         assert!(
@@ -1494,8 +1466,7 @@ pub fn calls_inner_fn() {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Should have edges to inner items
         assert!(
@@ -1540,8 +1511,7 @@ pub fn uses_assoc_const() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Should depend on the trait, not the const directly
         assert!(
@@ -1586,8 +1556,7 @@ pub fn calls_ref_impl(x: &Target) {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Should have proper impl name with &
         assert!(
@@ -1620,8 +1589,7 @@ pub fn calls_mut_ref_impl(x: &mut Target) {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Should have proper impl name with &mut
         assert!(
@@ -1652,8 +1620,7 @@ pub struct UsesStdOnly {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Functions/structs using only std types should have no local dependencies
         let fn_edges: Vec<_> = graph
@@ -1700,8 +1667,7 @@ pub const CONST_CALLS_FN: i32 = helper();
 const fn helper() -> i32 { 42 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Const type annotation creates dependency
         assert!(
@@ -1730,8 +1696,7 @@ pub static STATIC_CALLS_FN: i32 = helper();
 const fn helper() -> i32 { 42 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Static type annotation creates dependency
         assert!(
@@ -1757,8 +1722,7 @@ pub struct Wrapper<T>(T);
 pub type MyAlias = Wrapper<Inner>;
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Type alias depends on both the wrapper and inner type
         assert!(
@@ -1799,8 +1763,7 @@ pub fn caller() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Calling a default method resolves to the trait (since the impl
         // doesn't override it, the method lives on the trait)
@@ -1833,8 +1796,7 @@ pub fn uses_assoc_const() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Using an associated const should collapse to the impl
         assert!(
@@ -1864,8 +1826,7 @@ pub fn uses_assoc_type() -> <MyType as MyTrait>::Output {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Using an associated type should create dependency on the trait
         // (the path <MyType as MyTrait>::Output resolves through the trait)
@@ -1887,8 +1848,7 @@ pub trait TraitWithConst {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Trait's default const value type should create dependency
         assert!(
@@ -1916,8 +1876,7 @@ pub fn uses_const() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Function should depend on the const it uses
         assert!(
@@ -1938,8 +1897,7 @@ pub fn uses_static() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Function should depend on the static it uses
         assert!(
@@ -1960,8 +1918,7 @@ pub fn uses_alias(x: MyAlias) -> MyAlias {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Function should depend on the type alias it uses
         assert!(
@@ -1988,8 +1945,7 @@ pub fn caller() -> i32 {
 }
 "#,
         );
-        let resolver = DatabaseFileResolver::new(&db);
-        let graph = extract_symbol_graph(&db, &resolver, "test_crate");
+        let graph = extract_symbol_graph(&db, "test_crate");
 
         // Calling associated function via path should depend on the impl
         assert!(

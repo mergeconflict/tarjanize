@@ -15,21 +15,22 @@
 
 use std::collections::HashSet;
 
+use ra_ap_base_db::VfsPath;
 use ra_ap_hir::{
     DisplayTarget, HasSource, HasVisibility, HirDisplay, HirFileId, Impl,
     Module, ModuleDef, Semantics, symbols::SymbolCollector,
 };
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_paths::AbsPath;
 use ra_ap_syntax::AstNode;
 use tracing::warn;
 
-use super::FilePathResolver;
-use super::dependencies::{
+use tarjanize_schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
+
+use crate::dependencies::{
     Dependency, find_dependencies, find_impl_dependencies, is_local,
     is_local_dep,
 };
-use crate::schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
+use crate::file_path;
 
 /// Extract a module and its contents as a SchemaModule.
 ///
@@ -41,10 +42,9 @@ use crate::schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
 /// The crate_name parameter is used to build fully-qualified paths for edges.
 /// The crate_root is the directory containing the crate's lib.rs/main.rs,
 /// used to compute relative file paths for symbols.
-pub fn extract_module<F: FilePathResolver>(
+pub fn extract_module(
     sema: &Semantics<'_, RootDatabase>,
-    file_resolver: &F,
-    crate_root: Option<&AbsPath>,
+    crate_root: &VfsPath,
     module: &Module,
     crate_name: &str,
     edges: &mut HashSet<Edge>,
@@ -61,27 +61,14 @@ pub fn extract_module<F: FilePathResolver>(
     let module_path = build_module_path(db, module, crate_name);
 
     // Extract symbols defined directly in this module.
-    let symbols = extract_symbols(
-        sema,
-        file_resolver,
-        crate_root,
-        module,
-        &module_path,
-        edges,
-    );
+    let symbols =
+        extract_symbols(sema, crate_root, module, &module_path, edges);
 
     // Recursively extract child modules.
     let children: Vec<_> = module
         .children(db)
         .map(|child| {
-            extract_module(
-                sema,
-                file_resolver,
-                crate_root,
-                &child,
-                crate_name,
-                edges,
-            )
+            extract_module(sema, crate_root, &child, crate_name, edges)
         })
         .collect();
 
@@ -128,10 +115,9 @@ fn build_module_path(
 }
 
 /// Extract all symbols from a module (ModuleDefs and impl blocks).
-fn extract_symbols<F: FilePathResolver>(
+fn extract_symbols(
     sema: &Semantics<'_, RootDatabase>,
-    file_resolver: &F,
-    crate_root: Option<&AbsPath>,
+    crate_root: &VfsPath,
     module: &Module,
     module_path: &str,
     edges: &mut HashSet<Edge>,
@@ -145,14 +131,9 @@ fn extract_symbols<F: FilePathResolver>(
     let collected = SymbolCollector::new_module(db, *module, false);
 
     for sym in collected {
-        if let Some(symbol) = extract_module_def(
-            sema,
-            file_resolver,
-            crate_root,
-            &sym,
-            module_path,
-            edges,
-        ) {
+        if let Some(symbol) =
+            extract_module_def(sema, crate_root, &sym, module_path, edges)
+        {
             symbols.push(symbol);
         }
     }
@@ -160,14 +141,9 @@ fn extract_symbols<F: FilePathResolver>(
     // Extract impl blocks separately - they're not ModuleDefs but are still
     // important compilation units with their own dependencies.
     for impl_ in module.impl_defs(db) {
-        if let Some(symbol) = extract_impl(
-            sema,
-            file_resolver,
-            crate_root,
-            impl_,
-            module_path,
-            edges,
-        ) {
+        if let Some(symbol) =
+            extract_impl(sema, crate_root, impl_, module_path, edges)
+        {
             symbols.push(symbol);
         }
     }
@@ -178,10 +154,9 @@ fn extract_symbols<F: FilePathResolver>(
 /// Extract a single ModuleDef as a Symbol.
 ///
 /// Returns None for items we skip (e.g., built-in types).
-fn extract_module_def<F: FilePathResolver>(
+fn extract_module_def(
     sema: &Semantics<'_, RootDatabase>,
-    file_resolver: &F,
-    crate_root: Option<&AbsPath>,
+    crate_root: &VfsPath,
     sym: &ra_ap_hir::symbols::FileSymbol,
     module_path: &str,
     edges: &mut HashSet<Edge>,
@@ -201,12 +176,7 @@ fn extract_module_def<F: FilePathResolver>(
     // Compute file path relative to crate root.
     // We use the HirFileId from the symbol's location, convert to FileId,
     // then look up the path in the VFS and make it relative to crate root.
-    let file = compute_relative_file_path(
-        db,
-        file_resolver,
-        crate_root,
-        sym.loc.hir_file_id,
-    );
+    let file = compute_relative_file_path(db, crate_root, sym.loc.hir_file_id);
 
     // Compute cost as the byte size of the symbol's syntax node.
     // This is a rough proxy for compile-time complexity.
@@ -240,10 +210,9 @@ fn extract_module_def<F: FilePathResolver>(
 }
 
 /// Extract an impl block as a Symbol.
-fn extract_impl<F: FilePathResolver>(
+fn extract_impl(
     sema: &Semantics<'_, RootDatabase>,
-    file_resolver: &F,
-    crate_root: Option<&AbsPath>,
+    crate_root: &VfsPath,
     impl_: Impl,
     module_path: &str,
     edges: &mut HashSet<Edge>,
@@ -271,12 +240,8 @@ fn extract_impl<F: FilePathResolver>(
     let (file, cost) = impl_
         .source(db)
         .map(|source| {
-            let file = compute_relative_file_path(
-                db,
-                file_resolver,
-                crate_root,
-                source.file_id,
-            );
+            let file =
+                compute_relative_file_path(db, crate_root, source.file_id);
             let cost: f64 =
                 u32::from(source.value.syntax().text_range().len()).into();
             (file, cost)
@@ -452,39 +417,41 @@ fn impl_path(db: &RootDatabase, impl_: &ra_ap_hir::Impl) -> Option<String> {
 
 /// Compute the file path relative to the crate root.
 ///
-/// This takes a HirFileId (which may be a real file or a macro expansion),
-/// converts it to an absolute file path, then makes it relative to the
-/// crate root directory.
+/// For macro expansions, `original_file()` traces back to the source file
+/// containing the macro invocation.
 ///
-/// Returns an empty string if the file is a macro expansion or if the path
-/// cannot be computed.
-fn compute_relative_file_path<F: FilePathResolver>(
+/// # Path handling
+///
+/// rust-analyzer uses `VfsPath` which can be either a real filesystem path
+/// or a virtual path (for test fixtures). There's no built-in "relative to
+/// crate root" API, so we compute it manually:
+///
+/// 1. Real paths: `/Users/.../src/lib.rs` with root `/Users/.../src` →
+///    `strip_prefix()` returns `lib.rs`
+/// 2. Virtual paths: `/lib.rs` with root `""` (parent of root-level file) →
+///    `strip_prefix("")` returns `/lib.rs` unchanged, so we strip the `/`
+fn compute_relative_file_path(
     db: &RootDatabase,
-    file_resolver: &F,
-    crate_root: Option<&AbsPath>,
+    crate_root: &VfsPath,
     hir_file_id: HirFileId,
 ) -> String {
-    // Convert HirFileId to FileId. If the HirFileId is a macro expansion,
-    // original_file() traces back to the real source file.
     let file_id = hir_file_id.original_file(db).file_id(db);
 
-    // Look up the path using the file resolver.
-    let vfs_path = file_resolver.file_path(file_id);
-
-    // Convert to a filesystem path. VfsPath can be either a real path or
-    // a virtual path; we only care about real paths.
-    let Some(abs_path) = vfs_path.as_path() else {
-        return String::new();
+    let vfs_path = match file_path(db, file_id) {
+        Ok(path) => path,
+        Err(e) => {
+            warn!(%e, "could not resolve file path");
+            return String::new();
+        }
     };
 
-    // Make the path relative to the crate root.
-    match crate_root {
-        Some(root) => abs_path
-            .strip_prefix(root)
-            .map(|p| p.as_str().to_owned())
-            .unwrap_or_else(|| abs_path.as_str().to_owned()),
-        None => abs_path.as_str().to_owned(),
-    }
+    let path = vfs_path
+        .strip_prefix(crate_root)
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| vfs_path.to_string());
+
+    // Normalize: virtual paths keep leading "/" after strip_prefix("").
+    path.strip_prefix('/').unwrap_or(&path).to_owned()
 }
 
 /// Extract visibility from a ModuleDef.
@@ -513,5 +480,55 @@ fn extract_visibility(db: &RootDatabase, def: &ModuleDef) -> Option<String> {
                 None // private
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ra_ap_ide_db::RootDatabase;
+    use ra_ap_test_fixture::WithFixture;
+
+    use crate::extract_symbol_graph;
+
+    /// Verify macro-generated symbols are extracted with correct file paths.
+    ///
+    /// When a macro_rules! macro generates a function, the symbol's HirFileId
+    /// points to the macro expansion. Our `compute_relative_file_path` uses
+    /// `original_file()` to trace back to the source file containing the
+    /// macro invocation.
+    #[test]
+    fn test_macro_generated_symbol_has_file_path() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+macro_rules! make_fn {
+    ($name:ident) => {
+        pub fn $name() {}
+    };
+}
+
+make_fn!(generated_function);
+"#,
+        );
+        let graph = extract_symbol_graph(&db, "test_crate");
+
+        // Find the generated function
+        let root = &graph.crates[0];
+        let generated =
+            root.symbols.iter().find(|s| s.name == "generated_function");
+
+        assert!(
+            generated.is_some(),
+            "Should find macro-generated function. Found symbols: {:?}",
+            root.symbols.iter().map(|s| &s.name).collect::<Vec<_>>()
+        );
+
+        // File path should trace back to the source file containing the macro
+        // invocation, not be empty.
+        let symbol = generated.unwrap();
+        assert_eq!(
+            symbol.file, "lib.rs",
+            "Macro-generated symbol should have file path relative to crate root"
+        );
     }
 }

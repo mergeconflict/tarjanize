@@ -11,7 +11,6 @@
 //! analysis. The VFS (Virtual File System) is needed to map internal FileIds
 //! back to filesystem paths.
 
-use anyhow::{Context, Result};
 use camino::Utf8PathBuf;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{
@@ -21,13 +20,15 @@ use ra_ap_project_model::CargoConfig;
 use ra_ap_vfs::Vfs;
 use tracing::debug;
 
+use crate::ExtractError;
+
 /// Load a Rust workspace into rust-analyzer's analysis database.
 ///
 /// Returns the database and VFS. The VFS is needed to convert FileIds to paths.
 ///
 /// # Errors
 ///
-/// Returns [`anyhow::Error`] if:
+/// Returns [`ExtractError`] if:
 /// - The path doesn't exist or can't be canonicalized
 /// - The path contains non-UTF-8 characters
 /// - The workspace can't be loaded (invalid Cargo.toml, missing dependencies, etc.)
@@ -38,18 +39,23 @@ use tracing::debug;
 /// let (db, vfs) = load_workspace("path/to/workspace")?;
 /// let graph = extract_symbol_graph(&db, &vfs, "my_workspace");
 /// ```
-pub fn load_workspace(path: &str) -> Result<(RootDatabase, Vfs)> {
+pub fn load_workspace(path: &str) -> Result<(RootDatabase, Vfs), ExtractError> {
     // rust-analyzer requires absolute paths for file identification and
     // workspace discovery. canonicalize() also resolves symlinks to ensure
     // we work with the real filesystem location.
-    let workspace_path = std::fs::canonicalize(path)
-        .context("Failed to canonicalize workspace path")?;
+    let workspace_path = std::fs::canonicalize(path).map_err(|e| {
+        ExtractError::workspace_load(format!(
+            "Failed to canonicalize path: {e}"
+        ))
+    })?;
 
     // rust-analyzer's APIs expect UTF-8 paths internally. Utf8PathBuf makes
     // this contract explicit and provides better error messages if someone
     // uses a non-UTF-8 path (rare).
-    let workspace_path = Utf8PathBuf::from_path_buf(workspace_path)
-        .map_err(|_| anyhow::anyhow!("Path contains invalid UTF-8"))?;
+    let workspace_path =
+        Utf8PathBuf::from_path_buf(workspace_path).map_err(|_| {
+            ExtractError::workspace_load("Path contains invalid UTF-8")
+        })?;
 
     // CargoConfig controls how Cargo projects are interpreted (e.g., which
     // features to enable, target platform). Default settings work for most
@@ -90,7 +96,8 @@ pub fn load_workspace(path: &str) -> Result<(RootDatabase, Vfs)> {
         &|msg| {
             debug!(message = %msg, "workspace.progress");
         },
-    )?;
+    )
+    .map_err(ExtractError::workspace_load)?;
 
     Ok((db, vfs))
 }
@@ -103,10 +110,10 @@ mod tests {
     fn test_load_nonexistent_path() {
         let result = load_workspace("/nonexistent/path/that/does/not/exist");
         assert!(result.is_err());
-        let err = result.unwrap_err().to_string();
+        let err = result.unwrap_err();
         assert!(
-            err.contains("canonicalize"),
-            "Error should mention canonicalize: {err}"
+            err.is_workspace_load(),
+            "Error should be workspace_load variant"
         );
     }
 
@@ -116,11 +123,11 @@ mod tests {
     /// Cargo project to ensure the full pipeline works end-to-end.
     #[test]
     fn test_load_workspace_and_extract() {
-        use crate::extract::extract_symbol_graph;
+        use crate::extract_symbol_graph;
 
-        let (db, vfs) = load_workspace("tests/fixtures/minimal_crate")
+        let (db, _vfs) = load_workspace("tests/fixtures/minimal_crate")
             .expect("load workspace");
-        let graph = extract_symbol_graph(&db, &vfs, "minimal_crate");
+        let graph = extract_symbol_graph(&db, "minimal_crate");
 
         // Basic sanity checks
         assert_eq!(graph.workspace_name, "minimal_crate");
@@ -141,5 +148,21 @@ mod tests {
             .iter()
             .any(|e| e.from.contains("bar") && e.to.contains("Foo"));
         assert!(has_edge, "bar should depend on Foo");
+
+        // Verify file paths are resolved for real workspaces (not empty like in
+        // test fixtures which use virtual paths).
+        for symbol in &root.symbols {
+            assert!(
+                !symbol.file.is_empty(),
+                "Symbol '{}' should have a file path in real workspace",
+                symbol.name
+            );
+            assert!(
+                symbol.file.ends_with(".rs"),
+                "Symbol '{}' file path should be a .rs file, got: {}",
+                symbol.name,
+                symbol.file
+            );
+        }
     }
 }

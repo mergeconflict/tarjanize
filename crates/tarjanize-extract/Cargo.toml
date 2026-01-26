@@ -1,0 +1,23 @@
+[package]
+name = "tarjanize-extract"
+version.workspace = true
+edition.workspace = true
+description = "Symbol graph extraction from Rust workspaces using rust-analyzer"
+
+[dependencies]
+tarjanize-schemas = { path = "../tarjanize-schemas" }
+ra_ap_hir = "0.0.316"
+ra_ap_ide_db = "0.0.316"
+ra_ap_base_db = "0.0.316"
+ra_ap_project_model = "0.0.316"
+ra_ap_vfs = "0.0.316"
+ra_ap_load-cargo = "0.0.316"
+ra_ap_paths = "0.0.316"
+ra_ap_syntax = "0.0.316"
+camino = "1.2"
+serde_json = "1.0"
+toml = "0.8"
+tracing = "0.1"
+
+[dev-dependencies]
+ra_ap_test_fixture = "0.0.316"

@@ -1,0 +1,13 @@
+[package]
+name = "tarjanize"
+version.workspace = true
+edition.workspace = true
+description = "Analyze Rust workspace dependencies to identify crate splitting opportunities"
+
+[dependencies]
+tarjanize-extract = { path = "../tarjanize-extract" }
+mimalloc = { version = "0.1.48", features = ["v3"] }
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+clap-verbosity-flag = { version = "3.0.4", default-features = false, features = ["tracing"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

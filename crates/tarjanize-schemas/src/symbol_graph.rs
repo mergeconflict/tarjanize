@@ -1,98 +1,146 @@
+//! Symbol graph schema for representing extracted dependency information.
+//!
+//! The symbol graph captures all symbols (functions, structs, traits, impl
+//! blocks, etc.) in a workspace along with their dependency relationships.
+//! This is the output of the extraction phase and an input to subsequent
+//! analysis phases.
+
 use std::collections::HashSet;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 /// Root structure representing the entire symbol graph of a workspace.
+///
+/// The symbol graph captures all symbols and their dependencies within a
+/// Rust workspace. Crates are represented as their root modules, which
+/// contain symbols and nested submodules.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolGraph {
-    /// Name of the workspace
+    /// Name of the workspace, derived from Cargo.toml or the root directory.
     pub workspace_name: String,
 
-    /// All crates in the workspace. Crates are represented as their
-    /// respective root modules
+    /// All crates in the workspace. Each crate is represented as its root
+    /// module, which contains all symbols and submodules.
     pub crates: Vec<Module>,
 
-    /// Dependency edges between symbols
+    /// Dependency edges between symbols. An edge from A to B means A depends
+    /// on B (A uses B in its definition).
     pub edges: HashSet<Edge>,
 }
 
 /// A module (or crate root) containing symbols and submodules.
+///
+/// Modules form a tree structure where each module can contain:
+/// - Symbols (functions, structs, enums, traits, impl blocks, etc.)
+/// - Child submodules
+///
+/// The crate's root module (lib.rs or main.rs) is the top of this tree.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Module {
-    /// Module name
+    /// Module name. For the crate root, this is the crate name.
     pub name: String,
 
-    /// Symbols defined in this module. A symbol is either a module-level
-    /// definition (ra_ap_hir::ModuleDef) or an impl block (ra_ap_hir::Impl)
+    /// Symbols defined directly in this module. A symbol is either a
+    /// module-level definition (function, struct, etc.) or an impl block.
     pub symbols: Vec<Symbol>,
 
-    /// Child modules, omit if empty
+    /// Child modules. Omitted if the module has no submodules.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub submodules: Option<Vec<Module>>,
 }
 
 /// A symbol in the crate - either a module-level definition or an impl block.
+///
+/// Symbols are the vertices in the dependency graph. Each symbol has a name,
+/// source file, compilation cost estimate, and kind-specific details.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
-    /// Symbol name. Impl names are as they appear in the source,
-    /// e.g. 'impl Trait for Type'
+    /// Symbol name. For impl blocks, this is formatted as the impl appears
+    /// in source, e.g., "impl Trait for Type".
     pub name: String,
 
-    /// Path to symbol's file relative to crate root
+    /// Path to the symbol's file relative to the crate root.
     pub file: String,
 
-    /// Approximate cost (unitless) of compiling this symbol. Given two
-    /// symbols A and B, the estimated cost of compiling A and B in series
-    /// is A.cost + B.cost, and the estimated cost of compiling A and B in
-    /// parallel is max(A.cost, B.cost)
+    /// Approximate cost (unitless) of compiling this symbol.
+    ///
+    /// This is used for load balancing when partitioning the graph. Given
+    /// two symbols A and B:
+    /// - Serial compilation cost: A.cost + B.cost
+    /// - Parallel compilation cost: max(A.cost, B.cost)
+    ///
+    /// Currently estimated from syntax node size in bytes.
     #[schemars(range(min = 0.0))]
     pub cost: f64,
 
-    /// Symbol-specific fields depending on whether this is a module
-    /// definition or impl block
+    /// Symbol-specific fields depending on whether this is a module-level
+    /// definition or an impl block.
     #[serde(flatten)]
     pub kind: SymbolKind,
 }
 
 /// Discriminated union for symbol-specific fields.
+///
+/// This enum distinguishes between regular module-level definitions (like
+/// functions and structs) and impl blocks (which have different metadata).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SymbolKind {
-    /// Module-level definition, analogous to ra_ap_hir::ModuleDef
+    /// A module-level definition, analogous to `ra_ap_hir::ModuleDef`.
+    ///
+    /// This includes functions, structs, enums, unions, traits, consts,
+    /// statics, type aliases, and macros.
     ModuleDef {
-        /// Symbol kind (function, struct, enum, trait, etc.)
+        /// The kind of definition: "function", "struct", "enum", "union",
+        /// "trait", "const", "static", "type_alias", "macro", "module".
         kind: String,
 
-        /// Visibility specifier (pub, pub(crate), etc.). Private if absent
+        /// Visibility specifier. Examples: "pub", "pub(crate)",
+        /// "pub(restricted)". Absent for private items.
         #[serde(skip_serializing_if = "Option::is_none")]
         visibility: Option<String>,
     },
 
-    /// Impl block, analogous to ra_ap_hir::Impl. At least one of self_type or
-    /// trait must be present to satisfy the orphan rule.
+    /// An impl block, analogous to `ra_ap_hir::Impl`.
+    ///
+    /// Impl blocks are anonymous (you can't name them with a path), but
+    /// they're important compilation units. At least one of `self_type` or
+    /// `trait` must be present to satisfy Rust's orphan rules.
     Impl {
-        /// Fully qualified path to self type. Absent if the self type is in
-        /// another crate, or for blanket impl.
+        /// Fully qualified path to the self type (the type being implemented).
+        /// Absent if the self type is in another crate, or for blanket impls.
         #[serde(skip_serializing_if = "Option::is_none")]
         self_type: Option<String>,
 
-        /// Fully qualified path to trait. Absent if the trait is in another
-        /// crate, or for inherent impl.
+        /// Fully qualified path to the trait being implemented.
+        /// Absent for inherent impls or if the trait is in another crate.
         #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
         trait_: Option<String>,
     },
 }
 
 /// A dependency edge between two symbols.
+///
+/// An edge from A to B means that A depends on B - that is, A's definition
+/// references B in some way (type annotation, function call, trait bound,
+/// etc.).
+///
+/// # Normalization
+///
+/// Dependencies are normalized for consistency:
+/// - Enum variants collapse to their parent enum
+/// - Associated items collapse to their container (impl or trait)
+/// - Module references are skipped (modules aren't compilation units)
 #[derive(
     Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct Edge {
-    /// Fully qualified path of the dependent symbol
+    /// Fully qualified path of the dependent symbol (the one that has the
+    /// dependency).
     pub from: String,
 
-    /// Fully qualified path of the dependency symbol
+    /// Fully qualified path of the dependency (the symbol being depended on).
     pub to: String,
 }
 
@@ -234,8 +282,9 @@ mod tests {
 
         // Compare Schema objects rather than JSON strings. This makes the test
         // insensitive to formatting differences (key ordering, whitespace).
-        let expected: schemars::Schema = serde_json::from_str(&golden_json)
-            .context("Failed to parse golden file as JSON Schema")?;
+        let expected: schemars::schema::RootSchema =
+            serde_json::from_str(&golden_json)
+                .context("Failed to parse golden file as JSON Schema")?;
 
         assert_eq!(
             schema, expected,
