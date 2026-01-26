@@ -3,45 +3,57 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod crates;
-mod dependencies;
 mod extract;
-mod modules;
 mod schemas;
-mod workspaces;
 
+use std::fs::File;
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tracing::{Level, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use extract::extract_symbol_graph;
-use workspaces::load_workspace;
+use extract::workspaces::load_workspace;
 
+/// Analyze Rust workspace dependency structures to identify opportunities for
+/// splitting crates into smaller, parallelizable units for improved build times.
 #[derive(Parser, Debug)]
-#[command(
-    author,
-    version,
-    about = "Inspect a Rust workspace using rust-analyzer API"
-)]
-struct Args {
-    /// Path to the workspace root (directory containing Cargo.toml)
-    #[arg(default_value = ".")]
-    workspace_path: String,
-
+#[command(author, version, about)]
+struct Cli {
     /// Verbosity level (-v, -vv, -vvv)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Extract symbol graph from a Rust workspace (Phase 1)
+    ///
+    /// Analyzes all workspace member crates and produces a JSON file containing
+    /// all symbols and their dependency relationships.
+    Extract {
+        /// Path to the workspace root (directory containing Cargo.toml)
+        #[arg(default_value = ".")]
+        workspace_path: String,
+
+        /// Output file path (writes to stdout if not specified)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
     // Initialize structured logging. Output goes to stderr so JSON output
     // on stdout remains clean for piping.
-    let filter = match args.verbose {
+    let filter = match cli.verbose {
         0 => EnvFilter::new("tarjanize=info"),
         1 => EnvFilter::new("tarjanize=debug"),
         _ => EnvFilter::new("tarjanize=trace"),
@@ -53,23 +65,35 @@ fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
 
-    info!(path = %args.workspace_path, "workspace.loading");
-    let (db, vfs) = load_workspace(&args.workspace_path)?;
+    match cli.command {
+        Commands::Extract {
+            workspace_path,
+            output,
+        } => run_extract(&workspace_path, output.as_deref()),
+    }
+}
+
+/// Run the extract subcommand (Phase 1).
+///
+/// Loads a workspace, extracts the symbol graph, and writes it to the
+/// specified output (file or stdout).
+fn run_extract(workspace_path: &str, output: Option<&str>) -> Result<()> {
+    info!(path = %workspace_path, "workspace.loading");
+    let (db, vfs) = load_workspace(workspace_path)?;
 
     // Derive workspace name from Cargo.toml, falling back to directory name.
-    let workspace_name = read_workspace_name(&args.workspace_path)
-        .unwrap_or_else(|| {
-            let name = Path::new(&args.workspace_path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("workspace")
-                .to_string();
-            warn!(
-                fallback = %name,
-                "Could not read workspace name from Cargo.toml, using directory name"
-            );
-            name
-        });
+    let workspace_name = read_workspace_name(workspace_path).unwrap_or_else(|| {
+        let name = Path::new(workspace_path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("workspace")
+            .to_string();
+        warn!(
+            fallback = %name,
+            "Could not read workspace name from Cargo.toml, using directory name"
+        );
+        name
+    });
 
     // Extract the symbol graph from the workspace.
     let symbol_graph = extract_symbol_graph(&db, &vfs, &workspace_name);
@@ -80,11 +104,22 @@ fn main() -> Result<()> {
         "extraction.complete"
     );
 
-    // Serialize to JSON and print to stdout.
-    // Using stdout for the JSON allows piping to other tools (jq, etc.)
-    // while keeping status messages on stderr.
+    // Serialize to JSON.
     let json = serde_json::to_string_pretty(&symbol_graph)?;
-    println!("{}", json);
+
+    // Write to output file or stdout.
+    match output {
+        Some(path) => {
+            let file = File::create(path)?;
+            let mut writer = BufWriter::new(file);
+            writeln!(writer, "{}", json)?;
+            info!(path = %path, "output.written");
+        }
+        None => {
+            // Write to stdout for piping to other tools.
+            println!("{}", json);
+        }
+    }
 
     Ok(())
 }

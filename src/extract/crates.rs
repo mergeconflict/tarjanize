@@ -14,8 +14,8 @@ use ra_ap_hir::{Crate, Semantics};
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_paths::AbsPathBuf;
 
-use crate::extract::FilePathResolver;
-use crate::modules::extract_module;
+use super::FilePathResolver;
+use super::modules::extract_module;
 use crate::schemas::{Edge, Module as SchemaModule};
 
 /// Extract a crate as a SchemaModule (the crate root module).

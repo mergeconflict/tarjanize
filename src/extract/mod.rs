@@ -1,13 +1,20 @@
 //! Extraction of symbol graphs from rust-analyzer's semantic model.
 //!
-//! This module is the entry point for Phase 1 of tarjanize. It coordinates
+//! This module implements Phase 1 ("extract") of tarjanize. It coordinates
 //! the extraction process by iterating workspace crates and assembling the
 //! final SymbolGraph.
 //!
-//! The actual extraction logic lives in:
-//! - `crates.rs`: Crate-level extraction
-//! - `modules.rs`: Module and symbol extraction
-//! - `dependencies.rs`: Dependency analysis
+//! ## Submodules
+//!
+//! - `workspaces`: Loading Cargo workspaces into rust-analyzer's database
+//! - `crates`: Crate-level extraction
+//! - `modules`: Module and symbol extraction
+//! - `dependencies`: Dependency analysis
+
+mod crates;
+mod dependencies;
+mod modules;
+pub mod workspaces;
 
 use std::collections::HashSet;
 
@@ -18,8 +25,8 @@ use ra_ap_hir::{Crate, Semantics, attach_db};
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_vfs::Vfs;
 
-use crate::crates::extract_crate;
 use crate::schemas::SymbolGraph;
+use crates::extract_crate;
 
 /// Trait for resolving file IDs to file paths.
 ///

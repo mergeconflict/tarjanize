@@ -24,11 +24,11 @@ use ra_ap_paths::AbsPath;
 use ra_ap_syntax::AstNode;
 use tracing::warn;
 
-use crate::dependencies::{
+use super::FilePathResolver;
+use super::dependencies::{
     Dependency, find_dependencies, find_impl_dependencies, is_local,
     is_local_dep,
 };
-use crate::extract::FilePathResolver;
 use crate::schemas::{Edge, Module as SchemaModule, Symbol, SymbolKind};
 
 /// Extract a module and its contents as a SchemaModule.
