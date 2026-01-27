@@ -22,10 +22,13 @@
 mod crates;
 mod dependencies;
 mod error;
+mod impls;
+mod module_defs;
 mod modules;
+mod paths;
 mod workspaces;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -36,7 +39,7 @@ use ra_ap_ide_db::RootDatabase;
 use rayon::prelude::*;
 // Re-export schema types for convenience.
 #[doc(inline)]
-pub use tarjanize_schemas::{Edge, Module, Symbol, SymbolGraph, SymbolKind};
+pub use tarjanize_schemas::{Module, Symbol, SymbolGraph, SymbolKind};
 use tracing::{instrument, warn};
 
 #[doc(inline)]
@@ -61,8 +64,8 @@ pub(crate) fn file_path(
 
 /// Extracts a complete symbol graph from a rust-analyzer database.
 ///
-/// Walks all workspace crates and extracts their symbols and dependency
-/// relationships.
+/// Walks all workspace crates and extracts their symbols. Dependencies are
+/// stored directly on each symbol.
 #[instrument(skip(db))]
 pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
     // Filter to workspace members. Crate::all() returns ALL crates
@@ -73,23 +76,22 @@ pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
         .filter(|krate| krate.origin(&db).is_local())
         .collect();
 
-    let (crates, edges) = workspace_crates
+    let crates = workspace_crates
         // Iterate over all workspace crates in parallel...
         .par_iter()
         .fold_with(
-            // Start each thread with a fresh (db, crates, edges) accumulator.
+            // Start each thread with a fresh (db, crates) accumulator.
             // Note that cloning the db is cheap (it's effectively a handle).
-            (db, HashMap::new(), HashSet::new()),
+            (db, HashMap::new()),
             // For each crate ...
-            |(db, mut crates, mut edges), &krate| {
+            |(db, mut crates), &krate| {
                 // Attach the database for this thread (required for type inference).
                 attach_db(&db, || {
                     let sema = Semantics::new(&db);
                     // Extract the crate and accumulate the results.
                     match extract_crate(&sema, krate) {
-                        Ok((name, module, crate_edges)) => {
+                        Ok((name, module)) => {
                             crates.insert(name, module);
-                            edges.extend(crate_edges);
                         }
                         Err(e) => {
                             match krate.display_name(&db) {
@@ -99,22 +101,18 @@ pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
                         }
                     }
                 });
-                (db, crates, edges)
+                (db, crates)
             },
         )
-        // Discard the db from the accumulator tuples.
-        .map(|(_, crates, edges)| (crates, edges))
-        // Reduce all thread-local accumulators into a single (crates, edges) tuple.
-        .reduce(
-            || (HashMap::new(), HashSet::new()),
-            |(mut crates, mut edges), (more_crates, more_edges)| {
-                crates.extend(more_crates);
-                edges.extend(more_edges);
-                (crates, edges)
-            },
-        );
+        // Discard the db from the accumulator tuple, just keep the crates.
+        .map(|(_, crates)| crates)
+        // Reduce all thread-local accumulators into a single crates HashMap.
+        .reduce(HashMap::new, |mut acc_crates, crates| {
+            acc_crates.extend(crates);
+            acc_crates
+        });
 
-    SymbolGraph { crates, edges }
+    SymbolGraph { crates }
 }
 
 /// Run the extract operation.

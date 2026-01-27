@@ -3,7 +3,7 @@
 ## Follow-up Tasks
 
 - [ ] Audit logging levels: downgrade INFO logs to DEBUG where appropriate
-- [ ] Implement proptest strategies for generating structurally valid SymbolGraph instances (paths in Edge/Impl reference actual symbols)
+- [ ] Implement proptest strategies for generating structurally valid SymbolGraph instances (dependencies and Impl paths reference actual symbols). Requires two-phase generation: create symbol structure first, then populate dependencies from the set of valid symbol paths.
 
 ## tarjanize
 
@@ -91,23 +91,41 @@
 
 #### Production Code
 
-- [ ] `module_def_module()`
-- [ ] `extract_module()`
-- [ ] `build_module_path()`
-- [ ] `extract_symbols()`
-- [ ] `extract_module_def()`
-- [ ] `extract_impl()`
-- [ ] `impl_name()`
-- [ ] `module_def_kind_str()`
-- [ ] `module_def_path()`
-- [ ] `definition_path()`
-- [ ] `impl_path()`
-- [ ] `compute_relative_file_path()`
-- [ ] `extract_visibility()`
+- [x] `extract_module()`
+- [x] `extract_module_symbols()`
+
+### module_defs.rs
+
+#### Production Code
+
+- [x] `extract_module_def()`
 
 #### Tests
 
 - [ ] `test_macro_generated_symbol_has_file_path`
+- [ ] `test_modules_not_in_symbols`
+- [ ] `test_visibility`
+- [ ] `test_unnamed_const_skipped`
+- [ ] `test_kind_strings`
+
+### impls.rs
+
+#### Production Code
+
+- [ ] `extract_impl()`
+- [ ] `find_impl_dependencies()`
+- [ ] `ImplDependencies` struct
+
+### paths.rs
+
+#### Production Code
+
+- [x] `build_module_path()`
+- [ ] `module_def_path()`
+- [ ] `definition_path()`
+- [ ] `impl_path()`
+- [ ] `impl_name()`
+- [ ] `compute_relative_file_path()`
 
 ### dependencies.rs
 
@@ -124,8 +142,6 @@
 - [ ] `variant_def_to_adt_def()`
 - [ ] `normalize_definition()`
 - [ ] `collect_expr_deps()`
-- [ ] `find_impl_dependencies()`
-- [ ] `ImplDependencies` struct
 
 #### Tests
 
@@ -138,7 +154,6 @@
 - [ ] `test_fixture_type_alias`
 - [ ] `test_fixture_submodule`
 - [ ] `test_fixture_inherent_impl`
-- [ ] `test_fixture_visibility`
 - [ ] `test_fixture_fn_param_type`
 - [ ] `test_fixture_fn_return_type`
 - [ ] `test_fixture_fn_local_var`

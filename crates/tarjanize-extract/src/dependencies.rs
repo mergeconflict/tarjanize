@@ -32,8 +32,7 @@ use std::collections::HashSet;
 
 use either::Either;
 use ra_ap_hir::{
-    AsAssocItem, AssocItemContainer, HasSource, HirFileId, Impl, ModuleDef,
-    Semantics,
+    AsAssocItem, AssocItemContainer, HasSource, HirFileId, ModuleDef, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::defs::{Definition, NameRefClass};
@@ -112,14 +111,10 @@ pub(crate) fn is_local(db: &RootDatabase, def: &ModuleDef) -> bool {
 /// // Get a function from the HIR
 /// let func: ModuleDef = /* ... */;
 ///
-/// // Find all dependencies
+/// // Find all local dependencies
 /// let deps = find_dependencies(&sema, func);
-///
-/// // Filter to local workspace items
 /// for dep in deps {
-///     if is_local_def(db, &dep) {
-///         println!("Depends on: {:?}", dep);
-///     }
+///     println!("Depends on: {:?}", dep);
 /// }
 /// ```
 pub fn find_dependencies(
@@ -127,7 +122,7 @@ pub fn find_dependencies(
     def: ModuleDef,
 ) -> HashSet<Definition> {
     let db = sema.db;
-    let mut deps = HashSet::new();
+    let mut all_deps = HashSet::new();
 
     // For each item type, we get its source and collect dependencies.
     // The collect_deps_from helper handles the parse_or_expand dance needed
@@ -139,44 +134,59 @@ pub fn find_dependencies(
     match def {
         ModuleDef::Function(func) => {
             if let Some(src) = func.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
             }
         }
         ModuleDef::Adt(adt) => match adt {
             ra_ap_hir::Adt::Struct(s) => {
                 if let Some(src) = s.source(db) {
-                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                    collect_deps_from(
+                        sema,
+                        src.file_id,
+                        &src.value,
+                        &mut all_deps,
+                    );
                 }
             }
             ra_ap_hir::Adt::Enum(e) => {
                 if let Some(src) = e.source(db) {
-                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                    collect_deps_from(
+                        sema,
+                        src.file_id,
+                        &src.value,
+                        &mut all_deps,
+                    );
                 }
             }
             ra_ap_hir::Adt::Union(u) => {
                 if let Some(src) = u.source(db) {
-                    collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                    collect_deps_from(
+                        sema,
+                        src.file_id,
+                        &src.value,
+                        &mut all_deps,
+                    );
                 }
             }
         },
         ModuleDef::Const(c) => {
             if let Some(src) = c.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
             }
         }
         ModuleDef::Static(s) => {
             if let Some(src) = s.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
             }
         }
         ModuleDef::Trait(t) => {
             if let Some(src) = t.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
             }
         }
         ModuleDef::TypeAlias(t) => {
             if let Some(src) = t.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut deps);
+                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
             }
         }
 
@@ -201,10 +211,12 @@ pub fn find_dependencies(
         ModuleDef::BuiltinType(_) => {}
     }
 
-    // HashSet automatically deduplicates. A function might reference the same
-    // type multiple times (e.g., in parameter and return position), but we
-    // only need to record the dependency once.
-    deps
+    // Filter to local (workspace) dependencies only. External crates are already
+    // separate compilation units, so we don't need to track them.
+    all_deps
+        .into_iter()
+        .filter(|dep| is_local_def(db, dep))
+        .collect()
 }
 
 /// Find a node in a syntax tree by matching its text range.
@@ -571,125 +583,85 @@ fn collect_expr_deps(
     }
 }
 
-/// Analyze dependencies for an impl block.
-///
-/// Impl blocks are NOT part of ModuleDef (they're anonymous - you can't write
-/// a path like `my_crate::SomeImpl`). This function handles the impl-specific
-/// dependencies that `find_dependencies` cannot capture.
-///
-/// ## Dependencies captured
-///
-/// 1. **Self type**: `impl Foo { }` depends on Foo
-///    - `impl Vec<Bar> { }` depends on both Vec and Bar
-///    - We get the ADT (struct/enum/union) from the self type
-///
-/// 2. **Trait** (for trait impls): `impl Trait for Type { }` depends on Trait
-///
-/// 3. **Impl body**: The methods and associated items inside the impl
-///    - These are analyzed separately as Functions via `find_dependencies`
-///    - We return them for the caller to process
-///
-/// ## Why impl dependencies matter for tarjanize
-///
-/// If we split `struct Foo` into crate A and `impl Foo { }` stays in crate B,
-/// we create a dependency from B→A. Worse, for `impl Trait for Type`, the impl
-/// MUST live in the same crate as either Trait or Type (orphan rules). We need
-/// to track these dependencies to respect those constraints.
-///
-/// # Example
-///
-/// ```ignore
-/// let impl_deps = find_impl_dependencies(db, impl_block);
-///
-/// // Process direct dependencies (self type, trait)
-/// for dep in impl_deps.deps {
-///     if is_local(db, &dep) {
-///         // Record edge from impl to self type/trait
-///     }
-/// }
-///
-/// // Process associated items (methods need their own analysis)
-/// for item in impl_deps.items {
-///     let item_def: ModuleDef = item.into();
-///     let method_deps = find_dependencies(&sema, item_def);
-///     // ... process method dependencies
-/// }
-/// ```
-pub(crate) fn find_impl_dependencies(
-    db: &RootDatabase,
-    impl_: Impl,
-) -> ImplDependencies {
-    let mut deps = Vec::new();
-
-    // Get the self type (the type being implemented).
-    // For `impl Foo { }` this is Foo.
-    // For `impl Trait for Type { }` this is Type.
-    let self_ty = impl_.self_ty(db);
-
-    // Extract the ADT (struct/enum/union) from the self type.
-    // For `impl Foo { }` or `impl Foo<Bar> { }`, we get Foo.
-    // Generic parameters like Bar are typically captured when the impl body
-    // references them in type positions (which path resolution handles).
-    if let Some(adt) = self_ty.as_adt() {
-        deps.push(ModuleDef::Adt(adt));
-    }
-
-    // Get the trait (if this is a trait impl).
-    // For `impl Clone for Foo { }` this is Some(Clone).
-    // For `impl Foo { }` (inherent impl) this is None.
-    if let Some(trait_) = impl_.trait_(db) {
-        deps.push(ModuleDef::Trait(trait_));
-    }
-
-    // Get the associated items (methods, consts, types) in the impl.
-    // These need their own dependency analysis via find_dependencies().
-    let items = impl_.items(db);
-
-    ImplDependencies { deps, items }
-}
-
-/// The result of analyzing an impl block's dependencies.
-#[derive(Debug)]
-pub(crate) struct ImplDependencies {
-    /// Direct dependencies from the impl declaration itself (self type, trait).
-    pub deps: Vec<ModuleDef>,
-
-    /// Associated items in the impl that need their own dependency analysis.
-    /// The caller should process these with `find_dependencies()`.
-    pub items: Vec<ra_ap_hir::AssocItem>,
-}
-
 #[cfg(test)]
 mod tests {
     use ra_ap_ide_db::RootDatabase;
     use ra_ap_test_fixture::WithFixture;
-    use tarjanize_schemas::Edge;
+    use tarjanize_schemas::{Module, SymbolGraph};
     use tracing::debug;
 
     use crate::extract_symbol_graph;
 
-    /// Helper to check if an edge exists in the symbol graph.
-    /// The `from` and `to` are substrings that must appear in the edge paths.
-    fn has_edge(
-        edges: &std::collections::HashSet<Edge>,
-        from: &str,
-        to: &str,
-    ) -> bool {
-        edges
-            .iter()
-            .any(|e| e.from.contains(from) && e.to.contains(to))
+    /// Helper to check if a symbol has a dependency on another symbol.
+    /// The `from` and `to` are substrings that must appear in the symbol name
+    /// and dependency path respectively.
+    fn has_edge(graph: &SymbolGraph, from: &str, to: &str) -> bool {
+        // Search all crates for a symbol matching `from`
+        for module in graph.crates.values() {
+            if has_edge_in_module(module, from, to) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Recursively search a module for a symbol with a matching dependency.
+    fn has_edge_in_module(module: &Module, from: &str, to: &str) -> bool {
+        // Check symbols in this module
+        for (name, symbol) in &module.symbols {
+            if name.contains(from) {
+                if symbol.dependencies.iter().any(|dep| dep.contains(to)) {
+                    return true;
+                }
+            }
+        }
+        // Check submodules
+        for submodule in module.submodules.values() {
+            if has_edge_in_module(submodule, from, to) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Helper to log all edges for debugging.
     #[expect(
         dead_code,
-        reason = "debugging helper, uncomment print_edges call to use"
+        reason = "debugging helper, uncomment print_deps call to use"
     )]
-    fn print_edges(edges: &std::collections::HashSet<Edge>) {
-        let mut sorted: Vec<_> = edges.iter().collect();
-        sorted.sort_by(|a, b| (&a.from, &a.to).cmp(&(&b.from, &b.to)));
-        for edge in sorted {
-            debug!("  {} -> {}", edge.from, edge.to);
+    fn print_deps(graph: &SymbolGraph) {
+        for (crate_name, module) in &graph.crates {
+            print_module_deps(crate_name, module);
+        }
+    }
+
+    fn print_module_deps(prefix: &str, module: &Module) {
+        for (name, symbol) in &module.symbols {
+            let full_name = format!("{}::{}", prefix, name);
+            for dep in &symbol.dependencies {
+                debug!("  {} -> {}", full_name, dep);
+            }
+        }
+        for (name, submodule) in &module.submodules {
+            print_module_deps(&format!("{}::{}", prefix, name), submodule);
+        }
+    }
+
+    /// Collect all dependencies across all symbols in the graph.
+    fn all_dependencies(graph: &SymbolGraph) -> Vec<String> {
+        let mut deps = Vec::new();
+        for module in graph.crates.values() {
+            collect_module_deps(module, &mut deps);
+        }
+        deps
+    }
+
+    fn collect_module_deps(module: &Module, deps: &mut Vec<String>) {
+        for symbol in module.symbols.values() {
+            deps.extend(symbol.dependencies.iter().cloned());
+        }
+        for submodule in module.submodules.values() {
+            collect_module_deps(submodule, deps);
         }
     }
 
@@ -713,7 +685,7 @@ pub fn caller_fn() {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "caller_fn", "target_fn"),
+            has_edge(&graph, "caller_fn", "target_fn"),
             "caller_fn should depend on target_fn"
         );
     }
@@ -734,7 +706,7 @@ pub struct ContainerType {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "ContainerType", "TargetType"),
+            has_edge(&graph, "ContainerType", "TargetType"),
             "ContainerType should depend on TargetType"
         );
     }
@@ -753,7 +725,7 @@ pub fn generic_fn<T: MyTrait>(_x: T) {}
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "generic_fn", "MyTrait"),
+            has_edge(&graph, "generic_fn", "MyTrait"),
             "generic_fn should depend on MyTrait"
         );
     }
@@ -779,11 +751,11 @@ impl MyTrait for MyType {
 
         // The impl should depend on both the trait and the self type
         assert!(
-            has_edge(&graph.edges, "impl MyTrait for MyType", "MyTrait"),
+            has_edge(&graph, "impl MyTrait for MyType", "MyTrait"),
             "impl should depend on MyTrait"
         );
         assert!(
-            has_edge(&graph.edges, "impl MyTrait for MyType", "MyType"),
+            has_edge(&graph, "impl MyTrait for MyType", "MyType"),
             "impl should depend on MyType"
         );
     }
@@ -813,11 +785,11 @@ pub fn calls_dep_fn() {
 
         // Should have edges to the external crate items
         assert!(
-            has_edge(&graph.edges, "UsesDepType", "dep_crate::DepType"),
+            has_edge(&graph, "UsesDepType", "dep_crate::DepType"),
             "UsesDepType should depend on dep_crate::DepType"
         );
         assert!(
-            has_edge(&graph.edges, "calls_dep_fn", "dep_crate::dep_fn"),
+            has_edge(&graph, "calls_dep_fn", "dep_crate::dep_fn"),
             "calls_dep_fn should depend on dep_crate::dep_fn"
         );
     }
@@ -839,11 +811,11 @@ pub static MY_STATIC: Option<TargetType> = None;
 
         // Const and static should depend on their type
         assert!(
-            has_edge(&graph.edges, "MY_CONST", "TargetType"),
+            has_edge(&graph, "MY_CONST", "TargetType"),
             "MY_CONST should depend on TargetType"
         );
         assert!(
-            has_edge(&graph.edges, "MY_STATIC", "TargetType"),
+            has_edge(&graph, "MY_STATIC", "TargetType"),
             "MY_STATIC should depend on TargetType"
         );
     }
@@ -862,7 +834,7 @@ pub type MyAlias = TargetType;
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "MyAlias", "TargetType"),
+            has_edge(&graph, "MyAlias", "TargetType"),
             "MyAlias should depend on TargetType"
         );
     }
@@ -886,11 +858,7 @@ pub fn uses_inner() -> inner::InnerType {
 
         // Function should depend on the inner module's type
         assert!(
-            has_edge(
-                &graph.edges,
-                "uses_inner",
-                "test_crate::inner::InnerType"
-            ),
+            has_edge(&graph, "uses_inner", "test_crate::inner::InnerType"),
             "uses_inner should depend on test_crate::inner::InnerType"
         );
 
@@ -927,87 +895,9 @@ impl MyType {
 
         // The inherent impl should depend on its self type
         assert!(
-            has_edge(&graph.edges, "impl MyType", "MyType"),
+            has_edge(&graph, "impl MyType", "MyType"),
             "inherent impl should depend on MyType"
         );
-    }
-
-    /// Test visibility extraction using an in-memory fixture.
-    #[test]
-    fn test_fixture_visibility() {
-        let db = RootDatabase::with_files(
-            r#"
-//- /lib.rs crate:test_crate
-pub fn public_fn() {}
-
-pub(crate) fn pub_crate_fn() {}
-
-fn private_fn() {}
-
-pub mod inner {
-    pub(super) fn pub_super_fn() {}
-}
-"#,
-        );
-        let graph = extract_symbol_graph(db);
-
-        let root = &graph.crates["test_crate"];
-
-        // Find the public function
-        assert!(
-            root.symbols.contains_key("public_fn"),
-            "Should have public_fn"
-        );
-        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &root.symbols["public_fn"].kind
-        {
-            assert_eq!(visibility.as_deref(), Some("pub"));
-        }
-
-        // Find the pub(crate) function
-        assert!(
-            root.symbols.contains_key("pub_crate_fn"),
-            "Should have pub_crate_fn"
-        );
-        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &root.symbols["pub_crate_fn"].kind
-        {
-            assert_eq!(visibility.as_deref(), Some("pub(crate)"));
-        }
-
-        // Find the private function (should have no visibility)
-        assert!(
-            root.symbols.contains_key("private_fn"),
-            "Should have private_fn"
-        );
-        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &root.symbols["private_fn"].kind
-        {
-            assert!(
-                visibility.is_none(),
-                "private_fn should have no visibility"
-            );
-        }
-
-        // Find the pub(super) function in inner module
-        assert!(
-            root.submodules.contains_key("inner"),
-            "Should have inner module"
-        );
-        let inner = &root.submodules["inner"];
-        assert!(
-            inner.symbols.contains_key("pub_super_fn"),
-            "Should have pub_super_fn"
-        );
-        if let tarjanize_schemas::SymbolKind::ModuleDef { visibility, .. } =
-            &inner.symbols["pub_super_fn"].kind
-        {
-            assert_eq!(
-                visibility.as_deref(),
-                Some("pub(restricted)"),
-                "pub_super_fn should have restricted visibility"
-            );
-        }
     }
 
     // =========================================================================
@@ -1027,7 +917,7 @@ pub fn fn_with_param(_x: ParamType) {}
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "fn_with_param", "ParamType"),
+            has_edge(&graph, "fn_with_param", "ParamType"),
             "fn_with_param should depend on ParamType"
         );
     }
@@ -1047,7 +937,7 @@ pub fn fn_with_return() -> ReturnType {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "fn_with_return", "ReturnType"),
+            has_edge(&graph, "fn_with_return", "ReturnType"),
             "fn_with_return should depend on ReturnType"
         );
     }
@@ -1067,7 +957,7 @@ pub fn fn_uses_type_in_body() {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "fn_uses_type_in_body", "BodyType"),
+            has_edge(&graph, "fn_uses_type_in_body", "BodyType"),
             "fn_uses_type_in_body should depend on BodyType"
         );
     }
@@ -1088,7 +978,7 @@ where
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "fn_with_where", "WhereTrait"),
+            has_edge(&graph, "fn_with_where", "WhereTrait"),
             "fn_with_where should depend on WhereTrait"
         );
     }
@@ -1112,7 +1002,7 @@ pub struct StructWithBound<T: BoundTrait> {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "StructWithBound", "BoundTrait"),
+            has_edge(&graph, "StructWithBound", "BoundTrait"),
             "StructWithBound should depend on BoundTrait"
         );
     }
@@ -1135,7 +1025,7 @@ where
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "StructWithWhere", "WhereTrait"),
+            has_edge(&graph, "StructWithWhere", "WhereTrait"),
             "StructWithWhere should depend on WhereTrait"
         );
     }
@@ -1159,7 +1049,7 @@ pub enum EnumWithTuple {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "EnumWithTuple", "VariantType"),
+            has_edge(&graph, "EnumWithTuple", "VariantType"),
             "EnumWithTuple should depend on VariantType"
         );
     }
@@ -1179,7 +1069,7 @@ pub enum EnumWithStruct {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "EnumWithStruct", "FieldType"),
+            has_edge(&graph, "EnumWithStruct", "FieldType"),
             "EnumWithStruct should depend on FieldType"
         );
     }
@@ -1199,7 +1089,7 @@ pub enum EnumWithBound<T: BoundTrait> {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "EnumWithBound", "BoundTrait"),
+            has_edge(&graph, "EnumWithBound", "BoundTrait"),
             "EnumWithBound should depend on BoundTrait"
         );
     }
@@ -1219,7 +1109,7 @@ pub union UnionWithField {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "UnionWithField", "FieldType"),
+            has_edge(&graph, "UnionWithField", "FieldType"),
             "UnionWithField should depend on FieldType"
         );
     }
@@ -1241,7 +1131,7 @@ pub trait SubTrait: Supertrait {}
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "SubTrait", "Supertrait"),
+            has_edge(&graph, "SubTrait", "Supertrait"),
             "SubTrait should depend on Supertrait"
         );
     }
@@ -1261,7 +1151,7 @@ pub trait TraitWithAssocBound {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "TraitWithAssocBound", "BoundTrait"),
+            has_edge(&graph, "TraitWithAssocBound", "BoundTrait"),
             "TraitWithAssocBound should depend on BoundTrait"
         );
     }
@@ -1287,12 +1177,12 @@ pub trait TraitWithDefault {
 
         // Default method body type
         assert!(
-            has_edge(&graph.edges, "TraitWithDefault", "MethodBodyType"),
+            has_edge(&graph, "TraitWithDefault", "MethodBodyType"),
             "TraitWithDefault should depend on MethodBodyType"
         );
         // Default method body function call
         assert!(
-            has_edge(&graph.edges, "TraitWithDefault", "helper_fn"),
+            has_edge(&graph, "TraitWithDefault", "helper_fn"),
             "TraitWithDefault should depend on helper_fn"
         );
     }
@@ -1312,7 +1202,7 @@ pub trait TraitWithDefaultConst {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(&graph.edges, "TraitWithDefaultConst", "ConstType"),
+            has_edge(&graph, "TraitWithDefaultConst", "ConstType"),
             "TraitWithDefaultConst should depend on ConstType"
         );
     }
@@ -1343,12 +1233,12 @@ impl SelfType {
 
         // Method body type (collapsed to impl)
         assert!(
-            has_edge(&graph.edges, "impl SelfType", "BodyType"),
+            has_edge(&graph, "impl SelfType", "BodyType"),
             "impl SelfType should depend on BodyType (from method body)"
         );
         // Method body function call (collapsed to impl)
         assert!(
-            has_edge(&graph.edges, "impl SelfType", "body_fn"),
+            has_edge(&graph, "impl SelfType", "body_fn"),
             "impl SelfType should depend on body_fn (from method body)"
         );
     }
@@ -1373,11 +1263,7 @@ impl TraitWithAssoc for ImplType {
         let graph = extract_symbol_graph(db);
 
         assert!(
-            has_edge(
-                &graph.edges,
-                "impl TraitWithAssoc for ImplType",
-                "OutputType"
-            ),
+            has_edge(&graph, "impl TraitWithAssoc for ImplType", "OutputType"),
             "impl should depend on OutputType (associated type)"
         );
     }
@@ -1407,7 +1293,7 @@ pub fn caller() {
 
         // Method call should resolve to the impl, not the method directly
         assert!(
-            has_edge(&graph.edges, "caller", "impl Target"),
+            has_edge(&graph, "caller", "impl Target"),
             "caller should depend on impl Target (via method call)"
         );
     }
@@ -1437,7 +1323,7 @@ pub fn caller() {
 
         // Method call should resolve to the impl
         assert!(
-            has_edge(&graph.edges, "caller", "impl MyTrait for Target"),
+            has_edge(&graph, "caller", "impl MyTrait for Target"),
             "caller should depend on impl MyTrait for Target (via method call)"
         );
     }
@@ -1469,24 +1355,24 @@ pub fn constructs_variant() -> MyEnum {
 
         // Edges should be to MyEnum, NOT to MyEnum::VariantA or MyEnum::VariantB
         assert!(
-            has_edge(&graph.edges, "uses_variant", "MyEnum"),
+            has_edge(&graph, "uses_variant", "MyEnum"),
             "uses_variant should depend on MyEnum"
         );
         assert!(
-            has_edge(&graph.edges, "constructs_variant", "MyEnum"),
+            has_edge(&graph, "constructs_variant", "MyEnum"),
             "constructs_variant should depend on MyEnum"
         );
 
-        // Verify NO edges to variants directly
-        let variant_edges: Vec<_> = graph
-            .edges
+        // Verify NO dependencies to variants directly
+        let all_deps = all_dependencies(&graph);
+        let variant_deps: Vec<_> = all_deps
             .iter()
-            .filter(|e| e.to.contains("VariantA") || e.to.contains("VariantB"))
+            .filter(|d| d.contains("VariantA") || d.contains("VariantB"))
             .collect();
         assert!(
-            variant_edges.is_empty(),
-            "No edges should target enum variants directly: {:?}",
-            variant_edges
+            variant_deps.is_empty(),
+            "No dependencies should target enum variants directly: {:?}",
+            variant_deps
         );
     }
 
@@ -1513,24 +1399,22 @@ pub fn calls_inner_fn() {
 
         // Should have edges to inner items
         assert!(
-            has_edge(&graph.edges, "uses_inner_type", "InnerType"),
+            has_edge(&graph, "uses_inner_type", "InnerType"),
             "uses_inner_type should depend on InnerType"
         );
         assert!(
-            has_edge(&graph.edges, "calls_inner_fn", "inner_fn"),
+            has_edge(&graph, "calls_inner_fn", "inner_fn"),
             "calls_inner_fn should depend on inner_fn"
         );
 
-        // Should NOT have edges to the module itself
-        let module_edges: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.to.ends_with("::inner"))
-            .collect();
+        // Should NOT have dependencies to the module itself
+        let all_deps = all_dependencies(&graph);
+        let module_deps: Vec<_> =
+            all_deps.iter().filter(|d| d.ends_with("::inner")).collect();
         assert!(
-            module_edges.is_empty(),
-            "No edges should target modules directly: {:?}",
-            module_edges
+            module_deps.is_empty(),
+            "No dependencies should target modules directly: {:?}",
+            module_deps
         );
     }
 
@@ -1558,20 +1442,20 @@ pub fn uses_assoc_const() -> i32 {
 
         // Should depend on the trait, not the const directly
         assert!(
-            has_edge(&graph.edges, "uses_assoc_const", "MyTrait"),
+            has_edge(&graph, "uses_assoc_const", "MyTrait"),
             "uses_assoc_const should depend on MyTrait"
         );
 
-        // Verify NO edges to the const directly
-        let const_edges: Vec<_> = graph
-            .edges
+        // Verify NO dependencies to the const directly
+        let all_deps = all_dependencies(&graph);
+        let const_deps: Vec<_> = all_deps
             .iter()
-            .filter(|e| e.to.contains("TRAIT_CONST"))
+            .filter(|d| d.contains("TRAIT_CONST"))
             .collect();
         assert!(
-            const_edges.is_empty(),
-            "No edges should target trait consts directly: {:?}",
-            const_edges
+            const_deps.is_empty(),
+            "No dependencies should target trait consts directly: {:?}",
+            const_deps
         );
     }
 
@@ -1603,11 +1487,7 @@ pub fn calls_ref_impl(x: &Target) {
 
         // Should have proper impl name with &
         assert!(
-            has_edge(
-                &graph.edges,
-                "calls_ref_impl",
-                "impl MyTrait for &Target"
-            ),
+            has_edge(&graph, "calls_ref_impl", "impl MyTrait for &Target"),
             "calls_ref_impl should depend on impl MyTrait for &Target"
         );
     }
@@ -1637,7 +1517,7 @@ pub fn calls_mut_ref_impl(x: &mut Target) {
         // Should have proper impl name with &mut
         assert!(
             has_edge(
-                &graph.edges,
+                &graph,
                 "calls_mut_ref_impl",
                 "impl MyTrait for &mut Target"
             ),
@@ -1666,26 +1546,19 @@ pub struct UsesStdOnly {
         let graph = extract_symbol_graph(db);
 
         // Functions/structs using only std types should have no local dependencies
-        let fn_edges: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.from.contains("uses_std_only"))
-            .collect();
+        let root = &graph.crates["test_crate"];
+        let fn_deps = &root.symbols["uses_std_only"].dependencies;
         assert!(
-            fn_edges.is_empty(),
+            fn_deps.is_empty(),
             "uses_std_only should have no local dependencies: {:?}",
-            fn_edges
+            fn_deps
         );
 
-        let struct_edges: Vec<_> = graph
-            .edges
-            .iter()
-            .filter(|e| e.from.contains("UsesStdOnly"))
-            .collect();
+        let struct_deps = &root.symbols["UsesStdOnly"].dependencies;
         assert!(
-            struct_edges.is_empty(),
+            struct_deps.is_empty(),
             "UsesStdOnly should have no local dependencies: {:?}",
-            struct_edges
+            struct_deps
         );
     }
 
@@ -1714,13 +1587,13 @@ const fn helper() -> i32 { 42 }
 
         // Const type annotation creates dependency
         assert!(
-            has_edge(&graph.edges, "MY_CONST", "Target"),
+            has_edge(&graph, "MY_CONST", "Target"),
             "MY_CONST should depend on Target"
         );
 
         // Const initializer function call creates dependency
         assert!(
-            has_edge(&graph.edges, "CONST_CALLS_FN", "helper"),
+            has_edge(&graph, "CONST_CALLS_FN", "helper"),
             "CONST_CALLS_FN should depend on helper"
         );
     }
@@ -1743,13 +1616,13 @@ const fn helper() -> i32 { 42 }
 
         // Static type annotation creates dependency
         assert!(
-            has_edge(&graph.edges, "MY_STATIC", "Target"),
+            has_edge(&graph, "MY_STATIC", "Target"),
             "MY_STATIC should depend on Target"
         );
 
         // Static initializer function call creates dependency
         assert!(
-            has_edge(&graph.edges, "STATIC_CALLS_FN", "helper"),
+            has_edge(&graph, "STATIC_CALLS_FN", "helper"),
             "STATIC_CALLS_FN should depend on helper"
         );
     }
@@ -1769,11 +1642,11 @@ pub type MyAlias = Wrapper<Inner>;
 
         // Type alias depends on both the wrapper and inner type
         assert!(
-            has_edge(&graph.edges, "MyAlias", "Wrapper"),
+            has_edge(&graph, "MyAlias", "Wrapper"),
             "MyAlias should depend on Wrapper"
         );
         assert!(
-            has_edge(&graph.edges, "MyAlias", "Inner"),
+            has_edge(&graph, "MyAlias", "Inner"),
             "MyAlias should depend on Inner"
         );
     }
@@ -1811,7 +1684,7 @@ pub fn caller() -> i32 {
         // Calling a default method resolves to the trait (since the impl
         // doesn't override it, the method lives on the trait)
         assert!(
-            has_edge(&graph.edges, "caller", "MyTrait"),
+            has_edge(&graph, "caller", "MyTrait"),
             "caller should depend on MyTrait (default method lives on trait)"
         );
     }
@@ -1843,7 +1716,7 @@ pub fn uses_assoc_const() -> i32 {
 
         // Using an associated const should collapse to the impl
         assert!(
-            has_edge(&graph.edges, "uses_assoc_const", "impl MyType"),
+            has_edge(&graph, "uses_assoc_const", "impl MyType"),
             "uses_assoc_const should depend on impl MyType"
         );
     }
@@ -1874,7 +1747,7 @@ pub fn uses_assoc_type() -> <MyType as MyTrait>::Output {
         // Using an associated type should create dependency on the trait
         // (the path <MyType as MyTrait>::Output resolves through the trait)
         assert!(
-            has_edge(&graph.edges, "uses_assoc_type", "MyTrait"),
+            has_edge(&graph, "uses_assoc_type", "MyTrait"),
             "uses_assoc_type should depend on MyTrait"
         );
     }
@@ -1895,7 +1768,7 @@ pub trait TraitWithConst {
 
         // Trait's default const value type should create dependency
         assert!(
-            has_edge(&graph.edges, "TraitWithConst", "ConstType"),
+            has_edge(&graph, "TraitWithConst", "ConstType"),
             "TraitWithConst should depend on ConstType"
         );
     }
@@ -1923,7 +1796,7 @@ pub fn uses_const() -> i32 {
 
         // Function should depend on the const it uses
         assert!(
-            has_edge(&graph.edges, "uses_const", "MY_CONST"),
+            has_edge(&graph, "uses_const", "MY_CONST"),
             "uses_const should depend on MY_CONST"
         );
     }
@@ -1944,7 +1817,7 @@ pub fn uses_static() -> i32 {
 
         // Function should depend on the static it uses
         assert!(
-            has_edge(&graph.edges, "uses_static", "MY_STATIC"),
+            has_edge(&graph, "uses_static", "MY_STATIC"),
             "uses_static should depend on MY_STATIC"
         );
     }
@@ -1965,7 +1838,7 @@ pub fn uses_alias(x: MyAlias) -> MyAlias {
 
         // Function should depend on the type alias it uses
         assert!(
-            has_edge(&graph.edges, "uses_alias", "MyAlias"),
+            has_edge(&graph, "uses_alias", "MyAlias"),
             "uses_alias should depend on MyAlias"
         );
     }
@@ -1992,7 +1865,7 @@ pub fn caller() -> i32 {
 
         // Calling associated function via path should depend on the impl
         assert!(
-            has_edge(&graph.edges, "caller", "impl MyType"),
+            has_edge(&graph, "caller", "impl MyType"),
             "caller should depend on impl MyType"
         );
     }
@@ -2037,7 +1910,7 @@ pub fn caller(h: Handler) -> i32 {
         // The callable field syntax (h.callback)() is a call expression on
         // a field access, not a method call, so it doesn't use the fallback.
         assert!(
-            has_edge(&graph.edges, "caller", "Handler"),
+            has_edge(&graph, "caller", "Handler"),
             "caller should depend on Handler"
         );
     }

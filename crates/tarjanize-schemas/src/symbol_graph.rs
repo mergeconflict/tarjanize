@@ -14,17 +14,14 @@ use serde::{Deserialize, Serialize};
 ///
 /// The symbol graph captures all symbols and their dependencies within a
 /// Rust workspace. Crates are represented as their root modules, which
-/// contain symbols and nested submodules.
+/// contain symbols and nested submodules. Dependencies are stored directly
+/// on each symbol rather than as a separate edge list.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SymbolGraph {
     /// All crates in the workspace, keyed by crate name. Each crate is
     /// represented as its root module, which contains all symbols and
     /// submodules.
     pub crates: HashMap<String, Module>,
-
-    /// Dependency edges between symbols. An edge from A to B means A depends
-    /// on B (A uses B in its definition).
-    pub edges: HashSet<Edge>,
 }
 
 /// A module (or crate root) containing symbols and submodules.
@@ -51,8 +48,8 @@ pub struct Module {
 /// A symbol in the crate - either a module-level definition or an impl block.
 ///
 /// Symbols are the vertices in the dependency graph. Each symbol has a
-/// source file, compilation cost estimate, and kind-specific details.
-/// Symbol names are stored as keys in the parent Module's HashMap.
+/// source file, compilation cost estimate, dependencies, and kind-specific
+/// details. Symbol names are stored as keys in the parent Module's HashMap.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
     /// Path to the symbol's file relative to the crate root.
@@ -67,10 +64,52 @@ pub struct Symbol {
     #[schemars(range(min = 0.0))]
     pub cost: f64,
 
+    /// Fully qualified paths of symbols this symbol depends on. A dependency
+    /// means this symbol's definition references the target in some way
+    /// (type annotation, function call, trait bound, etc.).
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub dependencies: HashSet<String>,
+
     /// Symbol-specific fields depending on whether this is a module-level
     /// definition or an impl block.
     #[serde(flatten)]
     pub kind: SymbolKind,
+}
+
+/// Visibility of a symbol for crate-splitting purposes.
+///
+/// When splitting a crate, only `Public` items are guaranteed to remain
+/// accessible without modification. All other visibilities (`pub(crate)`,
+/// `pub(super)`, private) may require upgrading to `pub` if accessed across
+/// the new crate boundary.
+///
+/// Defaults to `NonPublic` and is omitted from serialization when non-public.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Default,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum Visibility {
+    /// Fully public (`pub`). No visibility changes needed when splitting.
+    Public,
+    /// Not fully public. Includes `pub(crate)`, `pub(super)`, `pub(in path)`,
+    /// and private items. May need visibility upgrade when splitting crates.
+    #[default]
+    NonPublic,
+}
+
+impl Visibility {
+    /// Returns true if this is non-public visibility.
+    fn is_non_public(&self) -> bool {
+        *self == Visibility::NonPublic
+    }
 }
 
 /// Metadata specific to the kind of symbol.
@@ -85,13 +124,14 @@ pub enum SymbolKind {
     /// This includes functions, structs, enums, unions, traits, consts,
     /// statics, type aliases, and macros.
     ModuleDef {
-        /// The kind of definition: "function", "struct", "enum", etc.
+        /// The kind of definition: "Function", "Struct", "Enum", etc.
+        /// Uses PascalCase to match rust-analyzer's `SymbolKind` enum.
         kind: String,
 
-        /// Visibility specifier: "pub", "pub(crate)", etc. Absent for private
-        /// symbols.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        visibility: Option<String>,
+        /// Visibility for crate-splitting purposes. Defaults to `NonPublic`
+        /// and is omitted from serialization when non-public.
+        #[serde(default, skip_serializing_if = "Visibility::is_non_public")]
+        visibility: Visibility,
     },
 
     /// An impl block, analogous to `ra_ap_hir::Impl`.
@@ -110,33 +150,6 @@ pub enum SymbolKind {
         #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
         trait_: Option<String>,
     },
-}
-
-/// A dependency edge between two symbols.
-///
-/// An edge from A to B means that A depends on B - that is, A's definition
-/// references B in some way (type annotation, function call, trait bound,
-/// etc.).
-///
-/// Certain items are "collapsed" to their containers, both as sources and
-/// targets of edges:
-///
-/// - **Enum variants** → enum. If `A` references `E::Variant`, then `A` depends
-///   on `E`. If `E::Variant` references `B`, then `E` depends on `B`.
-/// - **Associated items** → impl/trait. For example, if `A` calls
-///   obj.method(), then A depends on the impl/trait that defines `method`.
-///
-/// This collapsing ensures that tarjanize's analysis preserves structure.
-#[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
-)]
-pub struct Edge {
-    /// Fully qualified path of the dependent symbol (the one that has the
-    /// dependency).
-    pub from: String,
-
-    /// Fully qualified path of the dependency (the symbol being depended on).
-    pub to: String,
 }
 
 #[cfg(test)]
@@ -164,11 +177,16 @@ mod tests {
         prop::option::of(arb_name())
     }
 
+    /// Strategy for generating arbitrary Visibility values.
+    fn arb_visibility() -> impl Strategy<Value = Visibility> {
+        prop_oneof![Just(Visibility::Public), Just(Visibility::NonPublic)]
+    }
+
     /// Strategy for generating arbitrary SymbolKind values.
     fn arb_symbol_kind() -> impl Strategy<Value = SymbolKind> {
         prop_compose! {
             fn arb_module_def()
-                (kind in arb_name(), visibility in arb_opt_name())
+                (kind in arb_name(), visibility in arb_visibility())
             -> SymbolKind {
                 SymbolKind::ModuleDef { kind, visibility }
             }
@@ -192,9 +210,14 @@ mod tests {
         /// Note that floating-point values don't survive roundtrip
         /// serialization/deserialization perfectly.
         fn arb_symbol()
-            (file in arb_name(), cost in (0..1_000_000).prop_map(f64::from), kind in arb_symbol_kind())
+            (
+                file in arb_name(),
+                cost in (0..1_000_000).prop_map(f64::from),
+                dependencies in hash_set(arb_name(), 0..5),
+                kind in arb_symbol_kind(),
+            )
         -> Symbol {
-            Symbol { file, cost, kind }
+            Symbol { file, cost, dependencies, kind }
         }
     }
 
@@ -225,19 +248,11 @@ mod tests {
     }
 
     prop_compose! {
-        /// Strategy for generating arbitrary Edge values.
-        fn arb_edge()(from in arb_name(), to in arb_name()) -> Edge {
-            Edge { from, to }
-        }
-    }
-
-    prop_compose! {
         /// Strategy for generating arbitrary SymbolGraph values.
         fn arb_symbol_graph()
-            (crates in hash_map(arb_name(), arb_module(), 1..10),
-             edges in hash_set(arb_edge(), 0..100))
+            (crates in hash_map(arb_name(), arb_module(), 1..10))
         -> SymbolGraph {
-            SymbolGraph { crates, edges }
+            SymbolGraph { crates }
         }
     }
 

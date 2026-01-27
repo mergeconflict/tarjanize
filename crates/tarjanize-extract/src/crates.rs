@@ -8,28 +8,25 @@
 //! This module extracts that metadata and delegates the actual symbol
 //! extraction to the `modules` module.
 
-use std::collections::HashSet;
-
 use ra_ap_hir::{Crate, Semantics};
 use ra_ap_ide_db::RootDatabase;
-use tarjanize_schemas::{Edge, Module};
+use tarjanize_schemas::Module;
+use tracing::debug_span;
 
 use crate::error::ExtractError;
 use crate::file_path;
 use crate::modules::extract_module;
 
-/// Extract a crate as a (name, module, edges) tuple.
+/// Extract a crate as a (name, module) tuple.
 ///
 /// A crate is represented as its root module, which contains all symbols
-/// and submodules. This unifies crates and modules in the schema - a crate
-/// is just a module with a name from Cargo.toml.
-///
-/// Returns edges separately to support parallel extraction - each crate's
-/// edges are collected independently and merged by the caller.
+/// and submodules (each symbol includes its own dependencies). This unifies
+/// crates and modules in the schema - a crate is just a module with a name
+/// from Cargo.toml.
 pub(crate) fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
-) -> Result<(String, Module, HashSet<Edge>), ExtractError> {
+) -> Result<(String, Module), ExtractError> {
     let db = sema.db;
 
     // All Cargo workspace crates must have names in Cargo.toml. A missing
@@ -39,6 +36,8 @@ pub(crate) fn extract_crate(
         .ok_or_else(ExtractError::crate_name_missing)?
         .to_string();
 
+    let _span = debug_span!("extract_crate", %crate_name).entered();
+
     // Get the crate root directory for computing relative file paths.
     // The crate root file is lib.rs or main.rs; its parent is the crate root dir.
     let root_file_id = krate.root_file(db);
@@ -47,20 +46,12 @@ pub(crate) fn extract_crate(
         .parent()
         .ok_or_else(|| ExtractError::crate_root_no_parent(&crate_name))?;
 
-    // Collect edges for this crate into a local set.
-    let mut edges = HashSet::new();
-
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);
-    let (_, module) = extract_module(
-        sema,
-        &crate_root,
-        &root_module,
-        &crate_name,
-        &mut edges,
-    );
+    let (_, module) =
+        extract_module(sema, &crate_root, &root_module, &crate_name);
 
-    Ok((crate_name, module, edges))
+    Ok((crate_name, module))
 }
 
 #[cfg(test)]
@@ -85,7 +76,7 @@ mod tests {
             .expect("should have a local crate");
 
         let sema = Semantics::new(&db);
-        let (name, _, _) =
+        let (name, _) =
             extract_crate(&sema, krate).expect("extraction should succeed");
 
         assert_eq!(name, "test_crate");

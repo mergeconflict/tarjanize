@@ -7,6 +7,7 @@ description = "Symbol graph extraction from Rust workspaces using rust-analyzer"
 [dependencies]
 tarjanize-schemas = { path = "../tarjanize-schemas" }
 ra_ap_hir = "0.0.317"
+ra_ap_ide = "0.0.317"
 ra_ap_ide_db = "0.0.317"
 ra_ap_base_db = "0.0.317"
 ra_ap_project_model = "0.0.317"

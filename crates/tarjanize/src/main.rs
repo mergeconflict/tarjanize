@@ -7,6 +7,7 @@ use clap_verbosity_flag::{InfoLevel, Verbosity};
 use itertools::Itertools;
 use mimalloc::MiMalloc;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 // Use mimalloc for better performance. Per M-MIMALLOC-APPS, this can provide
 // up to 25% performance improvement for allocation-heavy workloads.
@@ -55,6 +56,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .init();
 
     match cli.command {
