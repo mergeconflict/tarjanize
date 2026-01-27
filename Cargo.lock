@@ -2078,6 +2078,7 @@ dependencies = [
  "anyhow",
  "clap",
  "clap-verbosity-flag",
+ "itertools",
  "mimalloc",
  "tarjanize-extract",
  "tracing-subscriber",

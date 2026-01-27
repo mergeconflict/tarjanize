@@ -4,7 +4,9 @@ use std::io::{BufWriter, Write};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
+use itertools::Itertools;
 use mimalloc::MiMalloc;
+use tracing_subscriber::EnvFilter;
 
 // Use mimalloc for better performance. Per M-MIMALLOC-APPS, this can provide
 // up to 25% performance improvement for allocation-heavy workloads.
@@ -44,9 +46,14 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize structured logging. Output goes to stderr so JSON output
-    // on stdout remains clean for piping.
+    // on stdout remains clean for piping. Default to warn, allowlist our crates.
+    const CRATES: &[&str] =
+        &["tarjanize", "tarjanize_extract", "tarjanize_schemas"];
+    let level = cli.verbose.tracing_level_filter();
+    let allowlist = CRATES.iter().map(|c| format!("{c}={level}")).join(",");
+    let filter = EnvFilter::new(format!("warn,{allowlist}"));
     tracing_subscriber::fmt()
-        .with_max_level(cli.verbose)
+        .with_env_filter(filter)
         .with_writer(std::io::stderr)
         .init();
 
