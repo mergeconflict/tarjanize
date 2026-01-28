@@ -114,3 +114,71 @@ fn extract_module_symbols(
 
     symbols
 }
+
+#[cfg(test)]
+mod tests {
+    use ra_ap_hir::{Crate, Semantics, attach_db};
+    use ra_ap_ide_db::RootDatabase;
+    use ra_ap_test_fixture::WithFixture;
+
+    use super::extract_module;
+    use crate::file_path;
+
+    /// Multiple impl blocks with the same signature should be merged,
+    /// combining their costs and dependencies.
+    #[test]
+    fn test_impl_merging() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub struct Foo;
+pub struct DepA;
+pub struct DepB;
+
+impl Foo {
+    pub fn method_a(&self) -> DepA { DepA }
+}
+
+impl Foo {
+    pub fn method_b(&self) -> DepB { DepB }
+}
+"#,
+        );
+
+        attach_db(&db, || {
+            let krate = Crate::all(&db)
+                .into_iter()
+                .find(|k| {
+                    k.display_name(&db)
+                        .is_some_and(|n| n.to_string() == "test_crate")
+                })
+                .expect("test_crate not found");
+
+            let crate_root = file_path(&db, krate.root_file(&db))
+                .expect("crate root file")
+                .parent()
+                .expect("crate root parent");
+
+            let sema = Semantics::new(&db);
+            let root_module = krate.root_module(&db);
+            let (_, module) =
+                extract_module(&sema, &crate_root, &root_module, "test_crate");
+
+            // Should have exactly one "impl Foo" symbol (merged)
+            let symbol = module
+                .symbols
+                .get("impl Foo")
+                .expect("Should have merged 'impl Foo' symbol");
+
+            // Dependencies should include both DepA and DepB
+            assert!(
+                symbol.dependencies.contains("test_crate::DepA"),
+                "Should depend on DepA"
+            );
+            assert!(
+                symbol.dependencies.contains("test_crate::DepB"),
+                "Should depend on DepB"
+            );
+        });
+    }
+}

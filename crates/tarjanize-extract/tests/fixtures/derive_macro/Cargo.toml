@@ -1,0 +1,11 @@
+# Workspace fixture for testing derive macro dependency capture.
+#
+# This workspace contains:
+# - my_derive: a proc-macro crate defining a derive macro
+# - consumer: a crate that uses the derive macro
+#
+# Used to test whether workspace-local derive macros are captured as dependencies.
+
+[workspace]
+members = ["my_derive", "consumer"]
+resolver = "2"

@@ -8,130 +8,65 @@
 //! - ModuleDefs: `crate::module::item` (e.g., `mycrate::foo::MyStruct`)
 //! - Impl blocks: `crate::module::impl Trait for Type` or `crate::module::impl Type`
 
-use ra_ap_hir::{
-    DisplayTarget, HirDisplay, Impl, Module as HirModule, ModuleDef,
-};
+use ra_ap_hir::{Impl, ModuleDef};
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_ide_db::defs::Definition;
 use tracing::warn;
 
 use crate::file_path;
-
-/// Build the fully-qualified path to a module (e.g., "mycrate::foo::bar").
-///
-/// We build paths manually rather than using rust-analyzer's display methods
-/// because we need stable, consistent identifiers for the dependency graph.
-pub(crate) fn build_module_path(
-    db: &RootDatabase,
-    module: &HirModule,
-    crate_name: &str,
-) -> String {
-    let parts: Vec<_> = std::iter::once(crate_name.to_owned())
-        .chain(
-            module
-                .path_to_root(db)
-                .into_iter()
-                .rev()
-                .filter_map(|m| m.name(db))
-                // We use as_str() rather than display() because we want a stable
-                // name that doesn't depend on edition.
-                .map(|n| n.as_str().to_owned()),
-        )
-        .collect();
-
-    parts.join("::")
-}
+use crate::impls::impl_name;
 
 /// Returns the fully-qualified path for a ModuleDef.
 ///
-/// Returns None for items without clear paths (e.g., built-in types).
+/// Uses rust-analyzer's `canonical_path` method and prepends the crate name.
+///
+/// Returns None for items that don't have meaningful paths:
+/// - Unnamed consts (`const _: () = ...`) have no name
+/// - Built-in types (i32, bool, str) have no containing module
+/// - Crate root modules have no containing module
+/// - Items in crates without display names (shouldn't happen in practice)
 pub(crate) fn module_def_path(
     db: &RootDatabase,
     def: &ModuleDef,
 ) -> Option<String> {
-    let name = def.name(db)?;
     let containing_module = def.module(db)?;
+    let krate = containing_module.krate(db);
+    let crate_name = krate.display_name(db)?;
+    let edition = krate.edition(db);
 
-    let crate_name = containing_module
-        .krate(db)
-        .display_name(db)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "(unnamed)".to_string());
-
-    let module_path = build_module_path(db, &containing_module, &crate_name);
-
-    Some(format!("{}::{}", module_path, name.as_str()))
-}
-
-/// Returns the fully-qualified path for a Definition dependency target.
-///
-/// This handles the normalized Definition variants that represent valid
-/// dependency targets. Other Definition variants (Module, BuiltinType, Local,
-/// etc.) should have been filtered out by `normalize_definition`.
-pub(crate) fn definition_path(
-    db: &RootDatabase,
-    def: &Definition,
-) -> Option<String> {
-    match def {
-        // Impl blocks use special formatting.
-        Definition::SelfType(impl_) => impl_path(db, impl_),
-
-        // All other valid dependency targets are module-level definitions.
-        // Convert to ModuleDef for path computation.
-        Definition::Function(f) => {
-            module_def_path(db, &ModuleDef::Function(*f))
-        }
-        Definition::Adt(a) => module_def_path(db, &ModuleDef::Adt(*a)),
-        Definition::Const(c) => module_def_path(db, &ModuleDef::Const(*c)),
-        Definition::Static(s) => module_def_path(db, &ModuleDef::Static(*s)),
-        Definition::Trait(t) => module_def_path(db, &ModuleDef::Trait(*t)),
-        Definition::TypeAlias(ta) => {
-            module_def_path(db, &ModuleDef::TypeAlias(*ta))
-        }
-        Definition::Macro(m) => module_def_path(db, &ModuleDef::Macro(*m)),
-
-        // Everything else should have been filtered out by normalize_definition.
-        // Return None rather than panicking to be defensive.
-        _ => None,
-    }
+    let canonical = def.canonical_path(db, edition)?;
+    Some(format!("{}::{}", crate_name, canonical))
 }
 
 /// Returns the fully-qualified path for an Impl.
 ///
 /// Impl paths use the format "crate::module::impl Trait for Type" or
 /// "crate::module::impl Type" for inherent impls.
+///
+/// Returns None if the crate has no display name (shouldn't happen in practice).
 pub(crate) fn impl_path(db: &RootDatabase, impl_: &Impl) -> Option<String> {
     let module = impl_.module(db);
     let krate = module.krate(db);
-    let crate_name = krate
-        .display_name(db)
-        .map(|n| n.to_string())
-        .unwrap_or_else(|| "(unnamed)".to_string());
+    let edition = krate.edition(db);
 
-    let module_path = build_module_path(db, &module, &crate_name);
-    let name = impl_name(db, impl_);
+    // Build path: crate::mod1::mod2::impl Type
+    // Unlike ModuleDef, Impl doesn't have canonical_path, so we build it manually.
+    let crate_name = krate.display_name(db)?.to_string();
+    let path = module
+        .path_to_root(db)
+        .into_iter()
+        .rev()
+        .map(|m| {
+            // Use the module name if available; fallback to crate name for the
+            // unnamed root module.
+            m.name(db)
+                .map(|n| n.display(db, edition).to_string())
+                .unwrap_or_else(|| crate_name.clone())
+        })
+        .chain([impl_name(db, impl_)])
+        .collect::<Vec<_>>()
+        .join("::");
 
-    Some(format!("{}::{}", module_path, name))
-}
-
-/// Build the display name for an impl block.
-///
-/// Uses HirDisplay to get proper type names including generics, references,
-/// slices, trait objects, etc. This ensures unique names for impls like
-/// `impl<T> Foo for &T` vs `impl<T> Foo for Box<T>`.
-///
-/// Returns names like "impl Trait for Type" or "impl Type" for inherent impls.
-pub(crate) fn impl_name(db: &RootDatabase, impl_: &Impl) -> String {
-    let self_ty = impl_.self_ty(db);
-    let display_target =
-        DisplayTarget::from_crate(db, impl_.module(db).krate(db).into());
-    let self_ty_name = self_ty.display(db, display_target).to_string();
-
-    if let Some(trait_) = impl_.trait_(db) {
-        format!("impl {} for {}", trait_.name(db).as_str(), self_ty_name)
-    } else {
-        format!("impl {}", self_ty_name)
-    }
+    Some(path)
 }
 
 /// Compute the file path relative to the crate root.

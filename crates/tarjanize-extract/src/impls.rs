@@ -12,15 +12,72 @@
 use std::collections::HashSet;
 
 use ra_ap_base_db::VfsPath;
-use ra_ap_hir::{Impl, ModuleDef, Semantics};
+use ra_ap_hir::{HasSource, Impl, ModuleDef, Semantics};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::RootDatabase;
-use ra_ap_ide_db::defs::Definition;
+use ra_ap_syntax::AstNode;
+use ra_ap_syntax::ast::HasGenericParams;
 use tarjanize_schemas::{Symbol, SymbolKind};
+use tracing::debug_span;
 
 use crate::dependencies::is_local_def;
-use crate::module_defs::find_dependencies as find_module_def_dependencies;
-use crate::paths::{compute_relative_file_path, impl_name, module_def_path};
+use crate::paths::{compute_relative_file_path, module_def_path};
+
+/// Build the display name for an impl block from its AST.
+///
+/// Extracts the signature directly from source, giving names like:
+/// - `impl<T> MyTrait for Wrapper<T>` (trait impl with generics)
+/// - `impl Foo` (inherent impl)
+/// - `impl<T: Clone> MyTrait for &T` (with bounds)
+/// - `impl<T> MyTrait for Foo where T: Clone` (with where clause)
+///
+/// # Panics
+///
+/// Panics if AST is unavailable. This should never happen for local impls
+/// that pass `try_to_nav()` - if it does, our assumptions are wrong.
+pub(crate) fn impl_name(db: &RootDatabase, impl_: &Impl) -> String {
+    use std::fmt::Write;
+
+    let source = impl_.source(db).expect("local impl should have source");
+    let ast = source.value;
+
+    // Build the name incrementally to avoid intermediate allocations.
+    // SyntaxText implements Display, so write! writes directly to the buffer.
+    let mut name = String::new();
+
+    // Unsafe keyword: `unsafe impl`
+    if ast.unsafe_token().is_some() {
+        name.push_str("unsafe ");
+    }
+
+    name.push_str("impl");
+
+    // Generic params: `<T: Clone>`
+    if let Some(g) = ast.generic_param_list() {
+        _ = write!(name, "{}", g.syntax().text());
+    }
+
+    name.push(' ');
+
+    // Trait part: `MyTrait for ` or `!MyTrait for ` (negative impl)
+    if let Some(t) = ast.trait_() {
+        if ast.excl_token().is_some() {
+            name.push('!');
+        }
+        _ = write!(name, "{} for ", t.syntax().text());
+    }
+
+    // Self type: `Wrapper<T>`
+    let self_ty = ast.self_ty().expect("impl should have self type");
+    _ = write!(name, "{}", self_ty.syntax().text());
+
+    // Where clause: ` where T: Clone`
+    if let Some(w) = ast.where_clause() {
+        _ = write!(name, " {}", w.syntax().text());
+    }
+
+    name
+}
 
 /// Extract an impl block as a (name, Symbol) pair.
 pub(crate) fn extract_impl(
@@ -31,6 +88,7 @@ pub(crate) fn extract_impl(
     let db = sema.db;
 
     let name = impl_name(db, &impl_);
+    let _span = debug_span!("extract_impl", %name).entered();
 
     // Get source location for file path and cost calculation via TryToNav.
     let nav = impl_.try_to_nav(sema)?.call_site;
@@ -47,9 +105,9 @@ pub(crate) fn extract_impl(
     let trait_path =
         trait_.and_then(|t| module_def_path(db, &ModuleDef::Trait(t)));
 
-    // Collect all dependencies: impl declaration (self type, trait) and
-    // associated items (methods, consts, type aliases).
-    let dependencies = find_dependencies(sema, impl_, self_type, trait_);
+    // Collect all dependencies: impl signature (self type, trait, generic
+    // bounds, where clauses) and associated items (methods, consts, type aliases).
+    let dependencies = find_dependencies(sema, impl_);
 
     Some((
         name,
@@ -67,258 +125,312 @@ pub(crate) fn extract_impl(
 
 /// Find all items that an impl block depends on.
 ///
-/// Impl blocks are NOT part of ModuleDef (they're anonymous - you can't write
-/// a path like `my_crate::SomeImpl`). This function handles the impl-specific
-/// dependencies.
-///
-/// ## Dependencies captured
-///
-/// 1. **Self type**: `impl Foo { }` depends on Foo
-///    - `impl Vec<Bar> { }` depends on both Vec and Bar
-///    - The ADT (struct/enum/union) is passed in from the caller
-///
-/// 2. **Trait** (for trait impls): `impl Trait for Type { }` depends on Trait
-///
-/// 3. **Impl body**: The methods and associated items inside the impl
-///    - Per PLAN.md, we collapse these to the impl block - the impl depends on
-///      whatever its methods depend on, but the methods aren't separate symbols.
-///
-/// ## Why impl dependencies matter for tarjanize
-///
-/// If we split `struct Foo` into crate A and `impl Foo { }` stays in crate B,
-/// we create a dependency from B→A. Worse, for `impl Trait for Type`, the impl
-/// MUST live in the same crate as either Trait or Type (orphan rules). We need
-/// to track these dependencies to respect those constraints.
+/// Walks the entire impl syntax (signature + body) to collect dependencies.
+/// This captures self type, trait, generic bounds, where clauses, and all
+/// references in method/const/type bodies.
 fn find_dependencies(
     sema: &Semantics<'_, RootDatabase>,
     impl_: Impl,
-    self_adt: Option<ra_ap_hir::Adt>,
-    trait_: Option<ra_ap_hir::Trait>,
 ) -> HashSet<String> {
     let db = sema.db;
 
-    // Collect all dependencies: declaration (self type, trait) and associated items.
-    [self_adt.map(ModuleDef::Adt), trait_.map(ModuleDef::Trait)]
+    // Walk the entire impl syntax (signature + body) to collect dependencies.
+    // This captures: self type, trait, generic bounds, where clauses, and
+    // all references in method/const/type bodies.
+    sema.source(impl_)
+        .map(|src| {
+            crate::dependencies::collect_path_deps(sema, src.value.syntax())
+        })
+        .unwrap_or_default()
         .into_iter()
-        .flatten()
-        .filter(|dep| is_local_def(db, &Definition::from(*dep)))
-        .filter_map(|dep| module_def_path(db, &dep))
-        .chain(
-            impl_.items(db).into_iter().flat_map(|item| {
-                find_module_def_dependencies(sema, item.into())
-            }),
-        )
+        .filter(|dep| is_local_def(db, dep))
+        .filter_map(|dep| crate::module_defs::definition_path(db, &dep))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
+    use ra_ap_hir::{Crate, Semantics, attach_db};
     use ra_ap_ide_db::RootDatabase;
     use ra_ap_test_fixture::WithFixture;
     use tarjanize_schemas::SymbolKind;
 
-    use crate::extract_symbol_graph;
+    use super::extract_impl;
+    use crate::file_path;
 
-    /// Inherent impl (`impl Foo { }`) should have self_type but no trait.
+    /// Helper to check impl extraction results.
+    fn check_impl(
+        fixture: &str,
+        expected_name: &str,
+        expected_self_type: Option<&str>,
+        expected_trait: Option<&str>,
+    ) {
+        let db = RootDatabase::with_files(fixture);
+        attach_db(&db, || {
+            let krate = Crate::all(&db)
+                .into_iter()
+                .find(|k| {
+                    k.display_name(&db)
+                        .is_some_and(|n| n.to_string() == "test_crate")
+                })
+                .expect("test_crate not found");
+
+            let crate_root = file_path(&db, krate.root_file(&db))
+                .expect("crate root file")
+                .parent()
+                .expect("crate root parent");
+
+            let sema = Semantics::new(&db);
+            let impl_ = krate
+                .root_module(&db)
+                .impl_defs(&db)
+                .into_iter()
+                .next()
+                .expect("no impl found");
+
+            let (name, symbol) = extract_impl(&sema, &crate_root, impl_)
+                .expect("extract_impl failed");
+
+            assert_eq!(name, expected_name);
+
+            let SymbolKind::Impl { self_type, trait_ } = &symbol.kind else {
+                panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
+            };
+            assert_eq!(self_type.as_deref(), expected_self_type);
+            assert_eq!(trait_.as_deref(), expected_trait);
+        });
+    }
+
+    // =========================================================================
+    // IMPL EXTRACTION TESTS
+    //
+    // Tests for extract_impl covering name generation and symbol field extraction.
+    // =========================================================================
+
     #[test]
     fn test_inherent_impl() {
-        let db = RootDatabase::with_files(
+        check_impl(
             r#"
 //- /lib.rs crate:test_crate
 pub struct Foo;
-
 impl Foo {
     pub fn method(&self) {}
 }
 "#,
+            "impl Foo",
+            Some("test_crate::Foo"),
+            None,
         );
-        let graph = extract_symbol_graph(db);
-        let root = &graph.crates["test_crate"];
-
-        let symbol = root
-            .symbols
-            .get("impl Foo")
-            .expect("Should have 'impl Foo' symbol");
-
-        // Verify it's an Impl with correct self_type and trait_
-        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
-            assert_eq!(
-                self_type.as_deref(),
-                Some("test_crate::Foo"),
-                "self_type should be test_crate::Foo"
-            );
-            assert_eq!(trait_.as_deref(), None, "trait_ should be None");
-        } else {
-            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
-        }
-
-        // Verify file path and cost are populated
-        assert_eq!(symbol.file, "lib.rs");
-        assert!(symbol.cost > 0.0, "cost should be non-zero");
     }
 
-    /// Trait impl (`impl Trait for Foo { }`) should have both self_type and trait.
     #[test]
     fn test_trait_impl() {
-        let db = RootDatabase::with_files(
+        check_impl(
             r#"
 //- /lib.rs crate:test_crate
-pub trait MyTrait {
-    fn method(&self);
-}
-
+pub trait MyTrait { fn method(&self); }
 pub struct Foo;
-
-impl MyTrait for Foo {
-    fn method(&self) {}
-}
+impl MyTrait for Foo { fn method(&self) {} }
 "#,
+            "impl MyTrait for Foo",
+            Some("test_crate::Foo"),
+            Some("test_crate::MyTrait"),
         );
-        let graph = extract_symbol_graph(db);
-        let root = &graph.crates["test_crate"];
-
-        let symbol = root
-            .symbols
-            .get("impl MyTrait for Foo")
-            .expect("Should have 'impl MyTrait for Foo' symbol");
-
-        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
-            assert_eq!(
-                self_type.as_deref(),
-                Some("test_crate::Foo"),
-                "self_type should be test_crate::Foo"
-            );
-            assert_eq!(
-                trait_.as_deref(),
-                Some("test_crate::MyTrait"),
-                "trait_ should be test_crate::MyTrait"
-            );
-        } else {
-            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
-        }
     }
 
-    /// Impl for reference type (`impl Trait for &Foo { }`) has self_type = None
-    /// because &Foo is not an ADT.
     #[test]
     fn test_impl_for_reference() {
-        let db = RootDatabase::with_files(
+        check_impl(
             r#"
 //- /lib.rs crate:test_crate
-pub trait MyTrait {
-    fn method(&self);
-}
-
+pub trait MyTrait { fn method(&self); }
 pub struct Foo;
-
-impl MyTrait for &Foo {
-    fn method(&self) {}
-}
+impl MyTrait for &Foo { fn method(&self) {} }
 "#,
+            "impl MyTrait for &Foo",
+            None, // &Foo is not an ADT
+            Some("test_crate::MyTrait"),
         );
-        let graph = extract_symbol_graph(db);
-        let root = &graph.crates["test_crate"];
-
-        let symbol = root
-            .symbols
-            .get("impl MyTrait for &Foo")
-            .expect("Should have 'impl MyTrait for &Foo' symbol");
-
-        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
-            // &Foo is not an ADT, so self_type is None
-            assert_eq!(
-                self_type.as_deref(),
-                None,
-                "self_type should be None for &Foo"
-            );
-            assert_eq!(
-                trait_.as_deref(),
-                Some("test_crate::MyTrait"),
-                "trait_ should be test_crate::MyTrait"
-            );
-        } else {
-            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
-        }
     }
 
-    /// Blanket impl (`impl<T> Trait for T { }`) has self_type = None
-    /// because T is a generic param, not an ADT.
     #[test]
     fn test_blanket_impl() {
-        let db = RootDatabase::with_files(
+        check_impl(
             r#"
 //- /lib.rs crate:test_crate
-pub trait MyTrait {
-    fn method(&self);
-}
-
-impl<T> MyTrait for T {
-    fn method(&self) {}
-}
+pub trait MyTrait { fn method(&self); }
+impl<T> MyTrait for T { fn method(&self) {} }
 "#,
+            "impl<T> MyTrait for T",
+            None, // T is a generic param
+            Some("test_crate::MyTrait"),
         );
-        let graph = extract_symbol_graph(db);
-        let root = &graph.crates["test_crate"];
-
-        let symbol = root
-            .symbols
-            .get("impl MyTrait for T")
-            .expect("Should have 'impl MyTrait for T' symbol");
-
-        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
-            // T is a generic param, not an ADT
-            assert_eq!(
-                self_type.as_deref(),
-                None,
-                "self_type should be None for T"
-            );
-            assert_eq!(
-                trait_.as_deref(),
-                Some("test_crate::MyTrait"),
-                "trait_ should be test_crate::MyTrait"
-            );
-        } else {
-            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
-        }
     }
 
-    /// Multiple impl blocks with the same signature should be merged,
-    /// combining their costs and dependencies.
     #[test]
-    fn test_impl_merging() {
-        let db = RootDatabase::with_files(
+    fn test_inherent_impl_generic() {
+        check_impl(
             r#"
 //- /lib.rs crate:test_crate
-pub struct Foo;
-pub struct DepA;
-pub struct DepB;
-
-impl Foo {
-    pub fn method_a(&self) -> DepA { DepA }
-}
-
-impl Foo {
-    pub fn method_b(&self) -> DepB { DepB }
+pub struct Wrapper<T>(T);
+impl<T> Wrapper<T> {
+    pub fn new(t: T) -> Self { Self(t) }
 }
 "#,
+            "impl<T> Wrapper<T>",
+            Some("test_crate::Wrapper"),
+            None,
         );
-        let graph = extract_symbol_graph(db);
-        let root = &graph.crates["test_crate"];
+    }
 
-        // Should have exactly one "impl Foo" symbol (merged)
-        let symbol = root
-            .symbols
-            .get("impl Foo")
-            .expect("Should have merged 'impl Foo' symbol");
-
-        // Dependencies should include both DepA and DepB
-        assert!(
-            symbol.dependencies.contains("test_crate::DepA"),
-            "Should depend on DepA"
+    #[test]
+    fn test_generic_bounds() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Foo;
+impl<T: Clone> MyTrait for Foo {}
+"#,
+            "impl<T: Clone> MyTrait for Foo",
+            Some("test_crate::Foo"),
+            Some("test_crate::MyTrait"),
         );
-        assert!(
-            symbol.dependencies.contains("test_crate::DepB"),
-            "Should depend on DepB"
+    }
+
+    #[test]
+    fn test_lifetime_params() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Ref<'a>(&'a str);
+impl<'a> MyTrait for Ref<'a> {}
+"#,
+            "impl<'a> MyTrait for Ref<'a>",
+            Some("test_crate::Ref"),
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_multiple_type_params() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Pair<T, U>(T, U);
+impl<T, U> MyTrait for Pair<T, U> {}
+"#,
+            "impl<T, U> MyTrait for Pair<T, U>",
+            Some("test_crate::Pair"),
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_generic_trait_impl() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Wrapper<T>(T);
+impl<T> MyTrait for Wrapper<T> {}
+"#,
+            "impl<T> MyTrait for Wrapper<T>",
+            Some("test_crate::Wrapper"),
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_where_clause() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Foo;
+impl<T> MyTrait for Foo where T: Clone {}
+"#,
+            "impl<T> MyTrait for Foo where T: Clone",
+            Some("test_crate::Foo"),
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_unsafe_impl() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub unsafe trait UnsafeTrait {}
+pub struct Foo;
+unsafe impl UnsafeTrait for Foo {}
+"#,
+            "unsafe impl UnsafeTrait for Foo",
+            Some("test_crate::Foo"),
+            Some("test_crate::UnsafeTrait"),
+        );
+    }
+
+    #[test]
+    fn test_tuple_type() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct A;
+pub struct B;
+impl MyTrait for (A, B) {}
+"#,
+            "impl MyTrait for (A, B)",
+            None, // tuple is not an ADT
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_array_type() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Foo;
+impl MyTrait for [Foo; 3] {}
+"#,
+            "impl MyTrait for [Foo; 3]",
+            None, // array is not an ADT
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_dyn_trait() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub trait OtherTrait {}
+impl MyTrait for dyn OtherTrait {}
+"#,
+            "impl MyTrait for dyn OtherTrait",
+            None, // dyn trait is not an ADT
+            Some("test_crate::MyTrait"),
+        );
+    }
+
+    #[test]
+    fn test_external_generic_with_local_type() {
+        check_impl(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {}
+pub struct Foo;
+impl MyTrait for Box<Foo> {}
+"#,
+            "impl MyTrait for Box<Foo>",
+            None, // Box<Foo> is not a local ADT
+            Some("test_crate::MyTrait"),
         );
     }
 }

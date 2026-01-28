@@ -1,4 +1,9 @@
-# Virtual workspace with no root package - tests fallback to directory name.
+# Virtual workspace with nested crate directories.
+#
+# Tests extraction from a workspace with:
+# - No root package (pure virtual workspace)
+# - Crates nested in a `crates/` subdirectory
+
 [workspace]
 members = ["crates/member_a"]
 resolver = "2"

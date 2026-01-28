@@ -16,7 +16,7 @@ use tracing::{info, instrument};
 use crate::ExtractError;
 
 /// Load a Rust workspace into rust-analyzer's analysis database.
-#[instrument]
+#[instrument(level = "debug")]
 pub(crate) fn load_workspace(
     path: impl AsRef<Path> + std::fmt::Debug,
 ) -> Result<RootDatabase, ExtractError> {
@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_load_workspace_succeeds() {
-        load_workspace("tests/fixtures/minimal_crate")
+        load_workspace("tests/fixtures/minimal")
             .expect("should load valid workspace");
     }
 

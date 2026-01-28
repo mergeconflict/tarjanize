@@ -66,7 +66,7 @@ pub(crate) fn file_path(
 ///
 /// Walks all workspace crates and extracts their symbols. Dependencies are
 /// stored directly on each symbol.
-#[instrument(skip(db))]
+#[instrument(level = "debug", skip(db))]
 pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
     // Filter to workspace members. Crate::all() returns ALL crates
     // (workspace + all transitive dependencies), but we only analyze
@@ -151,27 +151,4 @@ pub fn run(
     writeln!(output)?;
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use super::*;
-
-    /// run() should read a real Cargo project and produce reasonable output.
-    #[test]
-    fn test_run() {
-        let fixture = PathBuf::from("tests/fixtures/minimal_crate");
-        let mut output = Vec::new();
-
-        run(&fixture, &mut output).expect("run() should succeed");
-
-        let graph: SymbolGraph = serde_json::from_slice(&output)
-            .expect("run() should output valid JSON");
-        assert!(
-            graph.crates.contains_key("minimal_crate"),
-            "JSON output should contain minimal_crate"
-        );
-    }
 }

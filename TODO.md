@@ -95,46 +95,48 @@
 - [x] `extract_module()`
 - [x] `extract_module_symbols()`
 
+### impls.rs
+
+#### Production Code
+
+- [x] `impl_name()` - moved from paths.rs
+- [x] `extract_impl()`
+- [x] `find_dependencies()`
+
+#### Tests
+
+- [x] IMPL EXTRACTION TESTS (15 tests) - tests name generation and symbol extraction
+
+### modules.rs
+
+#### Tests
+
+- [x] `test_impl_merging` - tests that multiple impl blocks with same signature get merged
+
+### paths.rs
+
+#### Production Code
+
+- [x] `module_def_path()` - uses rust-analyzer's `canonical_path`
+- [x] `impl_path()`
+- [ ] `compute_relative_file_path()`
+
 ### module_defs.rs
 
 #### Production Code
 
 - [x] `extract_module_def()`
 - [x] `find_dependencies()`
+- [x] `definition_path()` - moved from paths.rs, only used here
 
 #### Tests
 
-- [ ] `test_macro_generated_symbol_has_file_path`
-- [ ] `test_modules_not_in_symbols`
-- [ ] `test_visibility`
-- [ ] `test_unnamed_const_skipped`
-- [ ] `test_kind_strings`
-
-### impls.rs
-
-#### Production Code
-
-- [x] `extract_impl()`
-- [x] `find_dependencies()`
-
-#### Tests
-
-- [x] `test_inherent_impl`
-- [x] `test_trait_impl`
-- [x] `test_impl_for_reference`
-- [x] `test_blanket_impl`
-- [x] `test_impl_merging`
-
-### paths.rs
-
-#### Production Code
-
-- [x] `build_module_path()`
-- [ ] `module_def_path()`
-- [ ] `definition_path()`
-- [ ] `impl_path()`
-- [ ] `impl_name()`
-- [ ] `compute_relative_file_path()`
+- [x] `test_macro_generated_symbol_has_file_path`
+- [x] `test_modules_not_in_symbols`
+- [x] `test_visibility`
+- [x] `test_unnamed_const_skipped`
+- [x] `test_kind_strings`
+- [x] DEFINITION PATH TESTS (12 tests)
 
 ### dependencies.rs
 
@@ -149,13 +151,13 @@
 #### Tests
 
 Tests are organized into 9 sections covering dependency sources, locations,
-normalization, resolution mechanisms, and filtering. All 78 tests reviewed.
+normalization, resolution mechanisms, and filtering. All 84 tests reviewed.
 
 - [x] BASIC DEPENDENCY TESTS (11 tests)
 - [x] FUNCTION DEPENDENCY LOCATIONS (11 tests)
 - [x] ADT DEPENDENCY LOCATIONS (6 tests)
 - [x] TRAIT DEPENDENCY LOCATIONS (3 tests)
-- [x] IMPL AND ITEM DEPENDENCY LOCATIONS (5 tests)
+- [x] IMPL AND ITEM DEPENDENCY LOCATIONS (11 tests)
 - [x] EDGE TARGET NORMALIZATION (12 tests)
 - [x] OTHER RESOLUTION MECHANISMS (17 tests)
 - [x] EDGE TARGET FILTERING (11 tests)
