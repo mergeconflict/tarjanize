@@ -90,24 +90,9 @@ pub(crate) fn definition_path(
         }
         Definition::Macro(m) => module_def_path(db, &ModuleDef::Macro(*m)),
 
-        // These should have been filtered out by normalize_definition.
+        // Everything else should have been filtered out by normalize_definition.
         // Return None rather than panicking to be defensive.
-        Definition::Module(_)
-        | Definition::Crate(_)
-        | Definition::Variant(_)
-        | Definition::Field(_)
-        | Definition::TupleField(_)
-        | Definition::BuiltinType(_)
-        | Definition::BuiltinLifetime(_)
-        | Definition::Local(_)
-        | Definition::GenericParam(_)
-        | Definition::Label(_)
-        | Definition::DeriveHelper(_)
-        | Definition::BuiltinAttr(_)
-        | Definition::ToolModule(_)
-        | Definition::ExternCrateDecl(_)
-        | Definition::InlineAsmRegOrRegClass(_)
-        | Definition::InlineAsmOperand(_) => None,
+        _ => None,
     }
 }
 

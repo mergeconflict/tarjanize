@@ -32,7 +32,7 @@ use std::collections::HashSet;
 
 use either::Either;
 use ra_ap_hir::{
-    AsAssocItem, AssocItemContainer, HasSource, HirFileId, ModuleDef, Semantics,
+    AsAssocItem, AssocItemContainer, HirFileId, ModuleDef, Semantics,
 };
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::defs::{Definition, NameRefClass};
@@ -60,163 +60,6 @@ pub(crate) fn is_local_def(db: &RootDatabase, def: &Definition) -> bool {
             .map(|m| m.krate(db).origin(db).is_local())
             .unwrap_or(false),
     }
-}
-
-/// Check if a ModuleDef belongs to a local (workspace) crate.
-/// Helper for direct ModuleDef checks (e.g., impl declaration deps).
-pub(crate) fn is_local(db: &RootDatabase, def: &ModuleDef) -> bool {
-    def.module(db)
-        .map(|m| m.krate(db).origin(db).is_local())
-        .unwrap_or(false)
-}
-
-/// Find all items that a given ModuleDef depends on.
-///
-/// This is the core of dependency analysis. Given an item (function, struct,
-/// etc.), we find every other item it references in its definition.
-///
-/// Returns a set of `Definition`s representing the normalized dependencies.
-/// These have already been collapsed (e.g., associated items → their impl/trait,
-/// enum variants → their enum) and filtered (no modules, builtins, locals, etc.).
-///
-/// ## What we capture
-/// - Path references: `Foo`, `bar()`, `mod::Type`
-/// - Method calls: `x.method()` - requires special handling (no visible path)
-///
-/// ## What we skip (intentionally)
-/// - Implicit std trait deps: `await` (Future), `?` (Try), `for` (IntoIterator),
-///   `[]` (Index), operators (Add/Sub/etc). These resolve to std library items
-///   which are foreign and filtered out anyway.
-/// - `#[derive(...)]` attributes: Not analyzed here, but the generated impl
-///   blocks are captured separately via `module.impl_defs()` in `extract_symbols`.
-/// - `macro_rules!` bodies: Token trees without hygiene context; can't resolve.
-///
-/// ## Collapsing to containers
-///
-/// Per PLAN.md, we collapse associated items to their containers:
-/// - Impl methods/consts/types → the impl block
-/// - Trait methods/consts/types → the trait
-/// - Enum variants → the enum
-///
-/// This ensures items that must stay together are treated atomically.
-///
-/// ## Impl blocks
-///
-/// Impl blocks are NOT ModuleDefs - they're anonymous. Use `find_impl_dependencies`
-/// for impl analysis (self type, trait, and associated items).
-///
-/// # Example
-///
-/// ```ignore
-/// // Get a function from the HIR
-/// let func: ModuleDef = /* ... */;
-///
-/// // Find all local dependencies
-/// let deps = find_dependencies(&sema, func);
-/// for dep in deps {
-///     println!("Depends on: {:?}", dep);
-/// }
-/// ```
-pub fn find_dependencies(
-    sema: &Semantics<'_, RootDatabase>,
-    def: ModuleDef,
-) -> HashSet<Definition> {
-    let db = sema.db;
-    let mut all_deps = HashSet::new();
-
-    // For each item type, we get its source and collect dependencies.
-    // The collect_deps_from helper handles the parse_or_expand dance needed
-    // to make Semantics work with the source nodes.
-    //
-    // Why different branches? Each ModuleDef variant's source() returns a
-    // different AST type. We could use a macro, but explicit matching gives
-    // clear compiler errors if rust-analyzer adds new variants.
-    match def {
-        ModuleDef::Function(func) => {
-            if let Some(src) = func.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
-            }
-        }
-        ModuleDef::Adt(adt) => match adt {
-            ra_ap_hir::Adt::Struct(s) => {
-                if let Some(src) = s.source(db) {
-                    collect_deps_from(
-                        sema,
-                        src.file_id,
-                        &src.value,
-                        &mut all_deps,
-                    );
-                }
-            }
-            ra_ap_hir::Adt::Enum(e) => {
-                if let Some(src) = e.source(db) {
-                    collect_deps_from(
-                        sema,
-                        src.file_id,
-                        &src.value,
-                        &mut all_deps,
-                    );
-                }
-            }
-            ra_ap_hir::Adt::Union(u) => {
-                if let Some(src) = u.source(db) {
-                    collect_deps_from(
-                        sema,
-                        src.file_id,
-                        &src.value,
-                        &mut all_deps,
-                    );
-                }
-            }
-        },
-        ModuleDef::Const(c) => {
-            if let Some(src) = c.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
-            }
-        }
-        ModuleDef::Static(s) => {
-            if let Some(src) = s.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
-            }
-        }
-        ModuleDef::Trait(t) => {
-            if let Some(src) = t.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
-            }
-        }
-        ModuleDef::TypeAlias(t) => {
-            if let Some(src) = t.source(db) {
-                collect_deps_from(sema, src.file_id, &src.value, &mut all_deps);
-            }
-        }
-
-        // Modules are containers, not items with dependencies. We analyze their
-        // contents individually. `pub use` re-exports don't create dependencies
-        // for tarjanize purposes - they're just visibility aliases.
-        ModuleDef::Module(_) => {}
-
-        // Enum variants don't need separate analysis. When we analyze the parent
-        // enum, we walk its entire syntax tree including all variant definitions,
-        // so dependencies like `Foo` in `enum E { V(Foo) }` are captured there.
-        ModuleDef::Variant(_) => {}
-
-        // macro_rules! bodies are token trees without hygiene context - we can't
-        // reliably resolve paths in them. Proc macros are separate crates.
-        // Macro *invocations* are handled: rust-analyzer expands them and we
-        // analyze the expanded code.
-        ModuleDef::Macro(_) => {}
-
-        // Builtin types (i32, bool, str, char, etc.) are language primitives.
-        // They have no source code and no dependencies - they just exist.
-        ModuleDef::BuiltinType(_) => {}
-    }
-
-    // Filter to local (workspace) dependencies only. External crates are already
-    // separate compilation units, so we don't need to track them.
-    all_deps
-        .into_iter()
-        .filter(|dep| is_local_def(db, dep))
-        .collect()
 }
 
 /// Find a node in a syntax tree by matching its text range.
@@ -253,16 +96,15 @@ fn find_node_in_file(
 /// The file_id and syntax parameters come from `item.source(db)` - we take
 /// them separately because each HIR type's source() returns a different AST
 /// type, but they all implement AstNode with .syntax().
-fn collect_deps_from<T: AstNode>(
+pub(crate) fn collect_deps_from<T: AstNode>(
     sema: &Semantics<'_, RootDatabase>,
     file_id: HirFileId,
     syntax: &T,
-    deps: &mut HashSet<Definition>,
-) {
+) -> HashSet<Definition> {
     let root = sema.parse_or_expand(file_id);
-    if let Some(node) = find_node_in_file(&root, syntax.syntax()) {
-        collect_path_deps(sema, &node, deps);
-    }
+    find_node_in_file(&root, syntax.syntax())
+        .map(|node| collect_path_deps(sema, &node))
+        .unwrap_or_default()
 }
 
 /// Walk a syntax tree and collect all references that resolve to dependencies.
@@ -284,9 +126,9 @@ fn collect_deps_from<T: AstNode>(
 fn collect_path_deps(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
-    deps: &mut HashSet<Definition>,
-) {
+) -> HashSet<Definition> {
     let db = sema.db;
+    let mut deps = HashSet::new();
 
     // Use NameRefClass::classify for robust name resolution.
     // This is the canonical rust-analyzer pattern from goto_definition.rs
@@ -324,13 +166,17 @@ fn collect_path_deps(
     // Handle expressions that create dependencies without visible name refs.
     // Method calls are the main case - the method name is resolved based on
     // the receiver's type, not as a standalone name reference.
-    for expr in syntax.descendants().filter_map(ast::Expr::cast) {
-        collect_expr_deps(sema, &expr, deps);
-    }
+    deps.extend(
+        syntax
+            .descendants()
+            .filter_map(ast::Expr::cast)
+            .filter_map(|expr| collect_expr_dep(sema, &expr)),
+    );
 
-    // NOTE: Impl blocks are handled separately via find_impl_dependencies().
+    // NOTE: Impl blocks are handled separately via impls::find_dependencies().
     // #[derive(...)] attributes typically reference foreign traits (Clone, Debug,
     // etc.) which we filter out anyway.
+    deps
 }
 
 /// Normalize a ModuleDef to the appropriate Definition dependency target.
@@ -470,16 +316,15 @@ fn normalize_definition(
     }
 }
 
-/// Exhaustively match on Expr variants to collect dependencies.
+/// Extract dependency from an expression, if any.
 ///
 /// We use exhaustive matching so the compiler warns us if rust-analyzer adds
 /// new expression types. Most expressions are handled by NameRef classification
 /// or tree walking; only method calls need special handling.
-fn collect_expr_deps(
+fn collect_expr_dep(
     sema: &Semantics<'_, RootDatabase>,
     expr: &ast::Expr,
-    deps: &mut HashSet<Definition>,
-) {
+) -> Option<Definition> {
     use ast::Expr;
     match expr {
         // Method calls: `x.method()` has no path - resolved based on receiver type.
@@ -503,42 +348,35 @@ fn collect_expr_deps(
                         .map(|(either, _subst)| either)
                 });
 
-            if let Some(either) = resolution {
-                match either {
-                    Either::Left(func) => {
-                        // Normal method call - collapse to container.
-                        if let Some(assoc_item) = func.as_assoc_item(sema.db) {
-                            match assoc_item.container(sema.db) {
-                                AssocItemContainer::Impl(impl_) => {
-                                    deps.insert(Definition::SelfType(impl_));
-                                }
-                                AssocItemContainer::Trait(trait_) => {
-                                    deps.insert(Definition::Trait(trait_));
-                                }
+            resolution.and_then(|either| match either {
+                Either::Left(func) => {
+                    // Normal method call - collapse to container.
+                    if let Some(assoc_item) = func.as_assoc_item(sema.db) {
+                        Some(match assoc_item.container(sema.db) {
+                            AssocItemContainer::Impl(impl_) => {
+                                Definition::SelfType(impl_)
                             }
-                        } else {
-                            // Not an associated item (free function?).
-                            deps.insert(Definition::Function(func));
-                        }
-                    }
-                    Either::Right(field) => {
-                        // Callable field: `foo.callback()` where callback is fn type.
-                        // Dependency is on the parent struct that contains the field.
-                        if let Some(dep) = variant_def_to_adt_def(
-                            sema.db,
-                            field.parent_def(sema.db),
-                        ) {
-                            deps.insert(dep);
-                        }
+                            AssocItemContainer::Trait(trait_) => {
+                                Definition::Trait(trait_)
+                            }
+                        })
+                    } else {
+                        // Not an associated item (free function?).
+                        Some(Definition::Function(func))
                     }
                 }
-            }
+                Either::Right(field) => {
+                    // Callable field: `foo.callback()` where callback is fn type.
+                    // Dependency is on the parent struct that contains the field.
+                    variant_def_to_adt_def(sema.db, field.parent_def(sema.db))
+                }
+            })
         }
 
         // Field access: technically depends on the struct, but if we're calling
         // methods or using the struct at all, we already have that dependency
         // via the type annotation or constructor.
-        Expr::FieldExpr(_) => {}
+        Expr::FieldExpr(_) => None,
 
         // Operators, await, try, for, index, prefix: these may use std traits
         // (Add, Future, Try, IntoIterator, Index, Deref, etc.) but those are
@@ -548,7 +386,7 @@ fn collect_expr_deps(
         | Expr::TryExpr(_)
         | Expr::ForExpr(_)
         | Expr::IndexExpr(_)
-        | Expr::PrefixExpr(_) => {}
+        | Expr::PrefixExpr(_) => None,
 
         // Everything else: either contains Path nodes (handled by path resolution)
         // or contains nested expressions (handled by tree walking).
@@ -579,7 +417,7 @@ fn collect_expr_deps(
         | Expr::UnderscoreExpr(_)
         | Expr::WhileExpr(_)
         | Expr::YeetExpr(_)
-        | Expr::YieldExpr(_) => {}
+        | Expr::YieldExpr(_) => None,
     }
 }
 
@@ -609,10 +447,10 @@ mod tests {
     fn has_edge_in_module(module: &Module, from: &str, to: &str) -> bool {
         // Check symbols in this module
         for (name, symbol) in &module.symbols {
-            if name.contains(from) {
-                if symbol.dependencies.iter().any(|dep| dep.contains(to)) {
-                    return true;
-                }
+            if name.contains(from)
+                && symbol.dependencies.iter().any(|dep| dep.contains(to))
+            {
+                return true;
             }
         }
         // Check submodules
@@ -671,7 +509,7 @@ mod tests {
 
     /// Test function call dependencies.
     #[test]
-    fn test_fixture_function_call() {
+    fn test_function_call() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -692,7 +530,7 @@ pub fn caller_fn() {
 
     /// Test struct field type dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_struct_field() {
+    fn test_struct_field() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -713,7 +551,7 @@ pub struct ContainerType {
 
     /// Test trait bound dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_trait_bound() {
+    fn test_trait_bound() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -732,7 +570,7 @@ pub fn generic_fn<T: MyTrait>(_x: T) {}
 
     /// Test impl block dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_impl_block() {
+    fn test_impl_block() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -762,7 +600,7 @@ impl MyTrait for MyType {
 
     /// Test cross-crate dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_cross_crate() {
+    fn test_cross_crate() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:dep_crate
@@ -796,7 +634,7 @@ pub fn calls_dep_fn() {
 
     /// Test const and static dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_const_static() {
+    fn test_const_static() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -822,7 +660,7 @@ pub static MY_STATIC: Option<TargetType> = None;
 
     /// Test type alias dependencies using an in-memory fixture.
     #[test]
-    fn test_fixture_type_alias() {
+    fn test_type_alias() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -841,7 +679,7 @@ pub type MyAlias = TargetType;
 
     /// Test submodule extraction using an in-memory fixture.
     #[test]
-    fn test_fixture_submodule() {
+    fn test_submodule() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -873,7 +711,7 @@ pub fn uses_inner() -> inner::InnerType {
 
     /// Test inherent impl (no trait) using an in-memory fixture.
     #[test]
-    fn test_fixture_inherent_impl() {
+    fn test_inherent_impl() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -905,7 +743,7 @@ impl MyType {
     // =========================================================================
 
     #[test]
-    fn test_fixture_fn_param_type() {
+    fn test_fn_param_type() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -923,7 +761,7 @@ pub fn fn_with_param(_x: ParamType) {}
     }
 
     #[test]
-    fn test_fixture_fn_return_type() {
+    fn test_fn_return_type() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -943,7 +781,7 @@ pub fn fn_with_return() -> ReturnType {
     }
 
     #[test]
-    fn test_fixture_fn_body_type() {
+    fn test_fn_body_type() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -963,7 +801,7 @@ pub fn fn_uses_type_in_body() {
     }
 
     #[test]
-    fn test_fixture_fn_where_clause() {
+    fn test_fn_where_clause() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -988,7 +826,7 @@ where
     // =========================================================================
 
     #[test]
-    fn test_fixture_struct_trait_bound() {
+    fn test_struct_trait_bound() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1008,7 +846,7 @@ pub struct StructWithBound<T: BoundTrait> {
     }
 
     #[test]
-    fn test_fixture_struct_where_clause() {
+    fn test_struct_where_clause() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1035,7 +873,7 @@ where
     // =========================================================================
 
     #[test]
-    fn test_fixture_enum_tuple_variant() {
+    fn test_enum_tuple_variant() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1055,7 +893,7 @@ pub enum EnumWithTuple {
     }
 
     #[test]
-    fn test_fixture_enum_struct_variant() {
+    fn test_enum_struct_variant() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1075,7 +913,7 @@ pub enum EnumWithStruct {
     }
 
     #[test]
-    fn test_fixture_enum_trait_bound() {
+    fn test_enum_trait_bound() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1095,7 +933,7 @@ pub enum EnumWithBound<T: BoundTrait> {
     }
 
     #[test]
-    fn test_fixture_union_field() {
+    fn test_union_field() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1119,7 +957,7 @@ pub union UnionWithField {
     // =========================================================================
 
     #[test]
-    fn test_fixture_trait_supertrait() {
+    fn test_trait_supertrait() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1137,7 +975,7 @@ pub trait SubTrait: Supertrait {}
     }
 
     #[test]
-    fn test_fixture_trait_assoc_type_bound() {
+    fn test_trait_assoc_type_bound() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1157,7 +995,7 @@ pub trait TraitWithAssocBound {
     }
 
     #[test]
-    fn test_fixture_trait_default_method() {
+    fn test_trait_default_method() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1188,7 +1026,7 @@ pub trait TraitWithDefault {
     }
 
     #[test]
-    fn test_fixture_trait_default_const() {
+    fn test_trait_default_const() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1212,7 +1050,7 @@ pub trait TraitWithDefaultConst {
     // =========================================================================
 
     #[test]
-    fn test_fixture_impl_method_body_deps() {
+    fn test_impl_method_body_deps() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1244,7 +1082,7 @@ impl SelfType {
     }
 
     #[test]
-    fn test_fixture_impl_assoc_type() {
+    fn test_impl_assoc_type() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1273,7 +1111,7 @@ impl TraitWithAssoc for ImplType {
     // =========================================================================
 
     #[test]
-    fn test_fixture_method_call_inherent() {
+    fn test_method_call_inherent() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1299,7 +1137,7 @@ pub fn caller() {
     }
 
     #[test]
-    fn test_fixture_method_call_trait() {
+    fn test_method_call_trait() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1333,7 +1171,7 @@ pub fn caller() {
     // =========================================================================
 
     #[test]
-    fn test_fixture_enum_variant_collapses() {
+    fn test_enum_variant_collapses() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1377,7 +1215,7 @@ pub fn constructs_variant() -> MyEnum {
     }
 
     #[test]
-    fn test_fixture_module_not_edge_target() {
+    fn test_module_not_edge_target() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1419,7 +1257,7 @@ pub fn calls_inner_fn() {
     }
 
     #[test]
-    fn test_fixture_trait_assoc_const_collapses() {
+    fn test_trait_assoc_const_collapses() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1464,7 +1302,7 @@ pub fn uses_assoc_const() -> i32 {
     // =========================================================================
 
     #[test]
-    fn test_fixture_impl_for_reference() {
+    fn test_impl_for_reference() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1493,7 +1331,7 @@ pub fn calls_ref_impl(x: &Target) {
     }
 
     #[test]
-    fn test_fixture_impl_for_mut_reference() {
+    fn test_impl_for_mut_reference() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1530,7 +1368,7 @@ pub fn calls_mut_ref_impl(x: &mut Target) {
     // =========================================================================
 
     #[test]
-    fn test_fixture_std_only_no_local_deps() {
+    fn test_std_only_no_local_deps() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1570,7 +1408,7 @@ pub struct UsesStdOnly {
     // =========================================================================
 
     #[test]
-    fn test_fixture_const_with_initializer_deps() {
+    fn test_const_with_initializer_deps() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1599,7 +1437,7 @@ const fn helper() -> i32 { 42 }
     }
 
     #[test]
-    fn test_fixture_static_with_initializer_deps() {
+    fn test_static_with_initializer_deps() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1628,7 +1466,7 @@ const fn helper() -> i32 { 42 }
     }
 
     #[test]
-    fn test_fixture_type_alias_with_generic_deps() {
+    fn test_type_alias_with_generic_deps() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1659,7 +1497,7 @@ pub type MyAlias = Wrapper<Inner>;
     // =========================================================================
 
     #[test]
-    fn test_fixture_trait_default_method_call() {
+    fn test_trait_default_method_call() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1697,7 +1535,7 @@ pub fn caller() -> i32 {
     // =========================================================================
 
     #[test]
-    fn test_fixture_impl_assoc_const_as_dependency() {
+    fn test_impl_assoc_const_as_dependency() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1722,7 +1560,7 @@ pub fn uses_assoc_const() -> i32 {
     }
 
     #[test]
-    fn test_fixture_impl_assoc_type_as_dependency() {
+    fn test_impl_assoc_type_as_dependency() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1753,7 +1591,7 @@ pub fn uses_assoc_type() -> <MyType as MyTrait>::Output {
     }
 
     #[test]
-    fn test_fixture_trait_with_assoc_const_default() {
+    fn test_trait_with_assoc_const_default() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1781,7 +1619,7 @@ pub trait TraitWithConst {
     // =========================================================================
 
     #[test]
-    fn test_fixture_dependency_to_const() {
+    fn test_dependency_to_const() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1802,7 +1640,7 @@ pub fn uses_const() -> i32 {
     }
 
     #[test]
-    fn test_fixture_dependency_to_static() {
+    fn test_dependency_to_static() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1823,7 +1661,7 @@ pub fn uses_static() -> i32 {
     }
 
     #[test]
-    fn test_fixture_dependency_to_type_alias() {
+    fn test_dependency_to_type_alias() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1844,7 +1682,7 @@ pub fn uses_alias(x: MyAlias) -> MyAlias {
     }
 
     #[test]
-    fn test_fixture_assoc_fn_via_path() {
+    fn test_assoc_fn_via_path() {
         let db = RootDatabase::with_files(
             r#"
 //- /lib.rs crate:test_crate
@@ -1878,7 +1716,7 @@ pub fn caller() -> i32 {
     // =========================================================================
 
     #[test]
-    fn test_fixture_callable_field() {
+    fn test_callable_field() {
         // Test that callable fields (fields with fn pointer or closure type)
         // are handled via resolve_method_call_fallback.
         //

@@ -15,12 +15,12 @@ use ra_ap_base_db::VfsPath;
 use ra_ap_hir::{Impl, ModuleDef, Semantics};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::RootDatabase;
+use ra_ap_ide_db::defs::Definition;
 use tarjanize_schemas::{Symbol, SymbolKind};
 
-use crate::dependencies::{find_dependencies, is_local};
-use crate::paths::{
-    compute_relative_file_path, definition_path, impl_name, module_def_path,
-};
+use crate::dependencies::is_local_def;
+use crate::module_defs::find_dependencies as find_module_def_dependencies;
+use crate::paths::{compute_relative_file_path, impl_name, module_def_path};
 
 /// Extract an impl block as a (name, Symbol) pair.
 pub(crate) fn extract_impl(
@@ -37,36 +37,19 @@ pub(crate) fn extract_impl(
     let file = compute_relative_file_path(db, crate_root, nav.file_id);
     let cost: f64 = u32::from(nav.full_range.len()).into();
 
-    // Extract self_type and trait paths for the schema.
-    // These are used to enforce the orphan rule during analysis.
-    let self_type_path = impl_
-        .self_ty(db)
-        .as_adt()
-        .and_then(|adt| module_def_path(db, &ModuleDef::Adt(adt)));
+    // Extract self type ADT and trait from the impl declaration.
+    // Used for both the schema (orphan rule analysis) and dependency collection.
+    let self_type = impl_.self_ty(db).as_adt();
+    let trait_ = impl_.trait_(db);
 
-    let trait_path = impl_
-        .trait_(db)
-        .and_then(|t| module_def_path(db, &t.into()));
+    let self_type_path =
+        self_type.and_then(|adt| module_def_path(db, &ModuleDef::Adt(adt)));
+    let trait_path =
+        trait_.and_then(|t| module_def_path(db, &ModuleDef::Trait(t)));
 
-    // Collect dependencies from the impl declaration (self type, trait).
-    let impl_deps = find_impl_dependencies(db, impl_);
-    let mut dependencies: HashSet<String> = impl_deps
-        .deps
-        .into_iter()
-        .filter(|dep| is_local(db, dep))
-        .filter_map(|dep| module_def_path(db, &dep))
-        .collect();
-
-    // Collect dependencies from associated items (methods, consts, type aliases).
-    // Per PLAN.md, we collapse these to the impl block - the impl depends on
-    // whatever its methods depend on, but the methods aren't separate symbols.
-    for item in impl_deps.items {
-        dependencies.extend(
-            find_dependencies(sema, item.into())
-                .into_iter()
-                .filter_map(|dep| definition_path(db, &dep)),
-        );
-    }
+    // Collect all dependencies: impl declaration (self type, trait) and
+    // associated items (methods, consts, type aliases).
+    let dependencies = find_dependencies(sema, impl_, self_type, trait_);
 
     Some((
         name,
@@ -82,23 +65,23 @@ pub(crate) fn extract_impl(
     ))
 }
 
-/// Analyze dependencies for an impl block.
+/// Find all items that an impl block depends on.
 ///
 /// Impl blocks are NOT part of ModuleDef (they're anonymous - you can't write
 /// a path like `my_crate::SomeImpl`). This function handles the impl-specific
-/// dependencies that `find_dependencies` cannot capture.
+/// dependencies.
 ///
 /// ## Dependencies captured
 ///
 /// 1. **Self type**: `impl Foo { }` depends on Foo
 ///    - `impl Vec<Bar> { }` depends on both Vec and Bar
-///    - We get the ADT (struct/enum/union) from the self type
+///    - The ADT (struct/enum/union) is passed in from the caller
 ///
 /// 2. **Trait** (for trait impls): `impl Trait for Type { }` depends on Trait
 ///
 /// 3. **Impl body**: The methods and associated items inside the impl
-///    - These are analyzed separately as Functions via `find_dependencies`
-///    - We return them for the caller to process
+///    - Per PLAN.md, we collapse these to the impl block - the impl depends on
+///      whatever its methods depend on, but the methods aren't separate symbols.
 ///
 /// ## Why impl dependencies matter for tarjanize
 ///
@@ -106,46 +89,232 @@ pub(crate) fn extract_impl(
 /// we create a dependency from B→A. Worse, for `impl Trait for Type`, the impl
 /// MUST live in the same crate as either Trait or Type (orphan rules). We need
 /// to track these dependencies to respect those constraints.
-pub(crate) fn find_impl_dependencies(
-    db: &RootDatabase,
+fn find_dependencies(
+    sema: &Semantics<'_, RootDatabase>,
     impl_: Impl,
-) -> ImplDependencies {
-    let mut deps = Vec::new();
+    self_adt: Option<ra_ap_hir::Adt>,
+    trait_: Option<ra_ap_hir::Trait>,
+) -> HashSet<String> {
+    let db = sema.db;
 
-    // Get the self type (the type being implemented).
-    // For `impl Foo { }` this is Foo.
-    // For `impl Trait for Type { }` this is Type.
-    let self_ty = impl_.self_ty(db);
-
-    // Extract the ADT (struct/enum/union) from the self type.
-    // For `impl Foo { }` or `impl Foo<Bar> { }`, we get Foo.
-    // Generic parameters like Bar are typically captured when the impl body
-    // references them in type positions (which path resolution handles).
-    if let Some(adt) = self_ty.as_adt() {
-        deps.push(ModuleDef::Adt(adt));
-    }
-
-    // Get the trait (if this is a trait impl).
-    // For `impl Clone for Foo { }` this is Some(Clone).
-    // For `impl Foo { }` (inherent impl) this is None.
-    if let Some(trait_) = impl_.trait_(db) {
-        deps.push(ModuleDef::Trait(trait_));
-    }
-
-    // Get the associated items (methods, consts, types) in the impl.
-    // These need their own dependency analysis via find_dependencies().
-    let items = impl_.items(db);
-
-    ImplDependencies { deps, items }
+    // Collect all dependencies: declaration (self type, trait) and associated items.
+    [
+        self_adt.map(ModuleDef::Adt),
+        trait_.map(ModuleDef::Trait),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|dep| is_local_def(db, &Definition::from(*dep)))
+    .filter_map(|dep| module_def_path(db, &dep))
+    .chain(
+        impl_
+            .items(db)
+            .into_iter()
+            .flat_map(|item| find_module_def_dependencies(sema, item.into())),
+    )
+    .collect()
 }
 
-/// The result of analyzing an impl block's dependencies.
-#[derive(Debug)]
-pub(crate) struct ImplDependencies {
-    /// Direct dependencies from the impl declaration itself (self type, trait).
-    pub deps: Vec<ModuleDef>,
+#[cfg(test)]
+mod tests {
+    use ra_ap_ide_db::RootDatabase;
+    use ra_ap_test_fixture::WithFixture;
+    use tarjanize_schemas::SymbolKind;
 
-    /// Associated items in the impl that need their own dependency analysis.
-    /// The caller should process these with `find_dependencies()`.
-    pub items: Vec<ra_ap_hir::AssocItem>,
+    use crate::extract_symbol_graph;
+
+    /// Inherent impl (`impl Foo { }`) should have self_type but no trait.
+    #[test]
+    fn test_inherent_impl() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub struct Foo;
+
+impl Foo {
+    pub fn method(&self) {}
+}
+"#,
+        );
+        let graph = extract_symbol_graph(db);
+        let root = &graph.crates["test_crate"];
+
+        let symbol = root
+            .symbols
+            .get("impl Foo")
+            .expect("Should have 'impl Foo' symbol");
+
+        // Verify it's an Impl with correct self_type and trait_
+        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
+            assert_eq!(
+                self_type.as_deref(),
+                Some("test_crate::Foo"),
+                "self_type should be test_crate::Foo"
+            );
+            assert_eq!(trait_.as_deref(), None, "trait_ should be None");
+        } else {
+            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
+        }
+
+        // Verify file path and cost are populated
+        assert_eq!(symbol.file, "lib.rs");
+        assert!(symbol.cost > 0.0, "cost should be non-zero");
+    }
+
+    /// Trait impl (`impl Trait for Foo { }`) should have both self_type and trait.
+    #[test]
+    fn test_trait_impl() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {
+    fn method(&self);
+}
+
+pub struct Foo;
+
+impl MyTrait for Foo {
+    fn method(&self) {}
+}
+"#,
+        );
+        let graph = extract_symbol_graph(db);
+        let root = &graph.crates["test_crate"];
+
+        let symbol = root
+            .symbols
+            .get("impl MyTrait for Foo")
+            .expect("Should have 'impl MyTrait for Foo' symbol");
+
+        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
+            assert_eq!(
+                self_type.as_deref(),
+                Some("test_crate::Foo"),
+                "self_type should be test_crate::Foo"
+            );
+            assert_eq!(
+                trait_.as_deref(),
+                Some("test_crate::MyTrait"),
+                "trait_ should be test_crate::MyTrait"
+            );
+        } else {
+            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
+        }
+    }
+
+    /// Impl for reference type (`impl Trait for &Foo { }`) has self_type = None
+    /// because &Foo is not an ADT.
+    #[test]
+    fn test_impl_for_reference() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {
+    fn method(&self);
+}
+
+pub struct Foo;
+
+impl MyTrait for &Foo {
+    fn method(&self) {}
+}
+"#,
+        );
+        let graph = extract_symbol_graph(db);
+        let root = &graph.crates["test_crate"];
+
+        let symbol = root
+            .symbols
+            .get("impl MyTrait for &Foo")
+            .expect("Should have 'impl MyTrait for &Foo' symbol");
+
+        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
+            // &Foo is not an ADT, so self_type is None
+            assert_eq!(self_type.as_deref(), None, "self_type should be None for &Foo");
+            assert_eq!(
+                trait_.as_deref(),
+                Some("test_crate::MyTrait"),
+                "trait_ should be test_crate::MyTrait"
+            );
+        } else {
+            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
+        }
+    }
+
+    /// Blanket impl (`impl<T> Trait for T { }`) has self_type = None
+    /// because T is a generic param, not an ADT.
+    #[test]
+    fn test_blanket_impl() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub trait MyTrait {
+    fn method(&self);
+}
+
+impl<T> MyTrait for T {
+    fn method(&self) {}
+}
+"#,
+        );
+        let graph = extract_symbol_graph(db);
+        let root = &graph.crates["test_crate"];
+
+        let symbol = root
+            .symbols
+            .get("impl MyTrait for T")
+            .expect("Should have 'impl MyTrait for T' symbol");
+
+        if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
+            // T is a generic param, not an ADT
+            assert_eq!(self_type.as_deref(), None, "self_type should be None for T");
+            assert_eq!(
+                trait_.as_deref(),
+                Some("test_crate::MyTrait"),
+                "trait_ should be test_crate::MyTrait"
+            );
+        } else {
+            panic!("Expected SymbolKind::Impl, got {:?}", symbol.kind);
+        }
+    }
+
+    /// Multiple impl blocks with the same signature should be merged,
+    /// combining their costs and dependencies.
+    #[test]
+    fn test_impl_merging() {
+        let db = RootDatabase::with_files(
+            r#"
+//- /lib.rs crate:test_crate
+pub struct Foo;
+pub struct DepA;
+pub struct DepB;
+
+impl Foo {
+    pub fn method_a(&self) -> DepA { DepA }
+}
+
+impl Foo {
+    pub fn method_b(&self) -> DepB { DepB }
+}
+"#,
+        );
+        let graph = extract_symbol_graph(db);
+        let root = &graph.crates["test_crate"];
+
+        // Should have exactly one "impl Foo" symbol (merged)
+        let symbol = root
+            .symbols
+            .get("impl Foo")
+            .expect("Should have merged 'impl Foo' symbol");
+
+        // Dependencies should include both DepA and DepB
+        assert!(
+            symbol.dependencies.contains("test_crate::DepA"),
+            "Should depend on DepA"
+        );
+        assert!(
+            symbol.dependencies.contains("test_crate::DepB"),
+            "Should depend on DepB"
+        );
+    }
 }

@@ -13,8 +13,10 @@ cargo nextest run -E 'test(foo)'  # Run tests matching expression
 cargo test --doc                # Run doc tests (nextest doesn't run these)
 cargo llvm-cov nextest          # Run tests with coverage report
 cargo fmt                       # Format code (80-char lines, edition 2024)
-cargo clippy                    # Lint
+cargo clippy --all-targets      # Lint (--all-targets required in virtual workspaces)
 ```
+
+**All code must pass `cargo clippy --all-targets` without warnings.** Fix any warnings before committing.
 
 ## Project Overview
 

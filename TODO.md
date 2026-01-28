@@ -2,8 +2,9 @@
 
 ## Follow-up Tasks
 
-- [ ] Audit logging levels: downgrade INFO logs to DEBUG where appropriate
+- [x] Audit logging levels: downgrade INFO logs to DEBUG where appropriate
 - [ ] Implement proptest strategies for generating structurally valid SymbolGraph instances (dependencies and Impl paths reference actual symbols). Requires two-phase generation: create symbol structure first, then populate dependencies from the set of valid symbol paths.
+- [ ] Experiment with further parallelization in `extract_module_symbols` using rayon. Currently crates are processed in parallel, but symbol extraction within modules is sequential. Considerations: (1) `Semantics` must be `Send + Sync` to use `par_iter()`, (2) may cause lock contention on the database if already parallel at crate level, (3) overhead may outweigh benefit for small modules.
 
 ## tarjanize
 
@@ -99,6 +100,7 @@
 #### Production Code
 
 - [x] `extract_module_def()`
+- [x] `find_dependencies()`
 
 #### Tests
 
@@ -112,9 +114,16 @@
 
 #### Production Code
 
-- [ ] `extract_impl()`
-- [ ] `find_impl_dependencies()`
-- [ ] `ImplDependencies` struct
+- [x] `extract_impl()`
+- [x] `find_dependencies()`
+
+#### Tests
+
+- [x] `test_inherent_impl`
+- [x] `test_trait_impl`
+- [x] `test_impl_for_reference`
+- [x] `test_blanket_impl`
+- [x] `test_impl_merging`
 
 ### paths.rs
 
@@ -132,8 +141,6 @@
 #### Production Code
 
 - [ ] `is_local_def()`
-- [ ] `is_local()`
-- [ ] `find_dependencies()`
 - [ ] `find_node_in_file()`
 - [ ] `collect_deps_from()`
 - [ ] `collect_path_deps()`
@@ -141,46 +148,52 @@
 - [ ] `collapse_assoc_item()`
 - [ ] `variant_def_to_adt_def()`
 - [ ] `normalize_definition()`
-- [ ] `collect_expr_deps()`
+- [ ] `collect_expr_dep()`
 
 #### Tests
 
-- [ ] `test_fixture_fn_call`
-- [ ] `test_fixture_struct_field`
-- [ ] `test_fixture_trait_bound`
-- [ ] `test_fixture_impl_block`
-- [ ] `test_fixture_cross_crate`
-- [ ] `test_fixture_const_static`
-- [ ] `test_fixture_type_alias`
-- [ ] `test_fixture_submodule`
-- [ ] `test_fixture_inherent_impl`
-- [ ] `test_fixture_fn_param_type`
-- [ ] `test_fixture_fn_return_type`
-- [ ] `test_fixture_fn_local_var`
-- [ ] `test_fixture_fn_multiple_deps`
-- [ ] `test_fixture_fn_generic_bound`
-- [ ] `test_fixture_fn_where_clause`
-- [ ] `test_fixture_struct_generic_field`
-- [ ] `test_fixture_struct_tuple`
-- [ ] `test_fixture_struct_unit`
-- [ ] `test_fixture_enum_variant_struct`
-- [ ] `test_fixture_enum_variant_tuple`
-- [ ] `test_fixture_trait_method_param`
-- [ ] `test_fixture_trait_method_return`
-- [ ] `test_fixture_trait_assoc_type_bound`
-- [ ] `test_fixture_trait_supertrait`
-- [ ] `test_fixture_impl_method_body`
-- [ ] `test_fixture_impl_generic_constraint`
-- [ ] `test_fixture_impl_trait_for_type`
-- [ ] `test_fixture_method_call_inherent`
-- [ ] `test_fixture_method_call_trait`
-- [ ] `test_fixture_qualified_path`
-- [ ] `test_fixture_use_statement`
-- [ ] `test_fixture_macro_use`
-- [ ] `test_fixture_type_alias_generic`
-- [ ] `test_fixture_const_type`
-- [ ] `test_fixture_static_type`
-- [ ] `test_fixture_closure_capture`
-- [ ] `test_fixture_async_fn`
-- [ ] `test_fixture_impl_deref`
-- [ ] `test_fixture_self_referential`
+- [ ] `test_function_call`
+- [ ] `test_struct_field`
+- [ ] `test_trait_bound`
+- [ ] `test_impl_block`
+- [ ] `test_cross_crate`
+- [ ] `test_const_static`
+- [ ] `test_type_alias`
+- [ ] `test_submodule`
+- [ ] `test_inherent_impl`
+- [ ] `test_fn_param_type`
+- [ ] `test_fn_return_type`
+- [ ] `test_fn_body_type`
+- [ ] `test_fn_where_clause`
+- [ ] `test_struct_trait_bound`
+- [ ] `test_struct_where_clause`
+- [ ] `test_enum_tuple_variant`
+- [ ] `test_enum_struct_variant`
+- [ ] `test_enum_trait_bound`
+- [ ] `test_union_field`
+- [ ] `test_trait_supertrait`
+- [ ] `test_trait_assoc_type_bound`
+- [ ] `test_trait_default_method`
+- [ ] `test_trait_default_const`
+- [ ] `test_impl_method_body_deps`
+- [ ] `test_impl_assoc_type`
+- [ ] `test_method_call_inherent`
+- [ ] `test_method_call_trait`
+- [ ] `test_enum_variant_collapses`
+- [ ] `test_module_not_edge_target`
+- [ ] `test_trait_assoc_const_collapses`
+- [ ] `test_impl_for_reference`
+- [ ] `test_impl_for_mut_reference`
+- [ ] `test_std_only_no_local_deps`
+- [ ] `test_const_with_initializer_deps`
+- [ ] `test_static_with_initializer_deps`
+- [ ] `test_type_alias_with_generic_deps`
+- [ ] `test_trait_default_method_call`
+- [ ] `test_impl_assoc_const_as_dependency`
+- [ ] `test_impl_assoc_type_as_dependency`
+- [ ] `test_trait_with_assoc_const_default`
+- [ ] `test_dependency_to_const`
+- [ ] `test_dependency_to_static`
+- [ ] `test_dependency_to_type_alias`
+- [ ] `test_assoc_fn_via_path`
+- [ ] `test_callable_field`

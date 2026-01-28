@@ -9,13 +9,14 @@
 use std::collections::HashSet;
 
 use ra_ap_base_db::VfsPath;
-use ra_ap_hir::{HasVisibility, ModuleDef, Semantics};
+use ra_ap_hir::{HasSource, HasVisibility, ModuleDef, Semantics};
 use ra_ap_ide::TryToNav;
+use ra_ap_ide_db::defs::Definition;
 use ra_ap_ide_db::{RootDatabase, SymbolKind as RaSymbolKind};
 use tarjanize_schemas::{Symbol, SymbolKind, Visibility};
 use tracing::debug_span;
 
-use crate::dependencies::find_dependencies;
+use crate::dependencies::{collect_deps_from, is_local_def};
 use crate::paths::{compute_relative_file_path, definition_path};
 
 /// Extract a single ModuleDef as a (name, Symbol) pair.
@@ -49,10 +50,7 @@ pub(crate) fn extract_module_def(
     let cost = u32::from(nav.full_range.len()) as f64;
 
     // Collect dependencies in this workspace for this symbol.
-    let dependencies: HashSet<String> = find_dependencies(sema, def)
-        .into_iter()
-        .filter_map(|dep| definition_path(db, &dep))
-        .collect();
+    let dependencies = find_dependencies(sema, def);
 
     // Determine the kind string using rust-analyzer's SymbolKind.
     let kind = format!("{:?}", RaSymbolKind::from_module_def(db, def));
@@ -72,6 +70,71 @@ pub(crate) fn extract_module_def(
             kind: SymbolKind::ModuleDef { kind, visibility },
         },
     ))
+}
+
+/// Find all items that a given ModuleDef depends on.
+///
+/// This is the core of dependency analysis for module-level definitions.
+/// Given an item (function, struct, etc.), we find every other item it
+/// references in its definition.
+///
+/// Returns fully-qualified paths to the dependencies. These have already been
+/// collapsed (e.g., associated items → their impl/trait, enum variants → their
+/// enum) and filtered to local (workspace) items only.
+///
+/// ## What we capture
+/// - Path references: `Foo`, `bar()`, `mod::Type`
+/// - Method calls: `x.method()` - requires special handling (no visible path)
+///
+/// ## Collapsing to containers
+///
+/// Associated items collapse to their containers:
+/// - Impl methods/consts/types → the impl block
+/// - Trait methods/consts/types → the trait
+/// - Enum variants → the enum
+pub(crate) fn find_dependencies(
+    sema: &Semantics<'_, RootDatabase>,
+    def: ModuleDef,
+) -> HashSet<String> {
+    let db = sema.db;
+
+    /// Collect dependencies from any item that implements HasSource.
+    fn go<T: HasSource>(
+        sema: &Semantics<'_, RootDatabase>,
+        item: T,
+    ) -> HashSet<Definition> {
+        item.source(sema.db)
+            .map(|src| collect_deps_from(sema, src.file_id, &src.value))
+            .unwrap_or_default()
+    }
+
+    // For each item type, we get its source and collect dependencies.
+    // The collect_deps_from helper handles the parse_or_expand dance needed
+    // to make Semantics work with the source nodes.
+    let deps = match def {
+        ModuleDef::Function(f) => go(sema, f),
+        ModuleDef::Adt(adt) => match adt {
+            ra_ap_hir::Adt::Struct(s) => go(sema, s),
+            ra_ap_hir::Adt::Enum(e) => go(sema, e),
+            ra_ap_hir::Adt::Union(u) => go(sema, u),
+        },
+        ModuleDef::Const(c) => go(sema, c),
+        ModuleDef::Static(s) => go(sema, s),
+        ModuleDef::Trait(t) => go(sema, t),
+        ModuleDef::TypeAlias(t) => go(sema, t),
+
+        // These variants have no analyzable source - return empty set.
+        ModuleDef::Module(_)
+        | ModuleDef::Variant(_)
+        | ModuleDef::Macro(_)
+        | ModuleDef::BuiltinType(_) => HashSet::new(),
+    };
+
+    // Filter to local (workspace) dependencies and convert to paths.
+    deps.into_iter()
+        .filter(|dep| is_local_def(db, dep))
+        .filter_map(|dep| definition_path(db, &dep))
+        .collect()
 }
 
 #[cfg(test)]
