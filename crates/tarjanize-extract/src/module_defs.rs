@@ -13,10 +13,11 @@ use ra_ap_hir::{HasSource, HasVisibility, ModuleDef, Semantics};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::defs::Definition;
 use ra_ap_ide_db::{RootDatabase, SymbolKind as RaSymbolKind};
+use ra_ap_syntax::AstNode;
 use tarjanize_schemas::{Symbol, SymbolKind, Visibility};
 use tracing::debug_span;
 
-use crate::dependencies::{collect_deps_from, is_local_def};
+use crate::dependencies::{collect_path_deps, is_local_def};
 use crate::paths::{compute_relative_file_path, definition_path};
 
 /// Extract a single ModuleDef as a (name, Symbol) pair.
@@ -99,18 +100,20 @@ pub(crate) fn find_dependencies(
     let db = sema.db;
 
     /// Collect dependencies from any item that implements HasSource.
+    ///
+    /// We use `sema.source()` instead of `item.source(db)` because Semantics'
+    /// version registers the syntax tree with its internal cache. This allows
+    /// subsequent calls like `resolve_path()` to work on nodes from that tree.
     fn go<T: HasSource>(
         sema: &Semantics<'_, RootDatabase>,
         item: T,
     ) -> HashSet<Definition> {
-        item.source(sema.db)
-            .map(|src| collect_deps_from(sema, src.file_id, &src.value))
+        sema.source(item)
+            .map(|src| collect_path_deps(sema, src.value.syntax()))
             .unwrap_or_default()
     }
 
     // For each item type, we get its source and collect dependencies.
-    // The collect_deps_from helper handles the parse_or_expand dance needed
-    // to make Semantics work with the source nodes.
     let deps = match def {
         ModuleDef::Function(f) => go(sema, f),
         ModuleDef::Adt(adt) => match adt {

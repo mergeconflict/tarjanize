@@ -93,7 +93,7 @@ tarjanize/
 
 **Semantic Resolution**: Uses rust-analyzer's `Semantics<RootDatabase>` for name resolution and type inference. Key types: `Crate`, `Module`, `ModuleDef`.
 
-**Source Tree Navigation**: Gets syntax via `HasSource::source()`, registers with Semantics via `parse_or_expand()`, then finds equivalent node via `find_node_in_file()` for walking.
+**Source Tree Navigation**: Uses `sema.source(item)` to get syntax nodes already registered with Semantics' internal cache, enabling resolution methods like `resolve_path()` to work.
 
 **Container Collapsing**: Associated items (impl methods, trait methods, enum variants) collapse to their containers since they can't be split independently.
 

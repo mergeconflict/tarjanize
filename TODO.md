@@ -140,60 +140,23 @@
 
 #### Production Code
 
-- [ ] `is_local_def()`
-- [ ] `find_node_in_file()`
-- [ ] `collect_deps_from()`
-- [ ] `collect_path_deps()`
-- [ ] `normalize_module_def()`
-- [ ] `collapse_assoc_item()`
-- [ ] `variant_def_to_adt_def()`
-- [ ] `normalize_definition()`
-- [ ] `collect_expr_dep()`
+- [x] `is_local_def()`
+- [x] `collect_path_deps()`
+- [x] `normalize_definition()`
+- [x] `collapse_if_assoc()`
+- [x] `variant_def_to_adt()`
 
 #### Tests
 
-- [ ] `test_function_call`
-- [ ] `test_struct_field`
-- [ ] `test_trait_bound`
-- [ ] `test_impl_block`
-- [ ] `test_cross_crate`
-- [ ] `test_const_static`
-- [ ] `test_type_alias`
-- [ ] `test_submodule`
-- [ ] `test_inherent_impl`
-- [ ] `test_fn_param_type`
-- [ ] `test_fn_return_type`
-- [ ] `test_fn_body_type`
-- [ ] `test_fn_where_clause`
-- [ ] `test_struct_trait_bound`
-- [ ] `test_struct_where_clause`
-- [ ] `test_enum_tuple_variant`
-- [ ] `test_enum_struct_variant`
-- [ ] `test_enum_trait_bound`
-- [ ] `test_union_field`
-- [ ] `test_trait_supertrait`
-- [ ] `test_trait_assoc_type_bound`
-- [ ] `test_trait_default_method`
-- [ ] `test_trait_default_const`
-- [ ] `test_impl_method_body_deps`
-- [ ] `test_impl_assoc_type`
-- [ ] `test_method_call_inherent`
-- [ ] `test_method_call_trait`
-- [ ] `test_enum_variant_collapses`
-- [ ] `test_module_not_edge_target`
-- [ ] `test_trait_assoc_const_collapses`
-- [ ] `test_impl_for_reference`
-- [ ] `test_impl_for_mut_reference`
-- [ ] `test_std_only_no_local_deps`
-- [ ] `test_const_with_initializer_deps`
-- [ ] `test_static_with_initializer_deps`
-- [ ] `test_type_alias_with_generic_deps`
-- [ ] `test_trait_default_method_call`
-- [ ] `test_impl_assoc_const_as_dependency`
-- [ ] `test_impl_assoc_type_as_dependency`
-- [ ] `test_trait_with_assoc_const_default`
-- [ ] `test_dependency_to_const`
-- [ ] `test_dependency_to_static`
-- [ ] `test_dependency_to_type_alias`
-- [ ] `test_assoc_fn_via_path`
-- [ ] `test_callable_field`
+Tests are organized into 9 sections covering dependency sources, locations,
+normalization, resolution mechanisms, and filtering. All 78 tests reviewed.
+
+- [x] BASIC DEPENDENCY TESTS (11 tests)
+- [x] FUNCTION DEPENDENCY LOCATIONS (11 tests)
+- [x] ADT DEPENDENCY LOCATIONS (6 tests)
+- [x] TRAIT DEPENDENCY LOCATIONS (3 tests)
+- [x] IMPL AND ITEM DEPENDENCY LOCATIONS (5 tests)
+- [x] EDGE TARGET NORMALIZATION (12 tests)
+- [x] OTHER RESOLUTION MECHANISMS (17 tests)
+- [x] EDGE TARGET FILTERING (11 tests)
+- [x] EXTERNAL DEPENDENCY FILTERING (2 tests)
