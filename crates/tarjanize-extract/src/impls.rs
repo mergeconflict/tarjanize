@@ -98,21 +98,17 @@ fn find_dependencies(
     let db = sema.db;
 
     // Collect all dependencies: declaration (self type, trait) and associated items.
-    [
-        self_adt.map(ModuleDef::Adt),
-        trait_.map(ModuleDef::Trait),
-    ]
-    .into_iter()
-    .flatten()
-    .filter(|dep| is_local_def(db, &Definition::from(*dep)))
-    .filter_map(|dep| module_def_path(db, &dep))
-    .chain(
-        impl_
-            .items(db)
-            .into_iter()
-            .flat_map(|item| find_module_def_dependencies(sema, item.into())),
-    )
-    .collect()
+    [self_adt.map(ModuleDef::Adt), trait_.map(ModuleDef::Trait)]
+        .into_iter()
+        .flatten()
+        .filter(|dep| is_local_def(db, &Definition::from(*dep)))
+        .filter_map(|dep| module_def_path(db, &dep))
+        .chain(
+            impl_.items(db).into_iter().flat_map(|item| {
+                find_module_def_dependencies(sema, item.into())
+            }),
+        )
+        .collect()
 }
 
 #[cfg(test)]
@@ -230,7 +226,11 @@ impl MyTrait for &Foo {
 
         if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
             // &Foo is not an ADT, so self_type is None
-            assert_eq!(self_type.as_deref(), None, "self_type should be None for &Foo");
+            assert_eq!(
+                self_type.as_deref(),
+                None,
+                "self_type should be None for &Foo"
+            );
             assert_eq!(
                 trait_.as_deref(),
                 Some("test_crate::MyTrait"),
@@ -267,7 +267,11 @@ impl<T> MyTrait for T {
 
         if let SymbolKind::Impl { self_type, trait_ } = &symbol.kind {
             // T is a generic param, not an ADT
-            assert_eq!(self_type.as_deref(), None, "self_type should be None for T");
+            assert_eq!(
+                self_type.as_deref(),
+                None,
+                "self_type should be None for T"
+            );
             assert_eq!(
                 trait_.as_deref(),
                 Some("test_crate::MyTrait"),
