@@ -1030,6 +1030,7 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+ "serde",
 ]
 
 [[package]]
@@ -2352,8 +2353,21 @@ dependencies = [
  "clap-verbosity-flag",
  "itertools",
  "mimalloc",
+ "tarjanize-condense",
  "tarjanize-extract",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "tarjanize-condense"
+version = "0.1.0"
+dependencies = [
+ "indexmap",
+ "petgraph",
+ "proptest",
+ "serde_json",
+ "tarjanize-schemas",
+ "tracing",
 ]
 
 [[package]]

@@ -241,7 +241,7 @@ SymbolGraph
 │       │       ├── cost: number
 │       │       └── oneOf:
 │       │           ├── module_def: { kind, visibility? }
-│       │           └── impl: { self_type?, trait? }
+│       │           └── impl: { anchors? }
 │       └── submodules?: [] (recursive Module)
 └── edges: []
     └── Edge
@@ -257,9 +257,12 @@ module tree. Edges use full paths like `crate::module::Name`. For impls, use
 modifier in source). Present values include `pub` and `pub(restricted)` (covers
 `pub(crate)`, `pub(super)`, `pub(in path)`).
 
-**Impl fields**: `self_type` and `trait` are full paths if the target is local
-(workspace member), or absent/null if foreign (external crate). Phase 2 uses these
-to derive coherence edges.
+**Impl fields**: For `impl<P..> Trait<T1..=Tn> for T0`:
+- `anchors`: Set of fully qualified paths for workspace symbols that can satisfy the orphan rule. Includes the self type T0, the trait, and any trait type parameters T1..Tn that are workspace symbols. Omitted if empty.
+
+Phase 2 uses these to track orphan rule constraints. The orphan rule requires the impl
+to be in the same crate as at least one anchor. We don't need to distinguish between
+the self type, trait, and trait type parameters—any of them can satisfy the rule.
 
 See `schemas/symbol_graph.schema.json` for the complete JSON Schema definition.
 
@@ -459,17 +462,20 @@ Symbols within an SCC have cyclic dependencies and **must** stay in the same cra
 
 ### Algorithm
 
-1. **Add coherence edges** to enforce orphan rules
+1. **Collect impl anchors** for orphan rule constraints (Phase 3 will enforce)
 
-   Rust's orphan rule requires that trait impls be defined in the same crate as either the trait or the type. We enforce this by adding synthetic edges that force impls into the same SCC as their "anchor" (the local item they must stay with).
+   Rust's orphan rule (see [Trait Implementation Coherence](https://doc.rust-lang.org/reference/items/implementations.html#trait-implementation-coherence)) requires that for `impl<P1..=Pn> Trait<T1..=Tn> for T0`, at least one of the following must be true:
+   - The **trait** is defined in the current crate, OR
+   - At least one of the **types** `T0..=Tn` (the self type T0 and trait type parameters T1..Tn) is defined in the current crate
 
-   For each impl symbol, read its `self_type` and `trait` fields to determine locality:
-   - **Only trait local** (self_type is null): Add `Trait → impl` (impl must stay with the trait)
-   - **Only type local** (trait is null or foreign): Add `Type → impl` (impl must stay with the type)
-   - **Both local**: Add `Type → impl` (either would work; we choose type by convention)
-   - **Blanket impls** (`impl<T> Trait for T`): Add `Trait → impl` (blanket impls must stay with their trait)
+   **Key insight**: It's not just the self type that can satisfy the orphan rule—trait type parameters can too. For example, `impl ForeignTrait<MyLocalType> for ForeignType` is valid because `MyLocalType` is local.
 
-   These synthetic edges create cycles that force the impl into the same SCC as its anchor, ensuring the orphan rule is satisfied after partitioning.
+   Rather than adding synthetic edges to force impls into the same SCC as their anchors (which would reduce Phase 3's flexibility), we track impl anchors separately. For each impl:
+   - Record the SCC containing the self type T0 (if it's a workspace symbol)
+   - Record the SCC containing the trait (if it's a workspace symbol)
+   - Record the SCCs containing trait type parameters T1..Tn (if they're workspace symbols)
+
+   Phase 3 uses this information to ensure each impl ends up in the same output crate as at least one of its anchor SCCs. This gives Phase 3 flexibility to choose the optimal grouping while guaranteeing orphan rule compliance.
 
 2. **Find SCCs within each crate** using Tarjan's algorithm
    - Can be parallelized since SCCs cannot span crates
@@ -625,6 +631,22 @@ An SCC is merged into its dependents' crate **if all its dependents are already 
 - Merges single-dependent SCCs (the common case)
 - Merges multi-dependent SCCs when their dependents have already been unified (e.g., diamonds)
 - Keeps SCCs separate when their dependents are in different crates (preserving parallelism)
+
+### Anchor constraints (hitting set problem)
+
+Each impl block has an **anchor set**: the SCCs containing workspace-local types/traits that can satisfy the orphan rule. When grouping SCCs into output crates, Phase 3 must ensure each impl ends up in the same crate as at least one of its anchors.
+
+When merging SCCs, their anchor sets combine. If the merged group has multiple anchor sets, Phase 3 must find a **hitting set**: a minimal set of SCCs that satisfies all anchor constraints. For example:
+- Impl A has anchors {x, y} (must be with x OR y)
+- Impl B has anchors {x, z} (must be with x OR z)
+- The minimal hitting set is {x} since it satisfies both constraints
+
+This is NP-hard in general, but tractable in practice because:
+1. Most impls have 1-2 anchors (small sets)
+2. Anchor SCCs often overlap (traits and their impls tend to cluster)
+3. A greedy algorithm (pick the anchor that satisfies the most constraints) works well
+
+The algorithm must reject merges that would make anchor constraints unsatisfiable.
 
 ### Algorithm
 

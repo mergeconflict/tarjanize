@@ -34,7 +34,7 @@ Phase 4: Reorganize Symbol Graph     → optimized_symbol_graph.json
 Phase 5: Generate Report             → report.md
 ```
 
-**Phase 1 is in progress**. See PLAN.md for full specification.
+**Phase 2 is in progress**. See PLAN.md for full specification.
 
 ## Code Style
 
@@ -52,7 +52,7 @@ This is a pure virtual workspace - all crates live under `crates/`.
 
 ```
 tarjanize/
-├── Cargo.toml               # Virtual workspace manifest
+├── Cargo.toml               # Virtual workspace manifest (includes lint config)
 └── crates/
     ├── tarjanize/           # CLI binary
     │   └── src/main.rs
@@ -60,30 +60,40 @@ tarjanize/
     ├── tarjanize-schemas/   # Schema definitions for all phases
     │   └── src/
     │       ├── lib.rs
-    │       └── symbol_graph.rs
+    │       ├── symbol_graph.rs
+    │       ├── condensed_graph.rs
+    │       └── testutil.rs
     │
-    └── tarjanize-extract/   # Phase 1: Symbol graph extraction
-        ├── src/
-        │   ├── lib.rs       # Public API: run()
-        │   ├── error.rs     # ExtractError (per M-ERRORS-CANONICAL-STRUCTS)
-        │   ├── workspaces.rs
-        │   ├── crates.rs
-        │   ├── modules.rs
-        │   ├── module_defs.rs
-        │   ├── impls.rs
-        │   ├── dependencies.rs
-        │   └── paths.rs
-        ├── doc/rust-analyzer/  # rust-analyzer API documentation
-        └── tests/fixtures/  # Integration test fixtures
+    ├── tarjanize-extract/   # Phase 1: Symbol graph extraction
+    │   ├── src/
+    │   │   ├── lib.rs       # Public API: run()
+    │   │   ├── error.rs     # ExtractError
+    │   │   ├── workspaces.rs
+    │   │   ├── crates.rs
+    │   │   ├── modules.rs
+    │   │   ├── module_defs.rs
+    │   │   ├── impls.rs
+    │   │   ├── dependencies.rs
+    │   │   └── paths.rs
+    │   ├── doc/rust-analyzer/  # rust-analyzer API documentation
+    │   └── tests/fixtures/  # Integration test fixtures
+    │
+    └── tarjanize-condense/  # Phase 2: SCC computation
+        └── src/
+            ├── lib.rs       # Public API: run()
+            ├── error.rs     # CondenseError
+            └── scc.rs       # SCC computation using petgraph
 ```
 
 ## Crate Details
 
 **tarjanize** (binary)
-- **main.rs** - CLI entry point; parses args, calls `tarjanize_extract::run()`
+- **main.rs** - CLI entry point; orchestrates extract and condense phases
 
 **tarjanize-schemas** (library)
-- **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Visibility` types with serde and JSON Schema support
+- **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Visibility` types
+- **condensed_graph.rs** - `CondensedGraph`, `Scc`, `AnchorSet` types for Phase 2 output
+- **testutil.rs** - Shared proptest strategies for generating arbitrary schema instances
 
 **tarjanize-extract** (library)
 - **lib.rs** - Public API: `run()`, re-exports `ExtractError` and schema types
@@ -95,6 +105,11 @@ tarjanize/
 - **impls.rs** - `extract_impl()` extracts impl blocks with their dependencies
 - **dependencies.rs** - `find_dependencies()` walks syntax trees using `NameRefClass::classify()`
 - **paths.rs** - Path utilities: `qualified_path()`, `file_path()`, `relative_file_path()`
+
+**tarjanize-condense** (library)
+- **lib.rs** - Public API: `run()` reads SymbolGraph JSON, outputs CondensedGraph JSON
+- **error.rs** - `CondenseError` for deserialization and I/O failures
+- **scc.rs** - `compute_condensed_graph()` uses petgraph's condensation algorithm
 
 ## Key Patterns
 
@@ -127,6 +142,8 @@ Test files target one property at a time (e.g., `test_fixture_fn_param_type`, `t
 Real Cargo projects in `tests/fixtures/` are used for integration tests. Each fixture must have an empty `[workspace]` table in its Cargo.toml to prevent being detected as part of the parent workspace.
 
 ## Static Verification
+
+Workspace-level lint configuration follows [M-STATIC-VERIFICATION](https://microsoft.github.io/rust-guidelines/guidelines/universal/index.html) from the Microsoft Pragmatic Rust Guidelines. See `[workspace.lints]` in the root `Cargo.toml` for the full configuration.
 
 Beyond `cargo clippy` and `cargo fmt`, consider running these tools periodically:
 

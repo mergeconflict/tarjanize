@@ -1,0 +1,23 @@
+[package]
+name = "tarjanize-condense"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Compute SCCs and condense symbol graphs into DAGs"
+
+[lints]
+workspace = true
+
+[dependencies]
+tarjanize-schemas = { path = "../tarjanize-schemas" }
+indexmap = "2.13"
+petgraph = "0.8"
+serde_json = "1.0"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1.9"

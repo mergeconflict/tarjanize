@@ -169,6 +169,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::testutil::{arb_name, arb_path};
 
     // -------------------------------------------------------------------------
     // Proptest strategies for generating arbitrary schema instances.
@@ -182,11 +183,6 @@ mod tests {
     // symbols. Requires two-phase generation: create symbol structure first,
     // then populate dependencies from the set of valid symbol paths.
     // -------------------------------------------------------------------------
-
-    /// Strategy for generating arbitrary identifier-like symbol names.
-    fn arb_name() -> impl Strategy<Value = String> {
-        "[a-z_][a-z0-9_]{0,19}"
-    }
 
     /// Strategy for generating arbitrary Visibility values.
     fn arb_visibility() -> impl Strategy<Value = Visibility> {
@@ -205,7 +201,7 @@ mod tests {
 
         prop_compose! {
             fn arb_impl()
-                (anchors in hash_set(arb_name(), 0..5))
+                (anchors in hash_set(arb_path(), 0..5))
             -> SymbolKind {
                 SymbolKind::Impl { anchors }
             }
@@ -224,7 +220,7 @@ mod tests {
             (
                 file in arb_name(),
                 cost in (0..1_000_000).prop_map(f64::from),
-                dependencies in hash_set(arb_name(), 0..5),
+                dependencies in hash_set(arb_path(), 0..5),
                 kind in arb_symbol_kind(),
             )
         -> Symbol {

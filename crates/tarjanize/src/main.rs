@@ -1,13 +1,13 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use itertools::Itertools;
 use mimalloc::MiMalloc;
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
+use tracing_subscriber::EnvFilter;
 
 // Use mimalloc for better performance. Per M-MIMALLOC-APPS, this can provide
 // up to 25% performance improvement for allocation-heavy workloads.
@@ -15,8 +15,12 @@ use tracing_subscriber::fmt::format::FmtSpan;
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// Crates to include in the logging allowlist.
-const CRATES: &[&str] =
-    &["tarjanize", "tarjanize_extract", "tarjanize_schemas"];
+const CRATES: &[&str] = &[
+    "tarjanize",
+    "tarjanize_condense",
+    "tarjanize_extract",
+    "tarjanize_schemas",
+];
 
 /// Analyze Rust workspace dependency structures to identify opportunities for
 /// splitting crates into smaller, parallelizable units for improved build times.
@@ -40,6 +44,19 @@ enum Commands {
         /// Path to the workspace root (directory containing Cargo.toml)
         #[arg(default_value = ".")]
         workspace_path: String,
+
+        /// Output file path (writes to stdout if not specified)
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Condense symbol graph into DAG of SCCs
+    ///
+    /// Computes strongly connected components from the symbol graph and produces
+    /// a condensed graph where cycles become single nodes.
+    Condense {
+        /// Input `symbol_graph.json` file (reads from stdin if not specified)
+        input: Option<String>,
 
         /// Output file path (writes to stdout if not specified)
         #[arg(short, long)]
@@ -74,6 +91,25 @@ fn main() -> Result<()> {
                 None => Box::new(stdout.lock()),
             };
             tarjanize_extract::run(&workspace_path, &mut *writer)?;
+            Ok(())
+        }
+
+        Commands::Condense { input, output } => {
+            // Set up input reader.
+            let stdin = std::io::stdin();
+            let reader: Box<dyn std::io::Read> = match input {
+                Some(path) => Box::new(BufReader::new(File::open(path)?)),
+                None => Box::new(stdin.lock()),
+            };
+
+            // Set up output writer.
+            let stdout = std::io::stdout();
+            let mut writer: Box<dyn Write> = match output {
+                Some(path) => Box::new(BufWriter::new(File::create(path)?)),
+                None => Box::new(stdout.lock()),
+            };
+
+            tarjanize_condense::run(reader, &mut *writer)?;
             Ok(())
         }
     }

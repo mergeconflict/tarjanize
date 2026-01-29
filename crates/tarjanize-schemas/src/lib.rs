@@ -5,7 +5,7 @@
 //! various artifacts produced by tarjanize's pipeline:
 //!
 //! - **Symbol Graph**: The full dependency graph extracted from rust-analyzer
-//! - **Condensed Graph**: The condensation graph after SCC computation (TODO)
+//! - **Condensed Graph**: The condensation graph after SCC computation
 //!
 //! The schemas are designed to be:
 //! - **Self-describing**: JSON Schema is auto-generated from Rust types
@@ -13,7 +13,12 @@
 //! - **Complete**: All information needed for analysis is captured
 //! - **Shared**: Used across all phases of the tarjanize pipeline
 
+mod condensed_graph;
 mod symbol_graph;
+#[cfg(test)]
+mod testutil;
 
+#[doc(inline)]
+pub use condensed_graph::*;
 #[doc(inline)]
 pub use symbol_graph::*;
