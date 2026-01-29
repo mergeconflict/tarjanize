@@ -8,8 +8,9 @@
 //! - ModuleDefs: `crate::module::item` (e.g., `mycrate::foo::MyStruct`)
 //! - Impl blocks: `crate::module::impl Trait for Type` or `crate::module::impl Type`
 
+use ra_ap_base_db::VfsPath;
 use ra_ap_hir::{Impl, ModuleDef};
-use ra_ap_ide_db::RootDatabase;
+use ra_ap_ide_db::{FileId, RootDatabase};
 use tracing::warn;
 
 use crate::file_path;
@@ -77,23 +78,26 @@ pub(crate) fn impl_path(db: &RootDatabase, impl_: &Impl) -> Option<String> {
 /// or a virtual path (for test fixtures). There's no built-in "relative to
 /// crate root" API, so we compute it manually:
 ///
-/// 1. Real paths: `/Users/.../src/lib.rs` with root `/Users/.../src` →
+/// 1. Real paths: `/a/b/c/lib.rs` with root `/a/b/c` →
 ///    `strip_prefix()` returns `lib.rs`
 /// 2. Virtual paths: `/lib.rs` with root `""` (parent of root-level file) →
 ///    `strip_prefix("")` returns `/lib.rs` unchanged, so we strip the `/`
 pub(crate) fn compute_relative_file_path(
     db: &RootDatabase,
-    crate_root: &ra_ap_base_db::VfsPath,
-    file_id: ra_ap_ide_db::FileId,
+    crate_root: &VfsPath,
+    file_id: FileId,
 ) -> String {
     let vfs_path = match file_path(db, file_id) {
         Ok(path) => path,
         Err(e) => {
-            warn!(%e, "could not resolve file path");
+            warn!(file_id = ?file_id, crate_root = ?crate_root, error = %e, "couldn't compute file path relative to crate root");
             return String::new();
         }
     };
 
+    // Try to make the path relative to the crate root. If strip_prefix fails
+    // (e.g., file outside crate root, or virtual path quirks), fall back to
+    // the absolute path rather than panicking.
     let path = vfs_path
         .strip_prefix(crate_root)
         .map(|p| p.as_str().to_owned())

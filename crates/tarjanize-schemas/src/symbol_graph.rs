@@ -165,6 +165,11 @@ mod tests {
     // These are defined here to keep the production types clean of test
     // annotations. The strategies generate bounded instances to avoid
     // stack overflow from unbounded recursion.
+    //
+    // TODO: Implement proptest strategies for generating structurally valid
+    // SymbolGraph instances. Dependencies and impl paths must reference actual
+    // symbols. Requires two-phase generation: create symbol structure first,
+    // then populate dependencies from the set of valid symbol paths.
     // -------------------------------------------------------------------------
 
     /// Strategy for generating arbitrary identifier-like symbol names.

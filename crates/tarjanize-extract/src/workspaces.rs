@@ -5,41 +5,32 @@
 
 use std::path::Path;
 
+use anyhow::{Context, anyhow};
 use camino::Utf8PathBuf;
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_load_cargo::{
     LoadCargoConfig, ProcMacroServerChoice, load_workspace_at,
 };
 use ra_ap_project_model::CargoConfig;
-use tracing::{info, instrument};
-
-use crate::ExtractError;
+use tracing::{debug_span, info};
 
 /// Load a Rust workspace into rust-analyzer's analysis database.
-#[instrument(level = "debug")]
 pub(crate) fn load_workspace(
-    path: impl AsRef<Path> + std::fmt::Debug,
-) -> Result<RootDatabase, ExtractError> {
+    path: impl AsRef<Path>,
+) -> anyhow::Result<RootDatabase> {
     let path = path.as_ref();
+    let _span = debug_span!("load_workspace", path = %path.display()).entered();
 
     // rust-analyzer requires absolute paths for file identification and
     // workspace discovery. canonicalize() also resolves symlinks to ensure
     // we work with the real filesystem location.
-    let canonical = path.canonicalize().map_err(|e| {
-        ExtractError::workspace_load(format!(
-            "Failed to canonicalize path '{}': {e}",
-            path.display()
-        ))
-    })?;
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize path '{}'", path.display()))?;
 
     // rust-analyzer's APIs expect UTF-8 paths internally.
-    let workspace_path =
-        Utf8PathBuf::from_path_buf(canonical).map_err(|p| {
-            ExtractError::workspace_load(format!(
-                "Path contains invalid UTF-8: {}",
-                p.display()
-            ))
-        })?;
+    let workspace_path = Utf8PathBuf::from_path_buf(canonical.clone())
+        .map_err(|_| anyhow!("path contains invalid UTF-8: {}", canonical.display()))?;
 
     // CargoConfig controls how Cargo projects are interpreted (e.g., which
     // features to enable, target platform). Default settings work for most
@@ -81,7 +72,7 @@ pub(crate) fn load_workspace(
             info!(message = %msg, "workspace.progress");
         },
     )
-    .map_err(ExtractError::workspace_load)?;
+    .context("failed to load workspace")?;
 
     Ok(db)
 }
@@ -100,6 +91,6 @@ mod tests {
     fn test_load_workspace_fails_for_nonexistent_path() {
         let err = load_workspace("/nonexistent/path")
             .expect_err("should fail for nonexistent path");
-        assert!(err.is_workspace_load());
+        assert!(err.to_string().contains("failed to canonicalize path"));
     }
 }

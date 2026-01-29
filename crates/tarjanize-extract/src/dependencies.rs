@@ -30,7 +30,7 @@
 
 use std::collections::HashSet;
 
-use ra_ap_hir::{AsAssocItem, AssocItemContainer, Semantics};
+use ra_ap_hir::{Adt, AsAssocItem, AssocItemContainer, Semantics, VariantDef};
 use ra_ap_ide_db::RootDatabase;
 use ra_ap_ide_db::defs::{Definition, NameClass, NameRefClass};
 use ra_ap_syntax::{AstNode, SyntaxNode, ast};
@@ -178,7 +178,7 @@ fn normalize_definition(
 
         // Variants collapse to their parent enum.
         Definition::Variant(v) => {
-            Some(Definition::Adt(ra_ap_hir::Adt::Enum(v.parent_enum(db))))
+            Some(Definition::Adt(Adt::Enum(v.parent_enum(db))))
         }
 
         // Fields collapse to their parent ADT (struct, union, or enum).
@@ -233,16 +233,11 @@ fn collapse_if_assoc<T: AsAssocItem>(
 /// VariantDef can be Struct, Union, or Variant (enum variant with fields).
 /// For enum variants, we return the parent enum since that's the actual
 /// type definition we depend on.
-fn variant_def_to_adt(
-    db: &RootDatabase,
-    variant_def: ra_ap_hir::VariantDef,
-) -> Definition {
+fn variant_def_to_adt(db: &RootDatabase, variant_def: VariantDef) -> Definition {
     let adt = match variant_def {
-        ra_ap_hir::VariantDef::Struct(s) => ra_ap_hir::Adt::Struct(s),
-        ra_ap_hir::VariantDef::Union(u) => ra_ap_hir::Adt::Union(u),
-        ra_ap_hir::VariantDef::Variant(v) => {
-            ra_ap_hir::Adt::Enum(v.parent_enum(db))
-        }
+        VariantDef::Struct(s) => Adt::Struct(s),
+        VariantDef::Union(u) => Adt::Union(u),
+        VariantDef::Variant(v) => Adt::Enum(v.parent_enum(db)),
     };
     Definition::Adt(adt)
 }

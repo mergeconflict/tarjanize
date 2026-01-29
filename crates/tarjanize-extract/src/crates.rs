@@ -8,12 +8,12 @@
 //! This module extracts that metadata and delegates the actual symbol
 //! extraction to the `modules` module.
 
+use anyhow::{Context, anyhow};
 use ra_ap_hir::{Crate, Semantics};
 use ra_ap_ide_db::RootDatabase;
 use tarjanize_schemas::Module;
 use tracing::debug_span;
 
-use crate::error::ExtractError;
 use crate::file_path;
 use crate::modules::extract_module;
 
@@ -26,14 +26,14 @@ use crate::modules::extract_module;
 pub(crate) fn extract_crate(
     sema: &Semantics<'_, RootDatabase>,
     krate: Crate,
-) -> Result<(String, Module), ExtractError> {
+) -> anyhow::Result<(String, Module)> {
     let db = sema.db;
 
     // All Cargo workspace crates must have names in Cargo.toml. A missing
     // display name indicates a non-Cargo build system or synthetic crate.
     let crate_name = krate
         .display_name(db)
-        .ok_or_else(ExtractError::crate_name_missing)?
+        .ok_or_else(|| anyhow!("crate has no display name"))?
         .to_string();
 
     let _span = debug_span!("extract_crate", %crate_name).entered();
@@ -41,10 +41,12 @@ pub(crate) fn extract_crate(
     // Get the crate root directory for computing relative file paths.
     // The crate root file is lib.rs or main.rs; its parent is the crate root dir.
     let root_file_id = krate.root_file(db);
-    let crate_root_path = file_path(db, root_file_id)?;
-    let crate_root = crate_root_path
-        .parent()
-        .ok_or_else(|| ExtractError::crate_root_no_parent(&crate_name))?;
+    let crate_root_path = file_path(db, root_file_id).with_context(|| {
+        format!("getting root path for crate '{crate_name}'")
+    })?;
+    let crate_root = crate_root_path.parent().ok_or_else(|| {
+        anyhow!("root file '{crate_root_path}' has no parent directory")
+    })?;
 
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);
@@ -56,7 +58,7 @@ pub(crate) fn extract_crate(
 
 #[cfg(test)]
 mod tests {
-    use ra_ap_hir::{Crate, Semantics};
+    use ra_ap_hir::{Crate, Semantics, attach_db};
     use ra_ap_ide_db::RootDatabase;
     use ra_ap_test_fixture::WithFixture;
 
@@ -70,15 +72,17 @@ mod tests {
 "#,
         );
 
-        let krate = Crate::all(&db)
-            .into_iter()
-            .find(|k| k.origin(&db).is_local())
-            .expect("should have a local crate");
+        attach_db(&db, || {
+            let krate = Crate::all(&db)
+                .into_iter()
+                .find(|k| k.origin(&db).is_local())
+                .expect("should have a local crate");
 
-        let sema = Semantics::new(&db);
-        let (name, _) =
-            extract_crate(&sema, krate).expect("extraction should succeed");
+            let sema = Semantics::new(&db);
+            let (name, _) =
+                extract_crate(&sema, krate).expect("extraction should succeed");
 
-        assert_eq!(name, "test_crate");
+            assert_eq!(name, "test_crate");
+        });
     }
 }

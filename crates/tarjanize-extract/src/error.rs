@@ -1,18 +1,13 @@
 //! Error types for the tarjanize-extract crate.
-//!
-//! TODO: Review error variants for potential simplification:
-//! - `FilePathNotFound`, `CrateNameMissing`, and `CrateRootNoParent` are all
-//!   "unexpected crate metadata" errors - could they share a variant?
 
 use std::backtrace::Backtrace;
 use std::fmt;
 
-use ra_ap_base_db::FileId;
-
 /// Error type for symbol graph extraction operations.
 ///
-/// This error captures failures that can occur during workspace loading,
-/// file path resolution, and output generation.
+/// This error captures failures that can occur during workspace loading
+/// and output generation. Internal errors (file path resolution, crate
+/// metadata issues) are handled with `anyhow` and logged, not propagated.
 #[derive(Debug)]
 pub struct ExtractError {
     kind: ExtractErrorKind,
@@ -21,13 +16,7 @@ pub struct ExtractError {
 
 /// Internal error variants. Not exposed publicly; use `is_xxx()` methods instead.
 #[derive(Debug)]
-enum ExtractErrorKind {
-    /// A file ID could not be resolved to a path in the source roots.
-    FilePathNotFound(FileId),
-    /// A crate has no display name (unexpected for Cargo workspaces).
-    CrateNameMissing,
-    /// A crate's root file has no parent directory.
-    CrateRootNoParent(String),
+pub(crate) enum ExtractErrorKind {
     /// Failed to load the workspace into rust-analyzer.
     WorkspaceLoad(Box<dyn std::error::Error + Send + Sync>),
     /// Failed to serialize output to JSON.
@@ -37,73 +26,12 @@ enum ExtractErrorKind {
 }
 
 impl ExtractError {
-    /// Creates an error for when a file path cannot be resolved.
-    pub fn file_path_not_found(file_id: FileId) -> Self {
+    /// Creates an error from an error kind, capturing a backtrace.
+    pub(crate) fn new(kind: ExtractErrorKind) -> Self {
         Self {
-            kind: ExtractErrorKind::FilePathNotFound(file_id),
+            kind,
             backtrace: Backtrace::capture(),
         }
-    }
-
-    /// Creates an error for when a crate has no display name.
-    ///
-    /// This is unexpected for Cargo workspaces since all crates must have
-    /// `[package].name` in Cargo.toml. It can occur with non-Cargo build
-    /// systems or dummy crates created for code snippets.
-    pub fn crate_name_missing() -> Self {
-        Self {
-            kind: ExtractErrorKind::CrateNameMissing,
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Creates an error for when a crate's root file has no parent directory.
-    pub fn crate_root_no_parent(crate_name: impl Into<String>) -> Self {
-        Self {
-            kind: ExtractErrorKind::CrateRootNoParent(crate_name.into()),
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Creates an error for workspace loading failures.
-    pub fn workspace_load(
-        err: impl Into<Box<dyn std::error::Error + Send + Sync>>,
-    ) -> Self {
-        Self {
-            kind: ExtractErrorKind::WorkspaceLoad(err.into()),
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Creates an error for serialization failures.
-    pub fn serialization(err: serde_json::Error) -> Self {
-        Self {
-            kind: ExtractErrorKind::Serialization(err),
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Creates an error for I/O failures.
-    pub fn io(err: std::io::Error) -> Self {
-        Self {
-            kind: ExtractErrorKind::Io(err),
-            backtrace: Backtrace::capture(),
-        }
-    }
-
-    /// Returns true if this error is due to a file path not being found.
-    pub fn is_file_path_not_found(&self) -> bool {
-        matches!(self.kind, ExtractErrorKind::FilePathNotFound(_))
-    }
-
-    /// Returns true if this error is due to a crate having no display name.
-    pub fn is_crate_name_missing(&self) -> bool {
-        matches!(self.kind, ExtractErrorKind::CrateNameMissing)
-    }
-
-    /// Returns true if this error is due to a crate root having no parent.
-    pub fn is_crate_root_no_parent(&self) -> bool {
-        matches!(self.kind, ExtractErrorKind::CrateRootNoParent(_))
     }
 
     /// Returns true if this error is due to workspace loading failure.
@@ -127,21 +55,9 @@ impl ExtractError {
     }
 }
 
-impl fmt::Display for ExtractError {
+impl fmt::Display for ExtractErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            ExtractErrorKind::FilePathNotFound(file_id) => {
-                write!(f, "file ID {file_id:?} not found in source roots")
-            }
-            ExtractErrorKind::CrateNameMissing => {
-                write!(f, "crate has no display name")
-            }
-            ExtractErrorKind::CrateRootNoParent(crate_name) => {
-                write!(
-                    f,
-                    "crate '{crate_name}' root file has no parent directory"
-                )
-            }
+        match self {
             ExtractErrorKind::WorkspaceLoad(err) => {
                 write!(f, "failed to load workspace: {err}")
             }
@@ -155,12 +71,19 @@ impl fmt::Display for ExtractError {
     }
 }
 
+impl fmt::Display for ExtractError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Summary of what happened.
+        writeln!(f, "{}", self.kind)?;
+
+        // Backtrace (will be empty unless RUST_BACKTRACE is set).
+        write!(f, "{}", self.backtrace)
+    }
+}
+
 impl std::error::Error for ExtractError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match &self.kind {
-            ExtractErrorKind::FilePathNotFound(_)
-            | ExtractErrorKind::CrateNameMissing
-            | ExtractErrorKind::CrateRootNoParent(_) => None,
             ExtractErrorKind::WorkspaceLoad(err) => Some(err.as_ref()),
             ExtractErrorKind::Serialization(err) => Some(err),
             ExtractErrorKind::Io(err) => Some(err),
@@ -170,13 +93,19 @@ impl std::error::Error for ExtractError {
 
 impl From<std::io::Error> for ExtractError {
     fn from(err: std::io::Error) -> Self {
-        Self::io(err)
+        Self {
+            kind: ExtractErrorKind::Io(err),
+            backtrace: Backtrace::capture(),
+        }
     }
 }
 
 impl From<serde_json::Error> for ExtractError {
     fn from(err: serde_json::Error) -> Self {
-        Self::serialization(err)
+        Self {
+            kind: ExtractErrorKind::Serialization(err),
+            backtrace: Backtrace::capture(),
+        }
     }
 }
 
@@ -186,65 +115,13 @@ mod tests {
 
     use super::*;
 
-    // Test file_path_not_found error variant.
-    #[test]
-    fn test_file_path_not_found() {
-        let file_id = FileId::from_raw(42);
-        let err = ExtractError::file_path_not_found(file_id);
-
-        assert!(err.is_file_path_not_found());
-        assert!(!err.is_crate_name_missing());
-        assert!(!err.is_crate_root_no_parent());
-        assert!(!err.is_workspace_load());
-        assert!(!err.is_serialization());
-        assert!(!err.is_io());
-
-        assert!(err.to_string().contains("file ID"));
-        assert!(err.source().is_none());
-    }
-
-    // Test crate_name_missing error variant.
-    #[test]
-    fn test_crate_name_missing() {
-        let err = ExtractError::crate_name_missing();
-
-        assert!(err.is_crate_name_missing());
-        assert!(!err.is_file_path_not_found());
-        assert!(!err.is_crate_root_no_parent());
-        assert!(!err.is_workspace_load());
-        assert!(!err.is_serialization());
-        assert!(!err.is_io());
-
-        assert_eq!(err.to_string(), "crate has no display name");
-        assert!(err.source().is_none());
-    }
-
-    // Test crate_root_no_parent error variant.
-    #[test]
-    fn test_crate_root_no_parent() {
-        let err = ExtractError::crate_root_no_parent("my_crate");
-
-        assert!(err.is_crate_root_no_parent());
-        assert!(!err.is_file_path_not_found());
-        assert!(!err.is_crate_name_missing());
-        assert!(!err.is_workspace_load());
-        assert!(!err.is_serialization());
-        assert!(!err.is_io());
-
-        assert!(err.to_string().contains("my_crate"));
-        assert!(err.to_string().contains("no parent directory"));
-        assert!(err.source().is_none());
-    }
-
-    // Test workspace_load error variant.
     #[test]
     fn test_workspace_load() {
-        let err = ExtractError::workspace_load("failed to find Cargo.toml");
+        let err = ExtractError::new(ExtractErrorKind::WorkspaceLoad(
+            "failed to find Cargo.toml".into(),
+        ));
 
         assert!(err.is_workspace_load());
-        assert!(!err.is_file_path_not_found());
-        assert!(!err.is_crate_name_missing());
-        assert!(!err.is_crate_root_no_parent());
         assert!(!err.is_serialization());
         assert!(!err.is_io());
 
@@ -252,7 +129,6 @@ mod tests {
         assert!(err.source().is_some());
     }
 
-    // Test serialization error variant via From impl.
     #[test]
     fn test_serialization_from() {
         // Create an invalid JSON to trigger a parse error.
@@ -261,9 +137,6 @@ mod tests {
         let err = ExtractError::from(json_err);
 
         assert!(err.is_serialization());
-        assert!(!err.is_file_path_not_found());
-        assert!(!err.is_crate_name_missing());
-        assert!(!err.is_crate_root_no_parent());
         assert!(!err.is_workspace_load());
         assert!(!err.is_io());
 
@@ -271,7 +144,6 @@ mod tests {
         assert!(err.source().is_some());
     }
 
-    // Test io error variant via From impl.
     #[test]
     fn test_io_from() {
         let io_err =
@@ -279,9 +151,6 @@ mod tests {
         let err = ExtractError::from(io_err);
 
         assert!(err.is_io());
-        assert!(!err.is_file_path_not_found());
-        assert!(!err.is_crate_name_missing());
-        assert!(!err.is_crate_root_no_parent());
         assert!(!err.is_workspace_load());
         assert!(!err.is_serialization());
 
@@ -289,19 +158,21 @@ mod tests {
         assert!(err.source().is_some());
     }
 
-    // Test that backtrace is captured.
     #[test]
     fn test_backtrace_captured() {
-        let err = ExtractError::crate_name_missing();
+        let err = ExtractError::new(ExtractErrorKind::WorkspaceLoad(
+            "test".into(),
+        ));
         // Just verify we can call backtrace() - the actual content depends
         // on RUST_BACKTRACE environment variable.
         let _ = err.backtrace();
     }
 
-    // Test Debug impl exists (required by M-PUBLIC-DEBUG).
     #[test]
     fn test_debug_impl() {
-        let err = ExtractError::crate_name_missing();
+        let err = ExtractError::new(ExtractErrorKind::WorkspaceLoad(
+            "test".into(),
+        ));
         let debug_str = format!("{err:?}");
         assert!(debug_str.contains("ExtractError"));
     }

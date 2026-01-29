@@ -69,7 +69,11 @@ tarjanize/
         │   ├── workspaces.rs
         │   ├── crates.rs
         │   ├── modules.rs
-        │   └── dependencies.rs
+        │   ├── module_defs.rs
+        │   ├── impls.rs
+        │   ├── dependencies.rs
+        │   └── paths.rs
+        ├── doc/rust-analyzer/  # rust-analyzer API documentation
         └── tests/fixtures/  # Integration test fixtures
 ```
 
@@ -79,21 +83,24 @@ tarjanize/
 - **main.rs** - CLI entry point; parses args, calls `tarjanize_extract::run()`
 
 **tarjanize-schemas** (library)
-- **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Edge` types with serde and JSON Schema support
+- **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Visibility` types with serde and JSON Schema support
 
 **tarjanize-extract** (library)
 - **lib.rs** - Public API: `run()`, re-exports `ExtractError` and schema types
 - **error.rs** - `ExtractError` with backtrace, `ErrorKind` enum, and `is_xxx()` helpers
 - **workspaces.rs** - `load_workspace()` configures rust-analyzer with proc macro expansion and build.rs analysis
 - **crates.rs** - `extract_crate()` extracts a crate as its root module
-- **modules.rs** - `extract_module()` collects symbols recursively via `SymbolCollector`
-- **dependencies.rs** - `find_dependencies()` walks syntax trees, `is_local()` filters to workspace members
+- **modules.rs** - `extract_module()` recursively extracts symbols from module hierarchy
+- **module_defs.rs** - `extract_module_def()` extracts ModuleDef items (functions, structs, etc.)
+- **impls.rs** - `extract_impl()` extracts impl blocks with their dependencies
+- **dependencies.rs** - `find_dependencies()` walks syntax trees using `NameRefClass::classify()`
+- **paths.rs** - Path utilities: `qualified_path()`, `file_path()`, `relative_file_path()`
 
 ## Key Patterns
 
 **Semantic Resolution**: Uses rust-analyzer's `Semantics<RootDatabase>` for name resolution and type inference. Key types: `Crate`, `Module`, `ModuleDef`.
 
-**Source Tree Navigation**: Uses `sema.source(item)` to get syntax nodes already registered with Semantics' internal cache, enabling resolution methods like `resolve_path()` to work.
+**Source Tree Navigation**: Uses `HasSource::source()` to get syntax nodes, then `sema.parse_or_expand()` to get a cached tree for resolution. See `doc/rust-analyzer/README.md` for details.
 
 **Container Collapsing**: Associated items (impl methods, trait methods, enum variants) collapse to their containers since they can't be split independently.
 

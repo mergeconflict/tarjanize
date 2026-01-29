@@ -5,6 +5,7 @@ edition.workspace = true
 description = "Symbol graph extraction from Rust workspaces using rust-analyzer"
 
 [dependencies]
+anyhow = "1"
 tarjanize-schemas = { path = "../tarjanize-schemas" }
 ra_ap_hir = "0.0.317"
 ra_ap_ide = "0.0.317"

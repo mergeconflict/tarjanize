@@ -2360,6 +2360,7 @@ dependencies = [
 name = "tarjanize-extract"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "camino",
  "either",
  "ra_ap_base_db",

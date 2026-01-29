@@ -9,7 +9,7 @@
 use std::collections::HashSet;
 
 use ra_ap_base_db::VfsPath;
-use ra_ap_hir::{HasSource, HasVisibility, ModuleDef, Semantics};
+use ra_ap_hir::{Adt, HasSource, HasVisibility, ModuleDef, Semantics, Visibility as HirVisibility};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::defs::Definition;
 use ra_ap_ide_db::{RootDatabase, SymbolKind as RaSymbolKind};
@@ -97,7 +97,7 @@ pub(crate) fn extract_module_def(
 
     // Extract visibility from the ModuleDef.
     let visibility = match def.visibility(db) {
-        ra_ap_hir::Visibility::Public => Visibility::Public,
+        HirVisibility::Public => Visibility::Public,
         _ => Visibility::NonPublic,
     };
 
@@ -156,9 +156,9 @@ pub(crate) fn find_dependencies(
     let deps = match def {
         ModuleDef::Function(f) => go(sema, f),
         ModuleDef::Adt(adt) => match adt {
-            ra_ap_hir::Adt::Struct(s) => go(sema, s),
-            ra_ap_hir::Adt::Enum(e) => go(sema, e),
-            ra_ap_hir::Adt::Union(u) => go(sema, u),
+            Adt::Struct(s) => go(sema, s),
+            Adt::Enum(e) => go(sema, e),
+            Adt::Union(u) => go(sema, u),
         },
         ModuleDef::Const(c) => go(sema, c),
         ModuleDef::Static(s) => go(sema, s),
@@ -416,13 +416,13 @@ macro_rules! my_macro { () => {} }
     // variants to fully-qualified path strings.
     // =========================================================================
 
-    use ra_ap_hir::{Crate, ModuleDef, attach_db};
+    use ra_ap_hir::{Crate, Module, ModuleDef, attach_db};
     use ra_ap_ide_db::defs::Definition;
 
     use super::definition_path;
 
     /// Helper to get the root module of the test_crate from a fixture.
-    fn get_test_crate_root(db: &RootDatabase) -> ra_ap_hir::Module {
+    fn get_test_crate_root(db: &RootDatabase) -> Module {
         Crate::all(db)
             .into_iter()
             .find(|k| {

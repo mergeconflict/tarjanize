@@ -33,18 +33,19 @@ use std::io::Write;
 use std::path::Path;
 
 use crates::extract_crate;
-use ra_ap_base_db::{FileId, SourceDatabase};
+use ra_ap_base_db::{FileId, SourceDatabase, VfsPath};
 use ra_ap_hir::{Crate, Semantics, attach_db};
 use ra_ap_ide_db::RootDatabase;
 use rayon::prelude::*;
 // Re-export schema types for convenience.
 #[doc(inline)]
 pub use tarjanize_schemas::{Module, Symbol, SymbolGraph, SymbolKind};
-use tracing::{instrument, warn};
+use tracing::{debug_span, instrument, warn};
 
+use crate::error::ExtractErrorKind;
 #[doc(inline)]
 pub use crate::error::ExtractError;
-pub(crate) use crate::workspaces::load_workspace;
+use crate::workspaces::load_workspace;
 
 /// Look up the filesystem path for a file ID.
 ///
@@ -53,13 +54,12 @@ pub(crate) use crate::workspaces::load_workspace;
 pub(crate) fn file_path(
     db: &RootDatabase,
     file_id: FileId,
-) -> Result<ra_ap_base_db::VfsPath, ExtractError> {
+) -> anyhow::Result<VfsPath> {
     let source_root_id = db.file_source_root(file_id).source_root_id(db);
     let source_root = db.source_root(source_root_id).source_root(db);
-    source_root
-        .path_for_file(&file_id)
-        .cloned()
-        .ok_or_else(|| ExtractError::file_path_not_found(file_id))
+    source_root.path_for_file(&file_id).cloned().ok_or_else(|| {
+        anyhow::anyhow!("file id {file_id:?} not found in source root")
+    })
 }
 
 /// Extracts a complete symbol graph from a rust-analyzer database.
@@ -137,11 +137,15 @@ pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
 /// run("path/to/workspace", &mut out).unwrap();
 /// ```
 pub fn run(
-    workspace_path: impl AsRef<Path> + std::fmt::Debug,
+    workspace_path: impl AsRef<Path>,
     output: &mut dyn Write,
 ) -> Result<(), ExtractError> {
+    let path = workspace_path.as_ref();
+    let _span = debug_span!("run", path = %path.display()).entered();
+
     // Step 1: load the workspace into a rust-analyzer database.
-    let db = load_workspace(workspace_path)?;
+    let db = load_workspace(path)
+        .map_err(|e| ExtractError::new(ExtractErrorKind::WorkspaceLoad(e.into())))?;
 
     // Step 2: extract the symbol graph from the db.
     let symbol_graph = extract_symbol_graph(db);

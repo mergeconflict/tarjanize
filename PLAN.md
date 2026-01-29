@@ -361,7 +361,8 @@ We track all symbols exposed by rust-analyzer's HIR (High-level Intermediate Rep
 
 **Excluded from analysis**:
 - **Build scripts** (`build.rs`): These are separate compilation units that run before the crate compiles. They have their own dependency graph and are orthogonal to the main crate structure.
-- **Procedural macro crates**: These must remain as separate crates (Rust requirement) and cannot be merged with regular code. They are excluded entirely from the analysis.
+
+**Note on procedural macro crates**: Proc-macro crates are analyzed like any other crate. While the `#[proc_macro]` entry points must remain in a proc-macro crate, the implementation can be split into helper library crates — a common pattern for improving compile times.
 
 **Macro handling**: rust-analyzer expands macros before building the HIR, so dependencies from expanded code are captured automatically. However, we must also record an explicit dependency on the macro definition itself — if a macro changes, all call sites need recompilation regardless of what the expansion contains. See [rust-analyzer's hir_expand documentation](https://docs.rs/ra_ap_hir_expand/latest/ra_ap_hir_expand/) for details on how macro expansions are tracked.
 
@@ -427,13 +428,15 @@ Steps:
 
 ### Implementation tasks (Rust only)
 
-- [ ] Integrate rust-analyzer crates (`ra_ap_ide`, `ra_ap_hir`, `ra_ap_vfs`)
-- [ ] Implement workspace discovery from root `Cargo.toml`
-- [ ] Load all workspace crates into rust-analyzer's database
-- [ ] Implement symbol enumeration across all crates
-- [ ] Implement dependency edge detection, including cross-crate edges
-- [ ] Serialize output to `symbol_graph.json`
-- [ ] Write tests against fixture workspaces
+- [x] Integrate rust-analyzer crates (`ra_ap_ide`, `ra_ap_hir`, `ra_ap_vfs`)
+- [x] Implement workspace discovery from root `Cargo.toml`
+- [x] Load all workspace crates into rust-analyzer's database
+- [x] Implement symbol enumeration across all crates
+- [x] Implement dependency edge detection, including cross-crate edges
+- [x] Serialize output to `symbol_graph.json`
+- [x] Write tests against fixture workspaces
+
+**Known limitation**: Derive macros (`#[derive(...)]`) are not captured due to `sema.resolve_derive_macro()` returning None. Workspace-local derive macros are rare, so this is acceptable.
 
 ## Phase 2: Compute SCCs and Condense Graph
 
