@@ -79,7 +79,6 @@ pub(crate) fn extract_module(
 // - Semantics must be Send + Sync for par_iter()
 // - May cause lock contention on the database
 // - Overhead may outweigh benefit for small modules.
-
 fn extract_module_symbols(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,

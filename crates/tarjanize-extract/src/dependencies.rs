@@ -233,7 +233,10 @@ fn collapse_if_assoc<T: AsAssocItem>(
 /// VariantDef can be Struct, Union, or Variant (enum variant with fields).
 /// For enum variants, we return the parent enum since that's the actual
 /// type definition we depend on.
-fn variant_def_to_adt(db: &RootDatabase, variant_def: VariantDef) -> Definition {
+fn variant_def_to_adt(
+    db: &RootDatabase,
+    variant_def: VariantDef,
+) -> Definition {
     let adt = match variant_def {
         VariantDef::Struct(s) => Adt::Struct(s),
         VariantDef::Union(u) => Adt::Union(u),

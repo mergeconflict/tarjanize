@@ -9,7 +9,10 @@
 use std::collections::HashSet;
 
 use ra_ap_base_db::VfsPath;
-use ra_ap_hir::{Adt, HasSource, HasVisibility, ModuleDef, Semantics, Visibility as HirVisibility};
+use ra_ap_hir::{
+    Adt, HasSource, HasVisibility, ModuleDef, Semantics,
+    Visibility as HirVisibility,
+};
 use ra_ap_ide::TryToNav;
 use ra_ap_ide_db::defs::Definition;
 use ra_ap_ide_db::{RootDatabase, SymbolKind as RaSymbolKind};

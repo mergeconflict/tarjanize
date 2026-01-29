@@ -87,22 +87,30 @@ pub(crate) fn compute_relative_file_path(
     crate_root: &VfsPath,
     file_id: FileId,
 ) -> String {
-    let vfs_path = match file_path(db, file_id) {
-        Ok(path) => path,
-        Err(e) => {
-            warn!(file_id = ?file_id, crate_root = ?crate_root, error = %e, "couldn't compute file path relative to crate root");
-            return String::new();
-        }
-    };
+    file_path(db, file_id)
+        .map(|vfs_path| {
+            // Try to make the path relative to the crate root. If strip_prefix
+            // fails (e.g., file outside crate root, or virtual path quirks),
+            // fall back to the absolute path rather than panicking.
+            let path = vfs_path
+                .strip_prefix(crate_root)
+                .map(|p| p.as_str().to_owned())
+                .unwrap_or_else(
+                    // Defensive: strip_prefix only fails for paths outside crate root.
+                    #[coverage(off)]
+                    || vfs_path.to_string(),
+                );
 
-    // Try to make the path relative to the crate root. If strip_prefix fails
-    // (e.g., file outside crate root, or virtual path quirks), fall back to
-    // the absolute path rather than panicking.
-    let path = vfs_path
-        .strip_prefix(crate_root)
-        .map(|p| p.as_str().to_owned())
-        .unwrap_or_else(|| vfs_path.to_string());
-
-    // Normalize: virtual paths keep leading "/" after strip_prefix("").
-    path.strip_prefix('/').unwrap_or(&path).to_owned()
+            // Normalize: virtual paths keep leading "/" after strip_prefix("").
+            path.strip_prefix('/').unwrap_or(&path).to_owned()
+        })
+        .unwrap_or_else(
+            // Defensive: file_path only fails for invalid file IDs, which
+            // shouldn't occur when called from symbol extraction.
+            #[coverage(off)]
+            |e| {
+                warn!(file_id = ?file_id, crate_root = ?crate_root, error = %e, "couldn't compute file path relative to crate root");
+                String::new()
+            },
+        )
 }

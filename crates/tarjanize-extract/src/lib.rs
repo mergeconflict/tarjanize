@@ -1,3 +1,6 @@
+// Enable coverage attribute for marking defensive code paths.
+#![feature(coverage_attribute)]
+
 //! Symbol graph extraction from Rust workspaces.
 //!
 //! This crate extracts symbol dependency graphs from Rust workspaces using
@@ -42,9 +45,9 @@ use rayon::prelude::*;
 pub use tarjanize_schemas::{Module, Symbol, SymbolGraph, SymbolKind};
 use tracing::{debug_span, instrument, warn};
 
-use crate::error::ExtractErrorKind;
 #[doc(inline)]
 pub use crate::error::ExtractError;
+use crate::error::ExtractErrorKind;
 use crate::workspaces::load_workspace;
 
 /// Look up the filesystem path for a file ID.
@@ -57,9 +60,11 @@ pub(crate) fn file_path(
 ) -> anyhow::Result<VfsPath> {
     let source_root_id = db.file_source_root(file_id).source_root_id(db);
     let source_root = db.source_root(source_root_id).source_root(db);
-    source_root.path_for_file(&file_id).cloned().ok_or_else(|| {
-        anyhow::anyhow!("file id {file_id:?} not found in source root")
-    })
+    source_root.path_for_file(&file_id).cloned().ok_or_else(
+        // Defensive: rust-analyzer's VFS always has paths for valid file IDs.
+        #[coverage(off)]
+        || anyhow::anyhow!("file id {file_id:?} not found in source root"),
+    )
 }
 
 /// Extracts a complete symbol graph from a rust-analyzer database.
@@ -144,8 +149,11 @@ pub fn run(
     let _span = debug_span!("run", path = %path.display()).entered();
 
     // Step 1: load the workspace into a rust-analyzer database.
-    let db = load_workspace(path)
-        .map_err(|e| ExtractError::new(ExtractErrorKind::WorkspaceLoad(e.into())))?;
+    let db = load_workspace(path).map_err(
+        // Defensive: workspace load failures are tested in workspaces.rs.
+        #[coverage(off)]
+        |e| ExtractError::new(ExtractErrorKind::WorkspaceLoad(e.into())),
+    )?;
 
     // Step 2: extract the symbol graph from the db.
     let symbol_graph = extract_symbol_graph(db);

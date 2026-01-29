@@ -160,9 +160,8 @@ mod tests {
 
     #[test]
     fn test_backtrace_captured() {
-        let err = ExtractError::new(ExtractErrorKind::WorkspaceLoad(
-            "test".into(),
-        ));
+        let err =
+            ExtractError::new(ExtractErrorKind::WorkspaceLoad("test".into()));
         // Just verify we can call backtrace() - the actual content depends
         // on RUST_BACKTRACE environment variable.
         let _ = err.backtrace();
@@ -170,9 +169,8 @@ mod tests {
 
     #[test]
     fn test_debug_impl() {
-        let err = ExtractError::new(ExtractErrorKind::WorkspaceLoad(
-            "test".into(),
-        ));
+        let err =
+            ExtractError::new(ExtractErrorKind::WorkspaceLoad("test".into()));
         let debug_str = format!("{err:?}");
         assert!(debug_str.contains("ExtractError"));
     }

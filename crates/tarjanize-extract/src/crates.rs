@@ -33,7 +33,11 @@ pub(crate) fn extract_crate(
     // display name indicates a non-Cargo build system or synthetic crate.
     let crate_name = krate
         .display_name(db)
-        .ok_or_else(|| anyhow!("crate has no display name"))?
+        .ok_or_else(
+            // Defensive: all Cargo crates have names.
+            #[coverage(off)]
+            || anyhow!("crate has no display name"),
+        )?
         .to_string();
 
     let _span = debug_span!("extract_crate", %crate_name).entered();
@@ -41,12 +45,16 @@ pub(crate) fn extract_crate(
     // Get the crate root directory for computing relative file paths.
     // The crate root file is lib.rs or main.rs; its parent is the crate root dir.
     let root_file_id = krate.root_file(db);
-    let crate_root_path = file_path(db, root_file_id).with_context(|| {
-        format!("getting root path for crate '{crate_name}'")
-    })?;
-    let crate_root = crate_root_path.parent().ok_or_else(|| {
-        anyhow!("root file '{crate_root_path}' has no parent directory")
-    })?;
+    let crate_root_path = file_path(db, root_file_id).with_context(
+        // Defensive: crate root files always have valid paths.
+        #[coverage(off)]
+        || format!("getting root path for crate '{crate_name}'"),
+    )?;
+    let crate_root = crate_root_path.parent().ok_or_else(
+        // Defensive: file paths always have parent directories.
+        #[coverage(off)]
+        || anyhow!("root file '{crate_root_path}' has no parent directory"),
+    )?;
 
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);

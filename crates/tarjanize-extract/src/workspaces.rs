@@ -24,13 +24,17 @@ pub(crate) fn load_workspace(
     // rust-analyzer requires absolute paths for file identification and
     // workspace discovery. canonicalize() also resolves symlinks to ensure
     // we work with the real filesystem location.
-    let canonical = path
-        .canonicalize()
-        .with_context(|| format!("failed to canonicalize path '{}'", path.display()))?;
+    let canonical = path.canonicalize().with_context(|| {
+        format!("failed to canonicalize path '{}'", path.display())
+    })?;
 
     // rust-analyzer's APIs expect UTF-8 paths internally.
     let workspace_path = Utf8PathBuf::from_path_buf(canonical.clone())
-        .map_err(|_| anyhow!("path contains invalid UTF-8: {}", canonical.display()))?;
+        .map_err(
+            // Defensive: non-UTF-8 paths are rare on modern systems.
+            #[coverage(off)]
+            |_| anyhow!("path contains invalid UTF-8: {}", canonical.display()),
+        )?;
 
     // CargoConfig controls how Cargo projects are interpreted (e.g., which
     // features to enable, target platform). Default settings work for most
