@@ -139,16 +139,17 @@ pub enum SymbolKind {
     /// Impl blocks are distinct from ModuleDefs; they don't have visibility,
     /// and Rust's orphan rules dictate where they can be defined.
     Impl {
-        /// Fully qualified path to the self type (the type being implemented).
-        /// Present when the self type is a struct, enum or union; absent for
-        /// type parameters, primitives, references, `dyn Trait`, etc.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        self_type: Option<String>,
-
-        /// Fully qualified path to the trait being implemented. Present for
-        /// trait impls, absent for inherent impls.
-        #[serde(rename = "trait", skip_serializing_if = "Option::is_none")]
-        trait_: Option<String>,
+        /// Workspace-local types and traits that can satisfy the orphan rule.
+        ///
+        /// For `impl<P1..=Pn> Trait<T1..=Tn> for T0`, the orphan rule allows:
+        /// - The trait is local, OR
+        /// - At least one of T0..=Tn is local (including trait type params)
+        ///
+        /// This set contains the fully qualified paths of all local types and
+        /// the trait (if local). Phase 2 maps these to SCCs, and Phase 3
+        /// ensures the impl ends up in a crate with at least one anchor.
+        #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+        anchors: HashSet<String>,
     },
 }
 
@@ -177,11 +178,6 @@ mod tests {
         "[a-z_][a-z0-9_]{0,19}"
     }
 
-    /// Strategy for generating optional names.
-    fn arb_opt_name() -> impl Strategy<Value = Option<String>> {
-        prop::option::of(arb_name())
-    }
-
     /// Strategy for generating arbitrary Visibility values.
     fn arb_visibility() -> impl Strategy<Value = Visibility> {
         prop_oneof![Just(Visibility::Public), Just(Visibility::NonPublic)]
@@ -199,9 +195,9 @@ mod tests {
 
         prop_compose! {
             fn arb_impl()
-                (self_type in arb_opt_name(), trait_ in arb_opt_name())
+                (anchors in hash_set(arb_name(), 0..5))
             -> SymbolKind {
-                SymbolKind::Impl { self_type, trait_ }
+                SymbolKind::Impl { anchors }
             }
         }
 
