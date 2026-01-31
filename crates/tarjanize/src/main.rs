@@ -14,6 +14,10 @@ use tracing_subscriber::fmt::format::FmtSpan;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+/// Crates to include in the logging allowlist.
+const CRATES: &[&str] =
+    &["tarjanize", "tarjanize_extract", "tarjanize_schemas"];
+
 /// Analyze Rust workspace dependency structures to identify opportunities for
 /// splitting crates into smaller, parallelizable units for improved build times.
 #[derive(Parser)]
@@ -48,8 +52,6 @@ fn main() -> Result<()> {
 
     // Initialize structured logging. Output goes to stderr so JSON output
     // on stdout remains clean for piping. Default to warn, allowlist our crates.
-    const CRATES: &[&str] =
-        &["tarjanize", "tarjanize_extract", "tarjanize_schemas"];
     let level = cli.verbose.tracing_level_filter();
     let allowlist = CRATES.iter().map(|c| format!("{c}={level}")).join(",");
     let filter = EnvFilter::new(format!("warn,{allowlist}"));

@@ -5,7 +5,7 @@
 //! for symbols across the workspace.
 //!
 //! Path formats:
-//! - ModuleDefs: `crate::module::item` (e.g., `mycrate::foo::MyStruct`)
+//! - `ModuleDefs`: `crate::module::item` (e.g., `mycrate::foo::MyStruct`)
 //! - Impl blocks: `crate::module::impl Trait for Type` or `crate::module::impl Type`
 
 use ra_ap_base_db::VfsPath;
@@ -16,7 +16,7 @@ use tracing::warn;
 use crate::file_path;
 use crate::impls::impl_name;
 
-/// Returns the fully-qualified path for a ModuleDef.
+/// Returns the fully-qualified path for a `ModuleDef`.
 ///
 /// Uses rust-analyzer's `canonical_path` method and prepends the crate name.
 ///
@@ -35,13 +35,13 @@ pub(crate) fn module_def_path(
     let edition = krate.edition(db);
 
     let canonical = def.canonical_path(db, edition)?;
-    Some(format!("{}::{}", crate_name, canonical))
+    Some(format!("{crate_name}::{canonical}"))
 }
 
 /// Returns the fully-qualified path for an Impl.
 ///
-/// Impl paths use the format "crate::module::impl Trait for Type" or
-/// "crate::module::impl Type" for inherent impls.
+/// Impl paths use the format "`crate::module::impl` Trait for Type" or
+/// "`crate::module::impl` Type" for inherent impls.
 ///
 /// Returns None if the crate has no display name (shouldn't happen in practice).
 pub(crate) fn impl_path(db: &RootDatabase, impl_: &Impl) -> Option<String> {
@@ -59,9 +59,10 @@ pub(crate) fn impl_path(db: &RootDatabase, impl_: &Impl) -> Option<String> {
         .map(|m| {
             // Use the module name if available; fallback to crate name for the
             // unnamed root module.
-            m.name(db)
-                .map(|n| n.display(db, edition).to_string())
-                .unwrap_or_else(|| crate_name.clone())
+            m.name(db).map_or_else(
+                || crate_name.clone(),
+                |n| n.display(db, edition).to_string(),
+            )
         })
         .chain([impl_name(db, impl_)])
         .collect::<Vec<_>>()
@@ -87,30 +88,17 @@ pub(crate) fn compute_relative_file_path(
     crate_root: &VfsPath,
     file_id: FileId,
 ) -> String {
-    file_path(db, file_id)
-        .map(|vfs_path| {
+    file_path(db, file_id).map_or_else(|e| {
+                warn!(file_id = ?file_id, crate_root = ?crate_root, error = %e, "couldn't compute file path relative to crate root");
+                String::new()
+            }, |vfs_path| {
             // Try to make the path relative to the crate root. If strip_prefix
             // fails (e.g., file outside crate root, or virtual path quirks),
             // fall back to the absolute path rather than panicking.
             let path = vfs_path
-                .strip_prefix(crate_root)
-                .map(|p| p.as_str().to_owned())
-                .unwrap_or_else(
-                    // Defensive: strip_prefix only fails for paths outside crate root.
-                    #[coverage(off)]
-                    || vfs_path.to_string(),
-                );
+                .strip_prefix(crate_root).map_or_else(|| vfs_path.to_string(), |p| p.as_str().to_owned());
 
             // Normalize: virtual paths keep leading "/" after strip_prefix("").
             path.strip_prefix('/').unwrap_or(&path).to_owned()
         })
-        .unwrap_or_else(
-            // Defensive: file_path only fails for invalid file IDs, which
-            // shouldn't occur when called from symbol extraction.
-            #[coverage(off)]
-            |e| {
-                warn!(file_id = ?file_id, crate_root = ?crate_root, error = %e, "couldn't compute file path relative to crate root");
-                String::new()
-            },
-        )
 }

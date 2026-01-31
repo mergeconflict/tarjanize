@@ -1,9 +1,9 @@
-//! ModuleDef extraction for tarjanize.
+//! `ModuleDef` extraction for tarjanize.
 //!
 //! This module handles extraction of `ModuleDef` items (functions, structs,
 //! enums, traits, consts, statics, type aliases, macros) into the schema format.
 //!
-//! ModuleDefs are the named items declared at module scope. They contrast with
+//! `ModuleDefs` are the named items declared at module scope. They contrast with
 //! impl blocks, which are anonymous and handled separately in `impls.rs`.
 
 use std::collections::HashSet;
@@ -31,7 +31,7 @@ use crate::paths::{compute_relative_file_path, impl_path, module_def_path};
 /// `ModuleDef`s but are valid dependency targets when a symbol references methods
 /// or associated items from an impl.
 ///
-/// Other Definition variants (Module, BuiltinType, Local, GenericParam, etc.)
+/// Other Definition variants (Module, `BuiltinType`, Local, `GenericParam`, etc.)
 /// should have been filtered out by `normalize_definition` in the dependency
 /// collection phase, but we return None defensively if they slip through.
 pub(crate) fn definition_path(
@@ -62,7 +62,7 @@ pub(crate) fn definition_path(
     }
 }
 
-/// Extract a single ModuleDef as a (name, Symbol) pair.
+/// Extract a single `ModuleDef` as a (name, Symbol) pair.
 ///
 /// Returns None for items without names (e.g., unnamed consts) or without
 /// source locations (e.g., built-in types).
@@ -90,7 +90,7 @@ pub(crate) fn extract_module_def(
 
     // Compute cost as the byte size of the symbol's syntax node.
     // This is a rough proxy for compile-time complexity.
-    let cost = u32::from(nav.full_range.len()) as f64;
+    let cost = f64::from(u32::from(nav.full_range.len()));
 
     // Collect dependencies in this workspace for this symbol.
     let dependencies = find_dependencies(sema, def);
@@ -115,7 +115,7 @@ pub(crate) fn extract_module_def(
     ))
 }
 
-/// Find all items that a given ModuleDef depends on.
+/// Find all items that a given `ModuleDef` depends on.
 ///
 /// This is the core of dependency analysis for module-level definitions.
 /// Given an item (function, struct, etc.), we find every other item it
@@ -139,9 +139,7 @@ pub(crate) fn find_dependencies(
     sema: &Semantics<'_, RootDatabase>,
     def: ModuleDef,
 ) -> HashSet<String> {
-    let db = sema.db;
-
-    /// Collect dependencies from any item that implements HasSource.
+    /// Collect dependencies from any item that implements `HasSource`.
     ///
     /// We use `sema.source()` instead of `item.source(db)` because Semantics'
     /// version registers the syntax tree with its internal cache. This allows
@@ -154,6 +152,8 @@ pub(crate) fn find_dependencies(
             .map(|src| collect_path_deps(sema, src.value.syntax()))
             .unwrap_or_default()
     }
+
+    let db = sema.db;
 
     // For each item type, we get its source and collect dependencies.
     let deps = match def {
@@ -191,14 +191,14 @@ mod tests {
 
     /// Verify macro-generated symbols are extracted with correct file paths.
     ///
-    /// When a macro_rules! macro generates a function, the symbol's HirFileId
+    /// When a `macro_rules`! macro generates a function, the symbol's `HirFileId`
     /// points to the macro expansion. Our `compute_relative_file_path` uses
     /// `original_file()` to trace back to the source file containing the
     /// macro invocation.
     #[test]
     fn test_macro_generated_symbol_has_file_path() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 macro_rules! make_fn {
     ($name:ident) => {
@@ -207,7 +207,7 @@ macro_rules! make_fn {
 }
 
 make_fn!(generated_function);
-"#,
+",
         );
         let graph = extract_symbol_graph(db);
 
@@ -231,20 +231,20 @@ make_fn!(generated_function);
 
     /// Verify that submodules appear in the nested Module structure, not as symbols.
     ///
-    /// Modules are represented hierarchically via Module::submodules, not as
+    /// Modules are represented hierarchically via `Module::submodules`, not as
     /// Symbol entries. This prevents double-representation and matches how
-    /// we actually process modules (recursively via extract_module).
+    /// we actually process modules (recursively via `extract_module`).
     #[test]
     fn test_modules_not_in_symbols() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub mod inner {
     pub fn inner_fn() {}
 }
 
 pub fn outer_fn() {}
-"#,
+",
         );
         let graph = extract_symbol_graph(db);
         let root = &graph.crates["test_crate"];
@@ -276,11 +276,11 @@ pub fn outer_fn() {}
         );
     }
 
-    /// Test visibility extraction: only `pub` is Public, everything else is NonPublic.
+    /// Test visibility extraction: only `pub` is Public, everything else is `NonPublic`.
     #[test]
     fn test_visibility() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn public_fn() {}
 
@@ -291,7 +291,7 @@ fn private_fn() {}
 pub mod inner {
     pub(super) fn pub_super_fn() {}
 }
-"#,
+",
         );
         let graph = extract_symbol_graph(db);
 
@@ -331,14 +331,14 @@ pub mod inner {
     #[test]
     fn test_unnamed_const_skipped() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 const _: () = {
     // compile-time assertion or side effect
 };
 
 const NAMED: i32 = 42;
-"#,
+",
         );
         let graph = extract_symbol_graph(db);
         let root = &graph.crates["test_crate"];
@@ -364,11 +364,11 @@ const NAMED: i32 = 42;
         );
     }
 
-    /// Kind strings should match rust-analyzer's SymbolKind enum names.
+    /// Kind strings should match rust-analyzer's `SymbolKind` enum names.
     #[test]
     fn test_kind_strings() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn my_function() {}
 pub struct MyStruct;
@@ -379,7 +379,7 @@ pub type MyTypeAlias = i32;
 pub const MY_CONST: i32 = 0;
 pub static MY_STATIC: i32 = 0;
 macro_rules! my_macro { () => {} }
-"#,
+",
         );
         let graph = extract_symbol_graph(db);
         let root = &graph.crates["test_crate"];
@@ -397,7 +397,7 @@ macro_rules! my_macro { () => {} }
             {
                 kind.clone()
             } else {
-                panic!("{} is not a ModuleDef", name);
+                panic!("{name} is not a ModuleDef");
             }
         };
 
@@ -424,7 +424,7 @@ macro_rules! my_macro { () => {} }
 
     use super::definition_path;
 
-    /// Helper to get the root module of the test_crate from a fixture.
+    /// Helper to get the root module of the `test_crate` from a fixture.
     fn get_test_crate_root(db: &RootDatabase) -> Module {
         Crate::all(db)
             .into_iter()
@@ -459,7 +459,7 @@ macro_rules! my_macro { () => {} }
                 return Definition::Macro(mac);
             }
         }
-        panic!("Definition '{}' not found", name);
+        panic!("Definition '{name}' not found");
     }
 
     /// Helper to find a nested declaration by module path and name.
@@ -473,7 +473,7 @@ macro_rules! my_macro { () => {} }
             module = module
                 .children(db)
                 .find(|m| m.name(db).is_some_and(|n| n.as_str() == segment))
-                .unwrap_or_else(|| panic!("Module '{}' not found", segment));
+                .unwrap_or_else(|| panic!("Module '{segment}' not found"));
         }
         for decl in module.declarations(db) {
             if decl.name(db).is_some_and(|n| n.as_str() == name) {
@@ -483,17 +483,17 @@ macro_rules! my_macro { () => {} }
                 };
             }
         }
-        panic!("Definition '{}' not found in module", name);
+        panic!("Definition '{name}' not found in module");
     }
 
     /// Function produces correct path.
     #[test]
     fn test_definition_path_function() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn my_function() {}
-"#,
+",
         );
         let def = find_def(&db, "my_function");
         assert_eq!(
@@ -506,10 +506,10 @@ pub fn my_function() {}
     #[test]
     fn test_definition_path_struct() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct MyStruct;
-"#,
+",
         );
         let def = find_def(&db, "MyStruct");
         assert_eq!(
@@ -522,10 +522,10 @@ pub struct MyStruct;
     #[test]
     fn test_definition_path_enum() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub enum MyEnum { A }
-"#,
+",
         );
         let def = find_def(&db, "MyEnum");
         assert_eq!(
@@ -538,10 +538,10 @@ pub enum MyEnum { A }
     #[test]
     fn test_definition_path_trait() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
-"#,
+",
         );
         let def = find_def(&db, "MyTrait");
         assert_eq!(
@@ -554,10 +554,10 @@ pub trait MyTrait {}
     #[test]
     fn test_definition_path_type_alias() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub type MyAlias = i32;
-"#,
+",
         );
         let def = find_def(&db, "MyAlias");
         assert_eq!(
@@ -570,10 +570,10 @@ pub type MyAlias = i32;
     #[test]
     fn test_definition_path_const() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const MY_CONST: i32 = 42;
-"#,
+",
         );
         let def = find_def(&db, "MY_CONST");
         assert_eq!(
@@ -586,10 +586,10 @@ pub const MY_CONST: i32 = 42;
     #[test]
     fn test_definition_path_static() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub static MY_STATIC: i32 = 42;
-"#,
+",
         );
         let def = find_def(&db, "MY_STATIC");
         assert_eq!(
@@ -602,10 +602,10 @@ pub static MY_STATIC: i32 = 42;
     #[test]
     fn test_definition_path_macro() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 macro_rules! my_macro { () => {} }
-"#,
+",
         );
         let def = find_def(&db, "my_macro");
         assert_eq!(
@@ -621,13 +621,13 @@ macro_rules! my_macro { () => {} }
     #[test]
     fn test_definition_path_inherent_impl() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Target;
 impl Target {
     pub fn method() {}
 }
-"#,
+",
         );
         attach_db(&db, || {
             let root = get_test_crate_root(&db);
@@ -648,12 +648,12 @@ impl Target {
     #[test]
     fn test_definition_path_trait_impl() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Target;
 pub trait MyTrait {}
 impl MyTrait for Target {}
-"#,
+",
         );
         attach_db(&db, || {
             let root = get_test_crate_root(&db);
@@ -675,14 +675,14 @@ impl MyTrait for Target {}
     #[test]
     fn test_definition_path_nested_module() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub mod outer {
     pub mod inner {
         pub fn target() {}
     }
 }
-"#,
+",
         );
         let def = find_nested_def(&db, &["outer", "inner"], "target");
         assert_eq!(
@@ -695,12 +695,12 @@ pub mod outer {
     #[test]
     fn test_definition_path_non_dependency_returns_none() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn foo() {
     let local_var = 42;
 }
-"#,
+",
         );
         // Definition::Module should return None (modules aren't dependency targets)
         let root = get_test_crate_root(&db);

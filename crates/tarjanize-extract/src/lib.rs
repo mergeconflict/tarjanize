@@ -99,10 +99,7 @@ pub(crate) fn extract_symbol_graph(db: RootDatabase) -> SymbolGraph {
                             crates.insert(name, module);
                         }
                         Err(e) => {
-                            match krate.display_name(&db) {
-                                Some(n) => warn!(crate_name = %n, error = %e, "skipping crate"),
-                                None => warn!(error = %e, "skipping unnamed crate"),
-                            }
+                            if let Some(n) = krate.display_name(&db) { warn!(crate_name = %n, error = %e, "skipping crate") } else { warn!(error = %e, "skipping unnamed crate") }
                         }
                     }
                 });

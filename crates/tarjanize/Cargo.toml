@@ -2,7 +2,15 @@
 name = "tarjanize"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Analyze Rust workspace dependencies to identify crate splitting opportunities"
+
+[lints]
+workspace = true
 
 [dependencies]
 tarjanize-extract = { path = "../tarjanize-extract" }

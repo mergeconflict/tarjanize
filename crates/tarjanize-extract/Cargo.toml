@@ -2,7 +2,15 @@
 name = "tarjanize-extract"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
 description = "Symbol graph extraction from Rust workspaces using rust-analyzer"
+
+[lints]
+workspace = true
 
 [dependencies]
 anyhow = "1"

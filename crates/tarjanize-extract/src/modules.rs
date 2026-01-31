@@ -3,7 +3,7 @@
 //! This module orchestrates the extraction of symbols from a module hierarchy.
 //! It recursively walks through modules, delegating the actual symbol extraction
 //! to specialized modules:
-//! - `module_defs`: Extracts ModuleDef items (functions, structs, etc.)
+//! - `module_defs`: Extracts `ModuleDef` items (functions, structs, etc.)
 //! - `impls`: Extracts impl blocks
 //!
 //! The extracted symbols are organized into a tree structure matching the
@@ -22,21 +22,21 @@ use crate::module_defs::extract_module_def;
 
 /// Extract a module and its contents as a Module.
 ///
-/// Returns a tuple of (module_name, module). The name is stored separately
-/// because the schema uses HashMaps keyed by name rather than storing the
+/// Returns a tuple of (`module_name`, module). The name is stored separately
+/// because the schema uses `HashMaps` keyed by name rather than storing the
 /// name inside the Module struct.
 ///
 /// This function recursively processes a module, extracting:
-/// - All symbols (ModuleDefs and impl blocks) with their dependencies
+/// - All symbols (`ModuleDefs` and impl blocks) with their dependencies
 /// - Child submodules
 ///
-/// The crate_name parameter is used to build fully-qualified paths for
-/// dependencies. The crate_root is the directory containing the crate's
+/// The `crate_name` parameter is used to build fully-qualified paths for
+/// dependencies. The `crate_root` is the directory containing the crate's
 /// lib.rs/main.rs, used to compute relative file paths for symbols.
 pub(crate) fn extract_module(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
-    module: &HirModule,
+    module: HirModule,
     crate_name: &str,
 ) -> (String, Module) {
     let db = sema.db;
@@ -44,8 +44,7 @@ pub(crate) fn extract_module(
     // Module name: use crate name for root module, otherwise use module name.
     let module_name = module
         .name(db)
-        .map(|n| n.as_str().to_owned())
-        .unwrap_or_else(|| crate_name.to_owned());
+        .map_or_else(|| crate_name.to_owned(), |n| n.as_str().to_owned());
 
     let _span = debug_span!("extract_module", %module_name).entered();
 
@@ -55,7 +54,7 @@ pub(crate) fn extract_module(
     // Recursively extract child modules into a HashMap keyed by name.
     let submodules: HashMap<String, Module> = module
         .children(db)
-        .map(|child| extract_module(sema, crate_root, &child, crate_name))
+        .map(|child| extract_module(sema, crate_root, child, crate_name))
         .collect();
 
     (
@@ -67,9 +66,9 @@ pub(crate) fn extract_module(
     )
 }
 
-/// Extract all symbols from a module (ModuleDefs and impl blocks).
+/// Extract all symbols from a module (`ModuleDefs` and impl blocks).
 ///
-/// Returns a HashMap keyed by symbol name. Multiple impl blocks with the same
+/// Returns a `HashMap` keyed by symbol name. Multiple impl blocks with the same
 /// signature (e.g., two `impl Foo` blocks) are merged into a single Symbol
 /// with combined cost and merged dependencies.
 //
@@ -82,7 +81,7 @@ pub(crate) fn extract_module(
 fn extract_module_symbols(
     sema: &Semantics<'_, RootDatabase>,
     crate_root: &VfsPath,
-    module: &HirModule,
+    module: HirModule,
 ) -> HashMap<String, Symbol> {
     let db = sema.db;
     let mut symbols = HashMap::new();
@@ -136,7 +135,7 @@ mod tests {
     #[test]
     fn test_impl_merging() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Foo;
 pub struct DepA;
@@ -149,7 +148,7 @@ impl Foo {
 impl Foo {
     pub fn method_b(&self) -> DepB { DepB }
 }
-"#,
+",
         );
 
         attach_db(&db, || {
@@ -169,7 +168,7 @@ impl Foo {
             let sema = Semantics::new(&db);
             let root_module = krate.root_module(&db);
             let (_, module) =
-                extract_module(&sema, &crate_root, &root_module, "test_crate");
+                extract_module(&sema, &crate_root, root_module, "test_crate");
 
             // Should have exactly one "impl Foo" symbol (merged)
             let symbol = module

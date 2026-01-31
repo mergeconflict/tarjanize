@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 /// Rust workspace. Crates are represented as their root modules, which
 /// contain symbols and nested submodules. Dependencies are stored directly
 /// on each symbol rather than as a separate edge list.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
 pub struct SymbolGraph {
     /// All crates in the workspace, keyed by crate name. Each crate is
     /// represented as its root module, which contains all symbols and
@@ -31,9 +33,11 @@ pub struct SymbolGraph {
 /// - Child submodules
 ///
 /// The crate's root module (lib.rs or main.rs) is the top of this tree.
-/// Both module and symbol names are stored as HashMap keys, not in the
+/// Both module and symbol names are stored as `HashMap` keys, not in the
 /// structs themselves.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
 pub struct Module {
     /// Symbols defined directly in this module, keyed by symbol name. Multiple
     /// impl blocks with the same signature (e.g., two `impl Foo` blocks) are
@@ -49,7 +53,7 @@ pub struct Module {
 ///
 /// Symbols are the vertices in the dependency graph. Each symbol has a
 /// source file, compilation cost estimate, dependencies, and kind-specific
-/// details. Symbol names are stored as keys in the parent Module's HashMap.
+/// details. Symbol names are stored as keys in the parent Module's `HashMap`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
     /// Path to the symbol's file relative to the crate root.
@@ -107,6 +111,12 @@ pub enum Visibility {
 
 impl Visibility {
     /// Returns true if this is non-public visibility.
+    ///
+    /// Takes `&self` because serde's `skip_serializing_if` passes by reference.
+    #[expect(
+        clippy::trivially_copy_pass_by_ref,
+        reason = "serde skip_serializing_if requires &self"
+    )]
     fn is_non_public(&self) -> bool {
         *self == Visibility::NonPublic
     }
@@ -125,7 +135,7 @@ pub enum SymbolKind {
     /// statics, type aliases, and macros.
     ModuleDef {
         /// The kind of definition: "Function", "Struct", "Enum", etc.
-        /// Uses PascalCase to match rust-analyzer's `SymbolKind` enum.
+        /// Uses `PascalCase` to match rust-analyzer's `SymbolKind` enum.
         kind: String,
 
         /// Visibility for crate-splitting purposes. Defaults to `NonPublic`
@@ -136,7 +146,7 @@ pub enum SymbolKind {
 
     /// An impl block, analogous to `ra_ap_hir::Impl`.
     ///
-    /// Impl blocks are distinct from ModuleDefs; they don't have visibility,
+    /// Impl blocks are distinct from `ModuleDefs`; they don't have visibility,
     /// and Rust's orphan rules dictate where they can be defined.
     Impl {
         /// Workspace-local types and traits that can satisfy the orphan rule.
@@ -183,7 +193,7 @@ mod tests {
         prop_oneof![Just(Visibility::Public), Just(Visibility::NonPublic)]
     }
 
-    /// Strategy for generating arbitrary SymbolKind values.
+    /// Strategy for generating arbitrary `SymbolKind` values.
     fn arb_symbol_kind() -> impl Strategy<Value = SymbolKind> {
         prop_compose! {
             fn arb_module_def()

@@ -33,7 +33,9 @@ pub(crate) fn load_workspace(
         .map_err(
             // Defensive: non-UTF-8 paths are rare on modern systems.
             #[coverage(off)]
-            |_| anyhow!("path contains invalid UTF-8: {}", canonical.display()),
+            |_err| {
+                anyhow!("path contains invalid UTF-8: {}", canonical.display())
+            },
         )?;
 
     // CargoConfig controls how Cargo projects are interpreted (e.g., which
@@ -59,8 +61,7 @@ pub(crate) fn load_workspace(
 
         // Parallelize proc macro expansion across available CPU cores.
         proc_macro_processes: std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1),
+            .map_or(1, std::num::NonZero::get),
     };
 
     // Load the workspace into rust-analyzer's analysis database. This:

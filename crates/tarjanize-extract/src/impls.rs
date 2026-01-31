@@ -2,7 +2,7 @@
 //!
 //! This module handles extraction of impl blocks into the schema format.
 //! Impl blocks are anonymous (you can't write a path like `mycrate::SomeImpl`),
-//! so they require special handling compared to named ModuleDefs.
+//! so they require special handling compared to named `ModuleDefs`.
 //!
 //! Impl blocks are important compilation units because:
 //! - They define method implementations that create dependencies
@@ -291,13 +291,13 @@ mod tests {
     #[test]
     fn test_inherent_impl() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Foo;
 impl Foo {
     pub fn method(&self) {}
 }
-"#,
+",
             "impl Foo",
             &["test_crate::Foo"],
         );
@@ -306,12 +306,12 @@ impl Foo {
     #[test]
     fn test_trait_impl() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait { fn method(&self); }
 pub struct Foo;
 impl MyTrait for Foo { fn method(&self) {} }
-"#,
+",
             "impl MyTrait for Foo",
             &["test_crate::Foo", "test_crate::MyTrait"],
         );
@@ -321,12 +321,12 @@ impl MyTrait for Foo { fn method(&self) {} }
     fn test_impl_for_reference() {
         // &Foo - reference is fundamental, so Foo inside counts as an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait { fn method(&self); }
 pub struct Foo;
 impl MyTrait for &Foo { fn method(&self) {} }
-"#,
+",
             "impl MyTrait for &Foo",
             &["test_crate::MyTrait", "test_crate::Foo"],
         );
@@ -336,11 +336,11 @@ impl MyTrait for &Foo { fn method(&self) {} }
     fn test_blanket_impl() {
         // T is a generic param, so only the trait is an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait { fn method(&self); }
 impl<T> MyTrait for T { fn method(&self) {} }
-"#,
+",
             "impl<T> MyTrait for T",
             &["test_crate::MyTrait"],
         );
@@ -349,13 +349,13 @@ impl<T> MyTrait for T { fn method(&self) {} }
     #[test]
     fn test_inherent_impl_generic() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Wrapper<T>(T);
 impl<T> Wrapper<T> {
     pub fn new(t: T) -> Self { Self(t) }
 }
-"#,
+",
             "impl<T> Wrapper<T>",
             &["test_crate::Wrapper"],
         );
@@ -364,12 +364,12 @@ impl<T> Wrapper<T> {
     #[test]
     fn test_generic_bounds() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl<T: Clone> MyTrait for Foo {}
-"#,
+",
             "impl<T: Clone> MyTrait for Foo",
             &["test_crate::Foo", "test_crate::MyTrait"],
         );
@@ -378,12 +378,12 @@ impl<T: Clone> MyTrait for Foo {}
     #[test]
     fn test_lifetime_params() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Ref<'a>(&'a str);
 impl<'a> MyTrait for Ref<'a> {}
-"#,
+",
             "impl<'a> MyTrait for Ref<'a>",
             &["test_crate::Ref", "test_crate::MyTrait"],
         );
@@ -392,12 +392,12 @@ impl<'a> MyTrait for Ref<'a> {}
     #[test]
     fn test_multiple_type_params() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Pair<T, U>(T, U);
 impl<T, U> MyTrait for Pair<T, U> {}
-"#,
+",
             "impl<T, U> MyTrait for Pair<T, U>",
             &["test_crate::Pair", "test_crate::MyTrait"],
         );
@@ -406,12 +406,12 @@ impl<T, U> MyTrait for Pair<T, U> {}
     #[test]
     fn test_generic_trait_impl() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Wrapper<T>(T);
 impl<T> MyTrait for Wrapper<T> {}
-"#,
+",
             "impl<T> MyTrait for Wrapper<T>",
             &["test_crate::Wrapper", "test_crate::MyTrait"],
         );
@@ -420,12 +420,12 @@ impl<T> MyTrait for Wrapper<T> {}
     #[test]
     fn test_where_clause() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl<T> MyTrait for Foo where T: Clone {}
-"#,
+",
             "impl<T> MyTrait for Foo where T: Clone",
             &["test_crate::Foo", "test_crate::MyTrait"],
         );
@@ -434,12 +434,12 @@ impl<T> MyTrait for Foo where T: Clone {}
     #[test]
     fn test_unsafe_impl() {
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub unsafe trait UnsafeTrait {}
 pub struct Foo;
 unsafe impl UnsafeTrait for Foo {}
-"#,
+",
             "unsafe impl UnsafeTrait for Foo",
             &["test_crate::Foo", "test_crate::UnsafeTrait"],
         );
@@ -449,13 +449,13 @@ unsafe impl UnsafeTrait for Foo {}
     fn test_tuple_type() {
         // Tuple is not an ADT, so only the trait is an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct A;
 pub struct B;
 impl MyTrait for (A, B) {}
-"#,
+",
             "impl MyTrait for (A, B)",
             &["test_crate::MyTrait"],
         );
@@ -465,12 +465,12 @@ impl MyTrait for (A, B) {}
     fn test_array_type() {
         // Array is not an ADT, so only the trait is an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl MyTrait for [Foo; 3] {}
-"#,
+",
             "impl MyTrait for [Foo; 3]",
             &["test_crate::MyTrait"],
         );
@@ -480,12 +480,12 @@ impl MyTrait for [Foo; 3] {}
     fn test_dyn_trait() {
         // dyn Trait is not an ADT, so only the impl'd trait is an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub trait OtherTrait {}
 impl MyTrait for dyn OtherTrait {}
-"#,
+",
             "impl MyTrait for dyn OtherTrait",
             &["test_crate::MyTrait"],
         );
@@ -497,14 +497,14 @@ impl MyTrait for dyn OtherTrait {}
         // Since T is a type parameter (not a concrete type), only the trait
         // is an anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 #[fundamental]
 pub struct Box<T>(T);
 impl<T> MyTrait for Box<T> {}
-"#,
+",
             "impl<T> MyTrait for Box<T>",
             &["test_crate::MyTrait"],
         );
@@ -514,14 +514,14 @@ impl<T> MyTrait for Box<T> {}
     fn test_fundamental_box_with_concrete_type() {
         // Box<Foo> where Box has #[fundamental] - Foo inside is the anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 #[fundamental]
 pub struct Box<T>(T);
 impl MyTrait for Box<Foo> {}
-"#,
+",
             "impl MyTrait for Box<Foo>",
             &["test_crate::MyTrait", "test_crate::Foo"],
         );
@@ -531,12 +531,12 @@ impl MyTrait for Box<Foo> {}
     fn test_fundamental_mut_ref() {
         // &mut Foo - mutable reference is fundamental, so Foo counts as anchor.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl MyTrait for &mut Foo {}
-"#,
+",
             "impl MyTrait for &mut Foo",
             &["test_crate::MyTrait", "test_crate::Foo"],
         );
@@ -547,13 +547,13 @@ impl MyTrait for &mut Foo {}
         // Wrapper<Foo> - custom wrapper is NOT fundamental, so Foo doesn't count.
         // Only the wrapper itself and the trait are anchors.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 pub struct Wrapper<T>(T);
 impl<T> MyTrait for Wrapper<T> {}
-"#,
+",
             "impl<T> MyTrait for Wrapper<T>",
             &["test_crate::MyTrait", "test_crate::Wrapper"],
         );
@@ -564,7 +564,7 @@ impl<T> MyTrait for Wrapper<T> {}
         // impl MyTrait<Foo> for i32 - Foo is a trait type parameter.
         // Note: We define our own trait since std::From isn't available.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Foo;
 pub trait Convert<T> {
@@ -573,7 +573,7 @@ pub trait Convert<T> {
 impl Convert<Foo> for i32 {
     fn convert(self) -> Foo { Foo }
 }
-"#,
+",
             "impl Convert<Foo> for i32",
             // Both the trait and its type parameter are local anchors.
             &["test_crate::Convert", "test_crate::Foo"],
@@ -584,7 +584,7 @@ impl Convert<Foo> for i32 {
     fn test_trait_type_param_with_local_self() {
         // impl Convert<A> for B - both A (trait type param) and B (self) are anchors.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct A;
 pub struct B;
@@ -594,7 +594,7 @@ pub trait Convert<T> {
 impl Convert<A> for B {
     fn convert(self) -> A { A }
 }
-"#,
+",
             "impl Convert<A> for B",
             &["test_crate::A", "test_crate::B", "test_crate::Convert"],
         );
@@ -604,14 +604,14 @@ impl Convert<A> for B {
     fn test_trait_multiple_type_params() {
         // impl MyTrait<A, B> for C - all type params and self are anchors.
         check_impl(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct A;
 pub struct B;
 pub struct C;
 pub trait MyTrait<T, U> {}
 impl MyTrait<A, B> for C {}
-"#,
+",
             "impl MyTrait<A, B> for C",
             &[
                 "test_crate::A",

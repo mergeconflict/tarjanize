@@ -59,15 +59,14 @@ pub(crate) fn extract_crate(
     // Get the crate's root module and extract it recursively.
     let root_module = krate.root_module(db);
     let (_, module) =
-        extract_module(sema, &crate_root, &root_module, &crate_name);
+        extract_module(sema, &crate_root, root_module, &crate_name);
 
     Ok((crate_name, module))
 }
 
 #[cfg(test)]
 mod tests {
-    use ra_ap_hir::{Crate, Semantics, attach_db};
-    use ra_ap_ide_db::RootDatabase;
+    use ra_ap_hir::attach_db;
     use ra_ap_test_fixture::WithFixture;
 
     use super::*;
@@ -75,9 +74,9 @@ mod tests {
     #[test]
     fn test_extract_crate_returns_name_and_symbols() {
         let db = RootDatabase::with_files(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
-"#,
+",
         );
 
         attach_db(&db, || {

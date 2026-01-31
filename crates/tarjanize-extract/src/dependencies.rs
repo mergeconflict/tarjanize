@@ -54,8 +54,7 @@ pub(crate) fn is_local_def(db: &RootDatabase, def: &Definition) -> bool {
         // the containing module (or None for crate roots, builtins, etc.)
         _ => def
             .module(db)
-            .map(|m| m.krate(db).origin(db).is_local())
-            .unwrap_or(false),
+            .is_some_and(|m| m.krate(db).origin(db).is_local()),
     }
 }
 
@@ -68,17 +67,17 @@ pub(crate) fn is_local_def(db: &RootDatabase, def: &Definition) -> bool {
 /// This is the heart of dependency extraction. We use the canonical rust-analyzer
 /// pattern of walking `NameRef` nodes and using `NameRefClass::classify()`.
 ///
-/// ## Why NameRefClass instead of resolve_path?
+/// ## Why `NameRefClass` instead of `resolve_path`?
 ///
 /// `NameRefClass::classify()` handles cases that raw path resolution misses:
-/// 1. **Field shorthands**: `Foo { field }` - `field` is a NameRef but not a path
+/// 1. **Field shorthands**: `Foo { field }` - `field` is a `NameRef` but not a path
 /// 2. **Pattern constants**: `match x { None => }` - special resolution rules
 /// 3. **Extern crate shorthands**: Different resolution rules
 ///
 /// ## Expression-specific handling
 ///
 /// Method calls (`x.method()`) are handled separately since the method name
-/// isn't a NameRef in the path sense - it's resolved based on the receiver's type.
+/// isn't a `NameRef` in the path sense - it's resolved based on the receiver's type.
 pub(crate) fn collect_path_deps(
     sema: &Semantics<'_, RootDatabase>,
     syntax: &SyntaxNode,
@@ -203,7 +202,7 @@ fn normalize_definition(
         | Definition::BuiltinAttr(_)  // #[cfg], #[allow], etc.
         | Definition::ToolModule(_)   // rustfmt::, clippy::, etc.
         | Definition::ExternCrateDecl(_) // extern crate statement
-        | Definition::InlineAsmRegOrRegClass(_) // asm! register class
+        | Definition::InlineAsmRegOrRegClass(()) // asm! register class
         | Definition::InlineAsmOperand(_) // asm! operand
         | Definition::TupleField(_) => None, // tuple.0, tuple.1, etc.
     }
@@ -211,7 +210,7 @@ fn normalize_definition(
 
 /// Collapse an item to its container if it's an associated item.
 ///
-/// Function, Const, and TypeAlias can appear either at module scope (free)
+/// Function, Const, and `TypeAlias` can appear either at module scope (free)
 /// or inside an impl/trait block (associated). Associated items collapse to
 /// their container since they can't be split independently.
 fn collapse_if_assoc<T: AsAssocItem>(
@@ -228,9 +227,9 @@ fn collapse_if_assoc<T: AsAssocItem>(
     }
 }
 
-/// Convert a VariantDef (parent of a field) to an Adt Definition.
+/// Convert a `VariantDef` (parent of a field) to an Adt Definition.
 ///
-/// VariantDef can be Struct, Union, or Variant (enum variant with fields).
+/// `VariantDef` can be Struct, Union, or Variant (enum variant with fields).
 /// For enum variants, we return the parent enum since that's the actual
 /// type definition we depend on.
 fn variant_def_to_adt(
@@ -266,12 +265,7 @@ mod tests {
     ///
     /// Panics with a descriptive message if `from` doesn't depend on `to`.
     fn assert_has_edge(graph: &SymbolGraph, from: &str, to: &str) {
-        assert!(
-            has_edge(graph, from, to),
-            "{} should depend on {}",
-            from,
-            to
-        );
+        assert!(has_edge(graph, from, to), "{from} should depend on {to}");
     }
 
     /// Helper to check if a symbol has a dependency on another symbol.
@@ -335,9 +329,7 @@ mod tests {
             all_deps.iter().filter(|d| d.ends_with(to)).collect();
         assert!(
             bad_deps.is_empty(),
-            "No dependencies should target {}: {:?}",
-            description,
-            bad_deps
+            "No dependencies should target {description}: {bad_deps:?}"
         );
     }
 
@@ -353,14 +345,14 @@ mod tests {
     #[test]
     fn test_fn_call() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn target_fn() {}
 
 pub fn caller_fn() {
     target_fn();
 }
-"#,
+",
         );
         assert_has_edge(&graph, "caller_fn", "target_fn");
     }
@@ -369,14 +361,14 @@ pub fn caller_fn() {
     #[test]
     fn test_struct_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct TargetType;
 
 pub struct ContainerType {
     pub field: TargetType,
 }
-"#,
+",
         );
         assert_has_edge(&graph, "ContainerType", "TargetType");
     }
@@ -385,14 +377,14 @@ pub struct ContainerType {
     #[test]
     fn test_enum_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct FieldType;
 
 pub enum MyEnum {
     Variant(FieldType),
 }
-"#,
+",
         );
         assert_has_edge(&graph, "MyEnum", "FieldType");
     }
@@ -401,11 +393,11 @@ pub enum MyEnum {
     #[test]
     fn test_union_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct FieldType;
 pub union MyUnion { pub field: FieldType }
-"#,
+",
         );
         assert_has_edge(&graph, "MyUnion", "FieldType");
     }
@@ -414,12 +406,12 @@ pub union MyUnion { pub field: FieldType }
     #[test]
     fn test_trait_supertrait() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Supertrait {}
 
 pub trait Subtrait: Supertrait {}
-"#,
+",
         );
         assert_has_edge(&graph, "Subtrait", "Supertrait");
     }
@@ -428,12 +420,12 @@ pub trait Subtrait: Supertrait {}
     #[test]
     fn test_trait_impl() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct MyType;
 impl MyTrait for MyType {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyTrait for MyType", "MyTrait");
         assert_has_edge(&graph, "impl MyTrait for MyType", "MyType");
@@ -443,11 +435,11 @@ impl MyTrait for MyType {}
     #[test]
     fn test_inherent_impl() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct MyType;
 impl MyType {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyType", "MyType");
     }
@@ -456,12 +448,12 @@ impl MyType {}
     #[test]
     fn test_const_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct TargetType;
 
 pub const MY_CONST: TargetType = TargetType;
-"#,
+",
         );
         assert_has_edge(&graph, "MY_CONST", "TargetType");
     }
@@ -470,12 +462,12 @@ pub const MY_CONST: TargetType = TargetType;
     #[test]
     fn test_static_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct TargetType;
 
 pub static MY_STATIC: TargetType = TargetType;
-"#,
+",
         );
         assert_has_edge(&graph, "MY_STATIC", "TargetType");
     }
@@ -484,12 +476,12 @@ pub static MY_STATIC: TargetType = TargetType;
     #[test]
     fn test_type_alias() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct TargetType;
 
 pub type MyAlias = TargetType;
-"#,
+",
         );
         assert_has_edge(&graph, "MyAlias", "TargetType");
     }
@@ -506,12 +498,12 @@ pub type MyAlias = TargetType;
     #[test]
     fn test_fn_param_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct ParamType;
 
 pub fn fn_with_param(_x: ParamType) {}
-"#,
+",
         );
         assert_has_edge(&graph, "fn_with_param", "ParamType");
     }
@@ -520,12 +512,12 @@ pub fn fn_with_param(_x: ParamType) {}
     #[test]
     fn test_fn_return_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct ReturnType;
 
 pub fn fn_with_return() -> ReturnType { ReturnType }
-"#,
+",
         );
         assert_has_edge(&graph, "fn_with_return", "ReturnType");
     }
@@ -534,12 +526,12 @@ pub fn fn_with_return() -> ReturnType { ReturnType }
     #[test]
     fn test_fn_ptr_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct A;
 pub struct B;
 pub fn takes_fn_ptr(_: fn(A) -> B) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_fn_ptr", "A");
         assert_has_edge(&graph, "takes_fn_ptr", "B");
@@ -549,11 +541,11 @@ pub fn takes_fn_ptr(_: fn(A) -> B) {}
     #[test]
     fn test_impl_trait_arg() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr {}
 pub fn takes_impl(_: impl Tr) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_impl", "Tr");
     }
@@ -562,13 +554,13 @@ pub fn takes_impl(_: impl Tr) {}
     #[test]
     fn test_impl_trait_return() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr {}
 pub struct S;
 impl Tr for S {}
 pub fn returns_impl() -> impl Tr { S }
-"#,
+",
         );
         assert_has_edge(&graph, "returns_impl", "Tr");
     }
@@ -577,12 +569,12 @@ pub fn returns_impl() -> impl Tr { S }
     #[test]
     fn test_nested_generics() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Outer<T>(T);
 pub struct Inner;
 pub fn nested() -> Outer<Outer<Inner>> { todo!() }
-"#,
+",
         );
         assert_has_edge(&graph, "nested", "Outer");
         assert_has_edge(&graph, "nested", "Inner");
@@ -592,14 +584,14 @@ pub fn nested() -> Outer<Outer<Inner>> { todo!() }
     #[test]
     fn test_deeply_nested_generics() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct A;
 pub struct B;
 pub struct C;
 pub struct Wrapper<T>(T);
 pub fn nested() -> Wrapper<Wrapper<(A, Wrapper<B>, C)>> { todo!() }
-"#,
+",
         );
         assert_has_edge(&graph, "nested", "Wrapper");
         assert_has_edge(&graph, "nested", "A");
@@ -611,12 +603,12 @@ pub fn nested() -> Wrapper<Wrapper<(A, Wrapper<B>, C)>> { todo!() }
     #[test]
     fn test_raw_pointer_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Pointee;
 pub fn takes_const_ptr(_: *const Pointee) {}
 pub fn takes_mut_ptr(_: *mut Pointee) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_const_ptr", "Pointee");
         assert_has_edge(&graph, "takes_mut_ptr", "Pointee");
@@ -626,12 +618,12 @@ pub fn takes_mut_ptr(_: *mut Pointee) {}
     #[test]
     fn test_slice_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Element;
 pub fn takes_slice(_: &[Element]) {}
 pub fn takes_mut_slice(_: &mut [Element]) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_slice", "Element");
         assert_has_edge(&graph, "takes_mut_slice", "Element");
@@ -641,11 +633,11 @@ pub fn takes_mut_slice(_: &mut [Element]) {}
     #[test]
     fn test_boxed_slice_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Element;
 pub fn takes_boxed_slice(_: Box<[Element]>) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_boxed_slice", "Element");
     }
@@ -654,11 +646,11 @@ pub fn takes_boxed_slice(_: Box<[Element]>) {}
     #[test]
     fn test_option_ref_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Inner;
 pub fn takes_option(_: Option<&Inner>) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_option", "Inner");
     }
@@ -667,12 +659,12 @@ pub fn takes_option(_: Option<&Inner>) {}
     #[test]
     fn test_const_expr_in_array_type() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const SIZE: usize = 10;
 pub struct Element;
 pub fn returns_array() -> [Element; SIZE] { todo!() }
-"#,
+",
         );
         assert_has_edge(&graph, "returns_array", "Element");
         assert_has_edge(&graph, "returns_array", "SIZE");
@@ -682,11 +674,11 @@ pub fn returns_array() -> [Element; SIZE] { todo!() }
     #[test]
     fn test_const_expr_arithmetic_in_array() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const BASE: usize = 5;
 pub fn returns_array() -> [u8; BASE + 1] { todo!() }
-"#,
+",
         );
         assert_has_edge(&graph, "returns_array", "BASE");
     }
@@ -695,14 +687,14 @@ pub fn returns_array() -> [u8; BASE + 1] { todo!() }
     #[test]
     fn test_enum_tuple_variant_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct TupleType;
 
 pub enum EnumWithTuple {
     Variant(TupleType),
 }
-"#,
+",
         );
         assert_has_edge(&graph, "EnumWithTuple", "TupleType");
     }
@@ -711,14 +703,14 @@ pub enum EnumWithTuple {
     #[test]
     fn test_enum_struct_variant_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct FieldType;
 
 pub enum EnumWithStruct {
     Variant { field: FieldType },
 }
-"#,
+",
         );
         assert_has_edge(&graph, "EnumWithStruct", "FieldType");
     }
@@ -727,11 +719,11 @@ pub enum EnumWithStruct {
     #[test]
     fn test_const_generic_default_expr() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const DEFAULT_SIZE: usize = 10;
 pub struct Buffer<const N: usize = DEFAULT_SIZE>;
-"#,
+",
         );
         assert_has_edge(&graph, "Buffer", "DEFAULT_SIZE");
     }
@@ -740,7 +732,7 @@ pub struct Buffer<const N: usize = DEFAULT_SIZE>;
     #[test]
     fn test_impl_assoc_type_definition() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait TraitWithAssoc {
     type Output;
@@ -752,7 +744,7 @@ pub struct OutputType;
 impl TraitWithAssoc for ImplType {
     type Output = OutputType;
 }
-"#,
+",
         );
         assert_has_edge(
             &graph,
@@ -765,13 +757,13 @@ impl TraitWithAssoc for ImplType {
     #[test]
     fn test_impl_for_tuple() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct A;
 pub struct B;
 impl MyTrait for (A, B) {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyTrait for (A, B)", "A");
         assert_has_edge(&graph, "impl MyTrait for (A, B)", "B");
@@ -782,12 +774,12 @@ impl MyTrait for (A, B) {}
     #[test]
     fn test_impl_for_array() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl MyTrait for [Foo; 3] {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyTrait for [Foo; 3]", "Foo");
         assert_has_edge(&graph, "impl MyTrait for [Foo; 3]", "MyTrait");
@@ -797,12 +789,12 @@ impl MyTrait for [Foo; 3] {}
     #[test]
     fn test_impl_for_dyn_trait() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub trait OtherTrait {}
 impl MyTrait for dyn OtherTrait {}
-"#,
+",
         );
         assert_has_edge(
             &graph,
@@ -816,12 +808,12 @@ impl MyTrait for dyn OtherTrait {}
     #[test]
     fn test_impl_for_external_generic() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 pub struct Foo;
 impl MyTrait for Box<Foo> {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyTrait for Box<Foo>", "Foo");
         assert_has_edge(&graph, "impl MyTrait for Box<Foo>", "MyTrait");
@@ -831,13 +823,13 @@ impl MyTrait for Box<Foo> {}
     #[test]
     fn test_type_alias_generics() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Inner;
 pub struct Wrapper<T>(T);
 
 pub type MyAlias = Wrapper<Inner>;
-"#,
+",
         );
         assert_has_edge(&graph, "MyAlias", "Wrapper");
         assert_has_edge(&graph, "MyAlias", "Inner");
@@ -847,11 +839,11 @@ pub type MyAlias = Wrapper<Inner>;
     #[test]
     fn test_dyn_trait() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr {}
 pub fn takes_dyn(_: &dyn Tr) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_dyn", "Tr");
     }
@@ -860,12 +852,12 @@ pub fn takes_dyn(_: &dyn Tr) {}
     #[test]
     fn test_dyn_multi_trait() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr1 {}
 pub trait Tr2 {}
 pub fn takes_dyn(_: &(dyn Tr1 + Tr2)) {}
-"#,
+",
         );
         assert_has_edge(&graph, "takes_dyn", "Tr1");
         assert_has_edge(&graph, "takes_dyn", "Tr2");
@@ -875,12 +867,12 @@ pub fn takes_dyn(_: &(dyn Tr1 + Tr2)) {}
     #[test]
     fn test_fn_body() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct BodyType;
 
 pub fn fn_uses_body() { let _x: BodyType = BodyType; }
-"#,
+",
         );
         assert_has_edge(&graph, "fn_uses_body", "BodyType");
     }
@@ -889,14 +881,14 @@ pub fn fn_uses_body() { let _x: BodyType = BodyType; }
     #[test]
     fn test_type_ascription_tuple_pattern() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct A;
 pub struct B;
 pub fn caller() {
     let (x, y): (A, B) = (A, B);
 }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "A");
         assert_has_edge(&graph, "caller", "B");
@@ -906,13 +898,13 @@ pub fn caller() {
     #[test]
     fn test_type_ascription_struct_pattern() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S { pub x: i32 }
 pub fn caller() {
     let S { x }: S = S { x: 1 };
 }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
     }
@@ -921,11 +913,11 @@ pub fn caller() {
     #[test]
     fn test_ref_to_type_alias() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub type A = i32;
 pub fn caller(_: A) {}
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "A");
     }
@@ -941,12 +933,12 @@ pub fn caller(_: A) {}
     #[test]
     fn test_fn_generic_bound() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait MyTrait {}
 
 pub fn generic_fn<T: MyTrait>(_x: T) {}
-"#,
+",
         );
         assert_has_edge(&graph, "generic_fn", "MyTrait");
     }
@@ -955,12 +947,12 @@ pub fn generic_fn<T: MyTrait>(_x: T) {}
     #[test]
     fn test_fn_where_clause() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait WhereTrait {}
 
 pub fn fn_with_where<T>(_x: T) where T: WhereTrait {}
-"#,
+",
         );
         assert_has_edge(&graph, "fn_with_where", "WhereTrait");
     }
@@ -969,11 +961,11 @@ pub fn fn_with_where<T>(_x: T) where T: WhereTrait {}
     #[test]
     fn test_hrtb() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr<'a> {}
 pub fn hrtb<T>(_: T) where T: for<'a> Tr<'a> {}
-"#,
+",
         );
         assert_has_edge(&graph, "hrtb", "Tr");
     }
@@ -982,13 +974,13 @@ pub fn hrtb<T>(_: T) where T: for<'a> Tr<'a> {}
     #[test]
     fn test_multiple_trait_bounds() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr1 {}
 pub trait Tr2 {}
 pub trait Tr3 {}
 pub fn multi_bound<T: Tr1 + Tr2 + Tr3>(_: T) {}
-"#,
+",
         );
         assert_has_edge(&graph, "multi_bound", "Tr1");
         assert_has_edge(&graph, "multi_bound", "Tr2");
@@ -999,12 +991,12 @@ pub fn multi_bound<T: Tr1 + Tr2 + Tr3>(_: T) {}
     #[test]
     fn test_assoc_type_constraint() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait HasItem { type Item; }
 pub struct ItemType;
 pub fn constrained<T: HasItem<Item = ItemType>>(_: T) {}
-"#,
+",
         );
         assert_has_edge(&graph, "constrained", "HasItem");
         assert_has_edge(&graph, "constrained", "ItemType");
@@ -1014,12 +1006,12 @@ pub fn constrained<T: HasItem<Item = ItemType>>(_: T) {}
     #[test]
     fn test_struct_generic_bound() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait BoundTrait {}
 
 pub struct StructWithBound<T: BoundTrait> { pub value: T }
-"#,
+",
         );
         assert_has_edge(&graph, "StructWithBound", "BoundTrait");
     }
@@ -1028,12 +1020,12 @@ pub struct StructWithBound<T: BoundTrait> { pub value: T }
     #[test]
     fn test_struct_where_clause() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait WhereTrait {}
 
 pub struct StructWithWhere<T> where T: WhereTrait { pub value: T }
-"#,
+",
         );
         assert_has_edge(&graph, "StructWithWhere", "WhereTrait");
     }
@@ -1042,11 +1034,11 @@ pub struct StructWithWhere<T> where T: WhereTrait { pub value: T }
     #[test]
     fn test_default_type_param() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Default;
 pub struct WithDefault<T = Default>(T);
-"#,
+",
         );
         assert_has_edge(&graph, "WithDefault", "Default");
     }
@@ -1055,14 +1047,14 @@ pub struct WithDefault<T = Default>(T);
     #[test]
     fn test_enum_generic_bound() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait BoundTrait {}
 
 pub enum EnumWithBound<T: BoundTrait> {
     Variant(T),
 }
-"#,
+",
         );
         assert_has_edge(&graph, "EnumWithBound", "BoundTrait");
     }
@@ -1071,13 +1063,13 @@ pub enum EnumWithBound<T: BoundTrait> {
     #[test]
     fn test_impl_generic_bound() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait BoundTrait {}
 pub trait ImplTrait {}
 pub struct ImplType;
 impl<T: BoundTrait> ImplTrait for ImplType {}
-"#,
+",
         );
         assert_has_edge(
             &graph,
@@ -1090,13 +1082,13 @@ impl<T: BoundTrait> ImplTrait for ImplType {}
     #[test]
     fn test_impl_where_clause() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait WhereTrait {}
 pub trait ImplTrait {}
 pub struct ImplType;
 impl<T> ImplTrait for ImplType where T: WhereTrait {}
-"#,
+",
         );
         assert_has_edge(
             &graph,
@@ -1109,14 +1101,14 @@ impl<T> ImplTrait for ImplType where T: WhereTrait {}
     #[test]
     fn test_trait_assoc_type_bound() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait BoundTrait {}
 
 pub trait TraitWithAssocBound {
     type Item: BoundTrait;
 }
-"#,
+",
         );
         assert_has_edge(&graph, "TraitWithAssocBound", "BoundTrait");
     }
@@ -1125,12 +1117,12 @@ pub trait TraitWithAssocBound {
     #[test]
     fn test_negative_impl() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub auto trait MyAuto {}
 pub struct NoAuto;
 impl !MyAuto for NoAuto {}
-"#,
+",
         );
         assert_has_edge(&graph, "impl !MyAuto for NoAuto", "MyAuto");
         assert_has_edge(&graph, "impl !MyAuto for NoAuto", "NoAuto");
@@ -1147,12 +1139,12 @@ impl !MyAuto for NoAuto {}
     #[test]
     fn test_turbofish() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S;
 pub fn generic<T>() {}
 pub fn caller() { generic::<S>(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "generic");
         assert_has_edge(&graph, "caller", "S");
@@ -1162,11 +1154,11 @@ pub fn caller() { generic::<S>(); }
     #[test]
     fn test_cross_module_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub mod inner { pub struct S; }
 pub fn caller() -> inner::S { inner::S }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
         assert_no_edge_to(&graph, "::inner", "modules");
@@ -1177,11 +1169,11 @@ pub fn caller() -> inner::S { inner::S }
     #[test]
     fn test_ref_to_const() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const C: i32 = 0;
 pub fn caller() -> i32 { C }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "C");
     }
@@ -1190,11 +1182,11 @@ pub fn caller() -> i32 { C }
     #[test]
     fn test_ref_to_static() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub static S: i32 = 0;
 pub fn caller() -> i32 { S }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
     }
@@ -1203,11 +1195,11 @@ pub fn caller() -> i32 { S }
     #[test]
     fn test_self_keyword() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct T;
 impl T { pub fn new() -> Self { Self } }
-"#,
+",
         );
         assert_has_edge(&graph, "impl T", "T");
     }
@@ -1216,12 +1208,12 @@ impl T { pub fn new() -> Self { Self } }
     #[test]
     fn test_const_initializer() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 const fn helper() -> i32 { 42 }
 
 pub const MY_CONST: i32 = helper();
-"#,
+",
         );
         assert_has_edge(&graph, "MY_CONST", "helper");
     }
@@ -1230,12 +1222,12 @@ pub const MY_CONST: i32 = helper();
     #[test]
     fn test_static_initializer() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 const fn helper() -> i32 { 42 }
 
 pub static MY_STATIC: i32 = helper();
-"#,
+",
         );
         assert_has_edge(&graph, "MY_STATIC", "helper");
     }
@@ -1244,14 +1236,14 @@ pub static MY_STATIC: i32 = helper();
     #[test]
     fn test_trait_default_const() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct ConstType;
 
 pub trait TraitWithDefaultConst {
     const DEFAULT: ConstType = ConstType;
 }
-"#,
+",
         );
         assert_has_edge(&graph, "TraitWithDefaultConst", "ConstType");
     }
@@ -1260,13 +1252,13 @@ pub trait TraitWithDefaultConst {
     #[test]
     fn test_trait_default_method_body() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn helper() {}
 pub trait MyTrait {
     fn default_method(&self) { helper(); }
 }
-"#,
+",
         );
         assert_has_edge(&graph, "MyTrait", "helper");
     }
@@ -1275,14 +1267,14 @@ pub trait MyTrait {
     #[test]
     fn test_impl_method_body() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct MyType;
 pub fn helper() {}
 impl MyType {
     pub fn method(&self) { helper(); }
 }
-"#,
+",
         );
         assert_has_edge(&graph, "impl MyType", "helper");
     }
@@ -1291,11 +1283,11 @@ impl MyType {
     #[test]
     fn test_closure_captures() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn target() {}
 pub fn caller() { let f = || target(); f(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "target");
     }
@@ -1304,11 +1296,11 @@ pub fn caller() { let f = || target(); f(); }
     #[test]
     fn test_async_closure() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub async fn target() {}
 pub fn caller() { let _ = async || { target().await }; }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "target");
     }
@@ -1317,9 +1309,9 @@ pub fn caller() { let _ = async || { target().await }; }
     ///
     /// In debug builds, rust-analyzer panics due to a bug. In release builds,
     /// we detect the dependency correctly.
-    /// See: https://github.com/rust-lang/rust-analyzer/issues/21539
+    /// See: <https://github.com/rust-lang/rust-analyzer/issues/21539>
     ///
-    /// TODO(rust-analyzer#21539): When the bug is fixed, remove should_panic.
+    /// TODO(rust-analyzer#21539): When the bug is fixed, remove `should_panic`.
     #[test]
     #[cfg_attr(
         debug_assertions,
@@ -1327,11 +1319,11 @@ pub fn caller() { let _ = async || { target().await }; }
     )]
     fn test_async_closure_nested() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub async fn target() {}
 pub fn caller() { let _ = || { async || { target().await } }; }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "target");
     }
@@ -1340,11 +1332,11 @@ pub fn caller() { let _ = || { async || { target().await } }; }
     #[test]
     fn test_async_await() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub async fn producer() {}
 pub async fn consumer() { producer().await }
-"#,
+",
         );
         assert_has_edge(&graph, "consumer", "producer");
     }
@@ -1353,11 +1345,11 @@ pub async fn consumer() { producer().await }
     #[test]
     fn test_struct_init_shorthand() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S { pub x: i32 }
 pub fn caller() -> S { let x = 1; S { x } }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
     }
@@ -1366,12 +1358,12 @@ pub fn caller() -> S { let x = 1; S { x } }
     #[test]
     fn test_array_repeat() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S;
 impl S { pub const fn new() -> S { S } }
 pub fn caller() -> [S; 3] { [S::new(); 3] }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl S");
     }
@@ -1380,11 +1372,11 @@ pub fn caller() -> [S; 3] { [S::new(); 3] }
     #[test]
     fn test_callable_field() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S { pub f: fn() }
 pub fn caller(s: S) { (s.f)(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
     }
@@ -1400,11 +1392,11 @@ pub fn caller(s: S) { (s.f)(); }
     #[test]
     fn test_pattern_destructuring() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S { pub x: i32 }
 pub fn destruct(s: S) -> i32 { let S { x } = s; x }
-"#,
+",
         );
         assert_has_edge(&graph, "destruct", "S");
     }
@@ -1413,11 +1405,11 @@ pub fn destruct(s: S) -> i32 { let S { x } = s; x }
     #[test]
     fn test_slice_pattern() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S;
 pub fn caller(arr: [S; 2]) { let [a, b] = arr; }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
     }
@@ -1426,14 +1418,14 @@ pub fn caller(arr: [S; 2]) { let [a, b] = arr; }
     #[test]
     fn test_tuple_struct_pattern() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Wrapper(pub i32);
 pub fn unwrap(w: Wrapper) -> i32 {
     let Wrapper(x) = w;
     x
 }
-"#,
+",
         );
         assert_has_edge(&graph, "unwrap", "Wrapper");
     }
@@ -1446,7 +1438,7 @@ pub fn unwrap(w: Wrapper) -> i32 {
     #[test]
     fn test_path_pattern_const() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub const MAGIC: i32 = 42;
 pub fn check(x: i32) -> bool {
@@ -1455,7 +1447,7 @@ pub fn check(x: i32) -> bool {
         _ => false,
     }
 }
-"#,
+",
         );
         assert_has_edge(&graph, "check", "MAGIC");
     }
@@ -1471,7 +1463,7 @@ pub fn check(x: i32) -> bool {
     #[test]
     fn test_macro_invocation() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 macro_rules! my_macro {
     () => { 42 };
@@ -1480,7 +1472,7 @@ macro_rules! my_macro {
 pub fn uses_macro() -> i32 {
     my_macro!()
 }
-"#,
+",
         );
         assert_has_edge(&graph, "uses_macro", "my_macro");
     }
@@ -1491,12 +1483,12 @@ pub fn uses_macro() -> i32 {
         // Use the built-in test proc macros from ra_ap_test_fixture.
         // The proc_macros crate is automatically added as a dependency.
         let graph = extract_graph(
-            r#"
+            r"
 //- proc_macros: identity
 //- /lib.rs crate:test_crate
 #[proc_macros::identity]
 pub fn decorated() {}
-"#,
+",
         );
         assert_has_edge(&graph, "decorated", "identity");
     }
@@ -1523,11 +1515,11 @@ pub fn decorated() {}
     #[test]
     fn test_variant_via_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub enum MyEnum { Variant }
 pub fn uses_variant() -> MyEnum { MyEnum::Variant }
-"#,
+",
         );
         assert_has_edge(&graph, "uses_variant", "MyEnum");
         assert_no_edge_to(&graph, "::Variant", "enum variants");
@@ -1537,13 +1529,13 @@ pub fn uses_variant() -> MyEnum { MyEnum::Variant }
     #[test]
     fn test_variant_via_pattern() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub enum MyEnum { Variant(i32) }
 pub fn matcher(x: MyEnum) -> i32 {
     match x { MyEnum::Variant(n) => n }
 }
-"#,
+",
         );
         assert_has_edge(&graph, "matcher", "MyEnum");
     }
@@ -1552,14 +1544,14 @@ pub fn matcher(x: MyEnum) -> i32 {
     #[test]
     fn test_variant_field_shorthand() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub enum MyEnum { Variant { x: i32 } }
 pub fn shorthand() -> MyEnum {
     let x = 1;
     MyEnum::Variant { x }
 }
-"#,
+",
         );
         assert_has_edge(&graph, "shorthand", "MyEnum");
     }
@@ -1570,12 +1562,12 @@ pub fn shorthand() -> MyEnum {
     #[test]
     fn test_inherent_method_call() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct T;
 impl T { pub fn method(&self) {} }
 pub fn caller(t: T) { t.method(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl T");
     }
@@ -1584,13 +1576,13 @@ pub fn caller(t: T) { t.method(); }
     #[test]
     fn test_trait_method_call() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { fn method(&self); }
 pub struct T;
 impl Tr for T { fn method(&self) {} }
 pub fn caller(t: T) { t.method(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl Tr for T");
     }
@@ -1599,13 +1591,13 @@ pub fn caller(t: T) { t.method(); }
     #[test]
     fn test_method_call_on_ref() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { fn method(&self); }
 pub struct T;
 impl Tr for &T { fn method(&self) {} }
 pub fn caller(t: &T) { t.method(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl Tr for &T");
     }
@@ -1614,13 +1606,13 @@ pub fn caller(t: &T) { t.method(); }
     #[test]
     fn test_method_call_on_mut_ref() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { fn method(&self); }
 pub struct T;
 impl Tr for &mut T { fn method(&self) {} }
 pub fn caller(t: &mut T) { t.method(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl Tr for &mut T");
     }
@@ -1629,12 +1621,12 @@ pub fn caller(t: &mut T) { t.method(); }
     #[test]
     fn test_assoc_fn_via_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct T;
 impl T { pub fn f() {} }
 pub fn caller() { T::f(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl T");
     }
@@ -1643,12 +1635,12 @@ pub fn caller() { T::f(); }
     #[test]
     fn test_assoc_const_via_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct T;
 impl T { pub const C: i32 = 0; }
 pub fn caller() -> i32 { T::C }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "impl T");
     }
@@ -1659,13 +1651,13 @@ pub fn caller() -> i32 { T::C }
     #[test]
     fn test_trait_default_method_call() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { fn default_method(&self) {} }
 pub struct T;
 impl Tr for T {}
 pub fn caller(t: T) { t.default_method(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "Tr");
     }
@@ -1674,13 +1666,13 @@ pub fn caller(t: T) { t.default_method(); }
     #[test]
     fn test_trait_assoc_const_via_qualified_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { const C: i32; }
 pub struct T;
 impl Tr for T { const C: i32 = 0; }
 pub fn caller() -> i32 { <T as Tr>::C }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "Tr");
         assert_no_edge_to(&graph, "::C", "trait consts");
@@ -1690,14 +1682,14 @@ pub fn caller() -> i32 { <T as Tr>::C }
     #[test]
     fn test_trait_assoc_type_via_qualified_path() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub trait Tr { type Out; }
 pub struct T;
 pub struct O;
 impl Tr for T { type Out = O; }
 pub fn caller() -> <T as Tr>::Out { O }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "Tr");
     }
@@ -1706,7 +1698,7 @@ pub fn caller() -> <T as Tr>::Out { O }
     #[test]
     fn test_trait_method_signature_types() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct InputType;
 pub struct OutputType;
@@ -1714,7 +1706,7 @@ pub struct OutputType;
 pub trait MyTrait {
     fn process(input: InputType) -> OutputType;
 }
-"#,
+",
         );
         assert_has_edge(&graph, "MyTrait", "InputType");
         assert_has_edge(&graph, "MyTrait", "OutputType");
@@ -1734,11 +1726,11 @@ pub trait MyTrait {
     #[test]
     fn test_module_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub mod m { pub struct S; }
 pub fn caller() -> m::S { m::S }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
         assert_no_edge_to(&graph, "::m", "modules");
@@ -1748,10 +1740,10 @@ pub fn caller() -> m::S { m::S }
     #[test]
     fn test_generic_type_param_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn generic<T>(x: T) -> T { x }
-"#,
+",
         );
         assert_no_edge_to(&graph, "::T", "generic type params");
     }
@@ -1760,11 +1752,11 @@ pub fn generic<T>(x: T) -> T { x }
     #[test]
     fn test_const_generic_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct Arr<const N: usize>;
 pub fn caller() -> Arr<10> { Arr }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "Arr");
         assert_no_edge_to(&graph, "::N", "const generic params");
@@ -1774,11 +1766,11 @@ pub fn caller() -> Arr<10> { Arr }
     #[test]
     fn test_tuple_field_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct T(pub i32);
 pub fn caller(t: T) -> i32 { t.0 }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "T");
         assert_no_edge_to(&graph, ".0", "tuple fields");
@@ -1788,11 +1780,11 @@ pub fn caller(t: T) -> i32 { t.0 }
     #[test]
     fn test_local_var_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub struct S;
 pub fn caller() { let x = S; }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "S");
         assert_no_edge_to(&graph, "::x", "local variables");
@@ -1802,10 +1794,10 @@ pub fn caller() { let x = S; }
     #[test]
     fn test_label_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn caller() { 'lbl: loop { break 'lbl; } }
-"#,
+",
         );
         assert_no_edge_to(&graph, "lbl", "labels");
     }
@@ -1814,10 +1806,10 @@ pub fn caller() { 'lbl: loop { break 'lbl; } }
     #[test]
     fn test_lifetime_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn caller<'a>(s: &'a str) -> &'a str { s }
-"#,
+",
         );
         assert_no_edge_to(&graph, "'a", "lifetime params");
     }
@@ -1834,15 +1826,15 @@ pub fn caller() -> &'static str { "" }
         assert_no_edge_to(&graph, "static", "'static lifetime");
     }
 
-    /// The crate:: path prefix is not an edge target.
+    /// The `crate::` path prefix is not an edge target.
     #[test]
     fn test_crate_keyword_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn target() {}
 pub fn caller() { crate::target(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "target");
         assert_no_edge_to(&graph, "crate", "crate keyword");
@@ -1852,11 +1844,11 @@ pub fn caller() { crate::target(); }
     #[test]
     fn test_extern_crate_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate deps:dep
 extern crate dep;
 //- /dep.rs crate:dep
-"#,
+",
         );
         assert_no_edge_to(&graph, "dep", "extern crate");
     }
@@ -1865,11 +1857,11 @@ extern crate dep;
     #[test]
     fn test_builtin_attr_not_target() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 #[inline]
 pub fn caller() {}
-"#,
+",
         );
         assert_no_edge_to(&graph, "inline", "built-in attributes");
     }
@@ -1886,12 +1878,12 @@ pub fn caller() {}
     #[test]
     fn test_cross_crate_local_deps() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /dep.rs crate:dep
 pub fn target() {}
 //- /main.rs crate:main deps:dep
 pub fn caller() { dep::target(); }
-"#,
+",
         );
         assert_has_edge(&graph, "caller", "dep::target");
     }
@@ -1900,10 +1892,10 @@ pub fn caller() { dep::target(); }
     #[test]
     fn test_std_only_no_deps() {
         let graph = extract_graph(
-            r#"
+            r"
 //- /lib.rs crate:test_crate
 pub fn caller() -> String { String::new() }
-"#,
+",
         );
         assert!(
             graph.crates["test_crate"].symbols["caller"]

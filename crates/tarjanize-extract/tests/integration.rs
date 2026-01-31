@@ -6,7 +6,7 @@ use std::path::PathBuf;
 
 use tarjanize_extract::{SymbolGraph, run};
 
-/// run() should read a real Cargo project and produce reasonable output.
+/// `run()` should read a real Cargo project and produce reasonable output.
 #[test]
 fn test_run() {
     let fixture = PathBuf::from("tests/fixtures/minimal");
@@ -83,13 +83,13 @@ fn test_derive_macro_captured() {
 
 /// Dev-dependency cycles are handled correctly.
 ///
-/// When crate_a has a dev-dependency on crate_b, and crate_b has a normal
-/// dependency on crate_a, this creates a cycle. rust-analyzer skips the
-/// cyclic edge (crate_a -> crate_b) when building the crate graph.
+/// When `crate_a` has a dev-dependency on `crate_b`, and `crate_b` has a normal
+/// dependency on `crate_a`, this creates a cycle. rust-analyzer skips the
+/// cyclic edge (`crate_a` -> `crate_b`) when building the crate graph.
 ///
 /// This test verifies that:
-/// 1. crate_b's symbols depend on crate_a (normal dep edge exists)
-/// 2. crate_a's symbols do NOT depend on crate_b (cyclic edge was skipped)
+/// 1. `crate_b`'s symbols depend on `crate_a` (normal dep edge exists)
+/// 2. `crate_a`'s symbols do NOT depend on `crate_b` (cyclic edge was skipped)
 #[test]
 fn test_dev_dep_cycle_edge_skipped() {
     let fixture = PathBuf::from("tests/fixtures/dev_dep_cycle");
@@ -97,8 +97,8 @@ fn test_dev_dep_cycle_edge_skipped() {
 
     run(&fixture, &mut output).expect("run() should succeed");
 
-    let graph: SymbolGraph =
-        serde_json::from_slice(&output).expect("run() should output valid JSON");
+    let graph: SymbolGraph = serde_json::from_slice(&output)
+        .expect("run() should output valid JSON");
 
     // Both crates should be extracted.
     assert!(
