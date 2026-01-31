@@ -1,0 +1,6 @@
+[package]
+name = "cost_multiple_nested_fns"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

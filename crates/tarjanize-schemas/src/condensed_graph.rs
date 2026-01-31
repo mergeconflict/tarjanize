@@ -4,8 +4,8 @@
 //! component (SCC) from the original symbol graph. This is the output of
 //! Phase 2 (SCC computation) and the input to Phase 3 (optimal partitioning).
 //!
-//! SCCs are stored in topological order (dependents before dependencies),
-//! which is the order needed for Phase 3's union-find algorithm.
+//! SCCs are stored in postorder (dependencies before dependents), which is the
+//! natural compilation order.
 //!
 //! ## Impl Anchors
 //!
@@ -22,14 +22,15 @@ use serde::{Deserialize, Serialize};
 /// Root structure representing the condensed graph of a workspace.
 ///
 /// The condensed graph is a complete flattening of the `SymbolGraph` structure.
-/// All SCCs from all crates are stored in a single vector, topologically
-/// sorted so that dependent SCCs appear before their dependencies. This
-/// ordering is essential for Phase 3's union-find merging algorithm.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+/// All SCCs from all crates are stored in a single vector in postorder
+/// (dependencies before dependents), which is the natural compilation order.
+#[derive(
+    Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema,
+)]
 pub struct CondensedGraph {
-    /// All SCCs in the workspace, topologically sorted (dependents before
-    /// dependencies). Each SCC knows which crate it belongs to and which
-    /// other SCCs it depends on.
+    /// All SCCs in the workspace, in postorder (dependencies before dependents).
+    /// This is the natural compilation order. Each SCC knows which other SCCs
+    /// it depends on.
     pub sccs: Vec<Scc>,
 }
 
@@ -39,20 +40,16 @@ pub struct CondensedGraph {
 /// other symbol through dependencies. Single-symbol SCCs represent symbols
 /// with no cyclic dependencies. Multi-symbol SCCs represent cycles that
 /// must stay together in any valid crate split.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct Scc {
-    /// Unique identifier for this SCC. Generated sequentially during
-    /// condensation.
-    pub id: u32,
-
     /// Fully qualified paths of symbols in this SCC. These paths reference
     /// symbols in the original `SymbolGraph`.
     #[schemars(length(min = 1))]
     pub symbols: HashSet<String>,
 
-    /// IDs of SCCs that this SCC depends on. These are the SCCs containing
-    /// symbols that symbols in this SCC reference. Due to topological
-    /// ordering, all referenced IDs appear later in the sccs vector.
+    /// Indices of SCCs that this SCC depends on. These are the SCCs containing
+    /// symbols that symbols in this SCC reference. Due to postorder, all
+    /// dependencies appear earlier in the sccs vector (lower indices).
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub dependencies: HashSet<u32>,
 
@@ -84,7 +81,7 @@ pub struct Scc {
     Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema,
 )]
 pub struct AnchorSet {
-    /// SCC IDs containing types/traits that anchor this impl. The impl must
+    /// SCC indices containing types/traits that anchor this impl. The impl must
     /// end up in the same output crate as at least one of these SCCs to
     /// satisfy the orphan rule. Uses `BTreeSet` for deterministic iteration
     /// order (required for Hash impl).
@@ -123,13 +120,12 @@ mod tests {
         /// Symbols must be non-empty (min 1 element).
         fn arb_scc()
             (
-                id in any::<u32>(),
                 symbols in hash_set(arb_path(), 1..8),
                 dependencies in hash_set(any::<u32>(), 0..5),
                 anchor_sets in hash_set(arb_anchor_set(), 0..3),
             )
         -> Scc {
-            Scc { id, symbols, dependencies, anchor_sets }
+            Scc { symbols, dependencies, anchor_sets }
         }
     }
 

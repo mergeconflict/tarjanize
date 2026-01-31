@@ -6,8 +6,8 @@ use clap::{Parser, Subcommand};
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use itertools::Itertools;
 use mimalloc::MiMalloc;
-use tracing_subscriber::fmt::format::FmtSpan;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 // Use mimalloc for better performance. Per M-MIMALLOC-APPS, this can provide
 // up to 25% performance improvement for allocation-heavy workloads.
@@ -15,15 +15,14 @@ use tracing_subscriber::EnvFilter;
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// Crates to include in the logging allowlist.
-const CRATES: &[&str] = &[
-    "tarjanize",
-    "tarjanize_condense",
-    "tarjanize_extract",
-    "tarjanize_schemas",
-];
+const CRATES: &[&str] =
+    &["tarjanize", "tarjanize_condense", "tarjanize_schemas"];
 
 /// Analyze Rust workspace dependency structures to identify opportunities for
 /// splitting crates into smaller, parallelizable units for improved build times.
+///
+/// For symbol extraction, use `cargo tarjanize` instead. This binary provides
+/// post-processing commands for the extracted symbol graph.
 #[derive(Parser)]
 #[command(author, version, about)]
 struct Cli {
@@ -36,20 +35,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Extract symbol graph from a Rust workspace
-    ///
-    /// Analyzes all workspace member crates and produces a JSON file containing
-    /// all symbols and their dependency relationships.
-    Extract {
-        /// Path to the workspace root (directory containing Cargo.toml)
-        #[arg(default_value = ".")]
-        workspace_path: String,
-
-        /// Output file path (writes to stdout if not specified)
-        #[arg(short, long)]
-        output: Option<String>,
-    },
-
     /// Condense symbol graph into DAG of SCCs
     ///
     /// Computes strongly connected components from the symbol graph and produces
@@ -79,21 +64,6 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Extract {
-            workspace_path,
-            output,
-        } => {
-            // Lock stdout once up front rather than on each write call.
-            // Stdout must outlive the lock, so we bind it here first.
-            let stdout = std::io::stdout();
-            let mut writer: Box<dyn Write> = match output {
-                Some(path) => Box::new(BufWriter::new(File::create(path)?)),
-                None => Box::new(stdout.lock()),
-            };
-            tarjanize_extract::run(&workspace_path, &mut *writer)?;
-            Ok(())
-        }
-
         Commands::Condense { input, output } => {
             // Set up input reader.
             let stdin = std::io::stdin();

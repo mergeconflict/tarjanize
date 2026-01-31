@@ -1,0 +1,6 @@
+[package]
+name = "profile_key_impl_for_tuple"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

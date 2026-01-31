@@ -13,7 +13,6 @@ description = "Analyze Rust workspace dependencies to identify crate splitting o
 workspace = true
 
 [dependencies]
-tarjanize-extract = { path = "../tarjanize-extract" }
 tarjanize-condense = { path = "../tarjanize-condense" }
 mimalloc = { version = "0.1.48", features = ["v3"] }
 anyhow = "1.0"

@@ -1,0 +1,6 @@
+[package]
+name = "profile_key_impl_for_external_generic"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -59,12 +59,14 @@ pub struct Symbol {
     /// Path to the symbol's file relative to the crate root.
     pub file: String,
 
-    /// Approximate cost (unitless) of compiling this symbol. Given
-    /// two symbols A and B:
-    /// - The cost of compiling A and B in sequence is A.cost + B.cost
-    /// - The cost of compiling A and B in parallel is max(A.cost, B.cost)
+    /// Compilation cost of this symbol in milliseconds.
     ///
-    /// Currently estimated from syntax node size in bytes.
+    /// When profiling is enabled (`--profile` flag), this is populated from
+    /// rustc's self-profile data. Otherwise defaults to 1.0.
+    ///
+    /// Given two symbols A and B:
+    /// - Cost of compiling A and B in sequence: `A.cost + B.cost`
+    /// - Cost of compiling A and B in parallel: `max(A.cost, B.cost)`
     #[schemars(range(min = 0.0))]
     pub cost: f64,
 
@@ -149,6 +151,15 @@ pub enum SymbolKind {
     /// Impl blocks are distinct from `ModuleDefs`; they don't have visibility,
     /// and Rust's orphan rules dictate where they can be defined.
     Impl {
+        /// Human-readable name of the impl block.
+        ///
+        /// For trait impls: `impl Trait for Type`
+        /// For inherent impls: `impl Type`
+        ///
+        /// This provides readability since the symbol key uses the compiler's
+        /// internal `DefPath` format (`{{impl}}[N]`).
+        name: String,
+
         /// Workspace-local types and traits that can satisfy the orphan rule.
         ///
         /// For `impl<P1..=Pn> Trait<T1..=Tn> for T0`, the orphan rule allows:
@@ -201,9 +212,9 @@ mod tests {
 
         prop_compose! {
             fn arb_impl()
-                (anchors in hash_set(arb_path(), 0..5))
+                (name in arb_name(), anchors in hash_set(arb_path(), 0..5))
             -> SymbolKind {
-                SymbolKind::Impl { anchors }
+                SymbolKind::Impl { name, anchors }
             }
         }
 

@@ -27,7 +27,7 @@ cargo clippy --all-targets      # Lint (--all-targets required in virtual worksp
 The tool implements a 5-phase pipeline:
 
 ```
-Phase 1: Extract Symbol Graph        → symbol_graph.json
+Phase 1: Extract Symbol Graph        → symbol_graph.json  (cargo tarjanize)
 Phase 2: Compute SCCs, Condense      → condensed_graph.json
 Phase 3: Optimal Partitioning        → optimized_condensed_graph.json
 Phase 4: Reorganize Symbol Graph     → optimized_symbol_graph.json
@@ -54,7 +54,7 @@ This is a pure virtual workspace - all crates live under `crates/`.
 tarjanize/
 ├── Cargo.toml               # Virtual workspace manifest (includes lint config)
 └── crates/
-    ├── tarjanize/           # CLI binary
+    ├── tarjanize/           # CLI binary (post-processing commands)
     │   └── src/main.rs
     │
     ├── tarjanize-schemas/   # Schema definitions for all phases
@@ -64,18 +64,13 @@ tarjanize/
     │       ├── condensed_graph.rs
     │       └── testutil.rs
     │
-    ├── tarjanize-extract/   # Phase 1: Symbol graph extraction
+    ├── cargo-tarjanize/     # Phase 1: Symbol graph extraction via rustc
     │   ├── src/
-    │   │   ├── lib.rs       # Public API: run()
-    │   │   ├── error.rs     # ExtractError
-    │   │   ├── workspaces.rs
-    │   │   ├── crates.rs
-    │   │   ├── modules.rs
-    │   │   ├── module_defs.rs
-    │   │   ├── impls.rs
-    │   │   ├── dependencies.rs
-    │   │   └── paths.rs
-    │   ├── doc/rust-analyzer/  # rust-analyzer API documentation
+    │   │   ├── main.rs      # CLI entry point (orchestrator/driver modes)
+    │   │   ├── orchestrator.rs  # Coordinates cargo check with RUSTC_WRAPPER
+    │   │   ├── driver.rs    # Custom rustc driver for symbol extraction
+    │   │   ├── extract.rs   # HIR/THIR analysis for dependency extraction
+    │   │   └── profile.rs   # Self-profile parsing for cost estimation
     │   └── tests/fixtures/  # Integration test fixtures
     │
     └── tarjanize-condense/  # Phase 2: SCC computation
@@ -88,23 +83,19 @@ tarjanize/
 ## Crate Details
 
 **tarjanize** (binary)
-- **main.rs** - CLI entry point; orchestrates extract and condense phases
+- **main.rs** - CLI entry point for post-processing commands (condense phase)
 
 **tarjanize-schemas** (library)
 - **symbol_graph.rs** - `SymbolGraph`, `Module`, `Symbol`, `SymbolKind`, `Visibility` types
 - **condensed_graph.rs** - `CondensedGraph`, `Scc`, `AnchorSet` types for Phase 2 output
 - **testutil.rs** - Shared proptest strategies for generating arbitrary schema instances
 
-**tarjanize-extract** (library)
-- **lib.rs** - Public API: `run()`, re-exports `ExtractError` and schema types
-- **error.rs** - `ExtractError` with backtrace, `ErrorKind` enum, and `is_xxx()` helpers
-- **workspaces.rs** - `load_workspace()` configures rust-analyzer with proc macro expansion and build.rs analysis
-- **crates.rs** - `extract_crate()` extracts a crate as its root module
-- **modules.rs** - `extract_module()` recursively extracts symbols from module hierarchy
-- **module_defs.rs** - `extract_module_def()` extracts ModuleDef items (functions, structs, etc.)
-- **impls.rs** - `extract_impl()` extracts impl blocks with their dependencies
-- **dependencies.rs** - `find_dependencies()` walks syntax trees using `NameRefClass::classify()`
-- **paths.rs** - Path utilities: `qualified_path()`, `file_path()`, `relative_file_path()`
+**cargo-tarjanize** (binary)
+- **main.rs** - Detects mode (orchestrator vs driver) and dispatches
+- **orchestrator.rs** - Runs `cargo check` with `RUSTC_WRAPPER` set to this binary
+- **driver.rs** - Custom rustc driver that runs extraction callbacks
+- **extract.rs** - Walks rustc's HIR and THIR to extract symbols and dependencies
+- **profile.rs** - Parses `-Zself-profile` output for accurate compilation costs
 
 **tarjanize-condense** (library)
 - **lib.rs** - Public API: `run()` reads SymbolGraph JSON, outputs CondensedGraph JSON
@@ -113,29 +104,17 @@ tarjanize/
 
 ## Key Patterns
 
-**Semantic Resolution**: Uses rust-analyzer's `Semantics<RootDatabase>` for name resolution and type inference. Key types: `Crate`, `Module`, `ModuleDef`.
+**Rustc Driver**: `cargo-tarjanize` acts as a `RUSTC_WRAPPER`, intercepting rustc invocations. For workspace crates, it runs our extraction callbacks in `after_analysis`. For external crates, it passes through to normal compilation.
 
-**Source Tree Navigation**: Uses `HasSource::source()` to get syntax nodes, then `sema.parse_or_expand()` to get a cached tree for resolution. See `doc/rust-analyzer/README.md` for details.
+**THIR Analysis**: Uses THIR (Typed High-level IR) for body analysis because it preserves source-level information (static refs, named consts, const patterns) that MIR loses.
 
 **Container Collapsing**: Associated items (impl methods, trait methods, enum variants) collapse to their containers since they can't be split independently.
 
-**Local Filtering**: Only workspace members are analyzed; external crates are filtered out via `CrateOrigin::is_local()`.
+**Profile Matching**: For accurate cost estimation, `--profile` runs with `-Zself-profile`. The profile uses compiler internal paths (`{{impl}}[N]`) which are stored in `Symbol.profile_key` for matching.
 
 ## Testing
 
 **Coverage requirement:** All modules except `main.rs` must maintain ≥90% line coverage. Run `cargo llvm-cov nextest` to check. The `main.rs` file is excluded because it's the CLI entry point and not exercised by unit tests.
-
-### Fixture-Based Unit Tests
-
-Tests use `ra_ap_test_fixture` for fast, in-memory fixture-based testing. Each test creates an in-memory database with the fixture syntax:
-```rust
-let db = RootDatabase::with_files(r#"
-//- /lib.rs crate:test_crate deps:other_crate
-pub fn my_function() {}
-"#);
-```
-
-Test files target one property at a time (e.g., `test_fixture_fn_param_type`, `test_fixture_trait_supertrait`).
 
 ### Integration Test Fixtures
 

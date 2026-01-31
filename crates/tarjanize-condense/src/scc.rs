@@ -3,7 +3,7 @@
 //! Uses petgraph's `condensation` to find strongly connected components
 //! and build a condensed DAG.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashSet};
 
 use indexmap::IndexSet;
 use petgraph::algo::condensation;
@@ -11,7 +11,14 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use tarjanize_schemas::{
     AnchorSet, CondensedGraph, Module, Scc, Symbol, SymbolGraph, SymbolKind,
 };
-use tracing::{debug, trace};
+
+/// Extracts impl anchors from a symbol kind, if it's an impl.
+fn impl_anchors(kind: &SymbolKind) -> Option<&HashSet<String>> {
+    match kind {
+        SymbolKind::Impl { anchors, .. } => Some(anchors),
+        SymbolKind::ModuleDef { .. } => None,
+    }
+}
 
 /// Indexes into a `SymbolGraph`.
 ///
@@ -89,11 +96,9 @@ pub(crate) fn compute_condensed_graph(
 
     // Step 2: Build DiGraph with symbol indices as node weights.
     let mut graph = DiGraph::<usize, ()>::with_capacity(index.len(), 0);
-    (0..index.len()).for_each(|i| {
+    for i in 0..index.len() {
         graph.add_node(i);
-    });
-
-    // Add dependency edges.
+    }
     for from in 0..index.len() {
         for dep in &index.get_symbol(from).dependencies {
             if let Some(to) = index.get_index(dep) {
@@ -115,29 +120,13 @@ pub(crate) fn compute_condensed_graph(
         }
     }
 
-    // Step 5: Collect impl anchors for orphan rule constraints.
-    let mut impl_anchors: HashMap<usize, AnchorSet> = HashMap::new();
-    for i in 0..index.len() {
-        let SymbolKind::Impl { anchors } = &index.get_symbol(i).kind else {
-            continue;
-        };
-        let scc_ids: BTreeSet<u32> = anchors
-            .iter()
-            .filter_map(|p| index.get_index(p).map(|i| symbol_to_scc[i]))
-            .collect();
-        assert!(!scc_ids.is_empty(), "impl has no local anchors");
-        impl_anchors.insert(i, AnchorSet { anchors: scc_ids });
-    }
-
-    // Step 6: Build final SCCs.
-    // Petgraph's condensation returns SCCs in reverse topological order (dependencies
-    // before dependents). We reverse to get dependents before dependencies, which is
-    // the order Phase 3 expects for union-find processing.
-    let mut sccs: Vec<Scc> = condensed_petgraph
+    // Step 5: Build final SCCs.
+    // Petgraph's condensation returns SCCs in postorder (dependencies before dependents),
+    // which is the natural compilation order.
+    let sccs: Vec<Scc> = condensed_petgraph
         .node_indices()
         .map(|node_idx| {
             let symbol_indices = &condensed_petgraph[node_idx];
-            let scc_id = node_idx.index() as u32;
 
             // Collect symbols.
             let symbols: HashSet<String> = symbol_indices
@@ -152,42 +141,59 @@ pub(crate) fn compute_condensed_graph(
                 .collect();
 
             // Collect anchor sets for impl blocks in this SCC.
+            // Filter out anchors that don't exist in the symbol index - these are
+            // external types that were included during AST-based extraction.
             let anchor_sets: HashSet<_> = symbol_indices
                 .iter()
-                .filter_map(|&i| impl_anchors.get(&i).cloned())
+                .filter_map(|&i| impl_anchors(&index.get_symbol(i).kind))
+                .filter_map(|anchors| {
+                    let valid_anchors: BTreeSet<u32> = anchors
+                        .iter()
+                        .filter_map(|p| {
+                            index.get_index(p).map(|idx| symbol_to_scc[idx])
+                        })
+                        .collect();
+                    // Only include anchor sets that have at least one valid anchor.
+                    (!valid_anchors.is_empty()).then_some(AnchorSet {
+                        anchors: valid_anchors,
+                    })
+                })
                 .collect();
 
-            trace!(
-                scc_id,
-                symbol_count = symbols.len(),
-                dep_count = dependencies.len(),
-                anchor_count = anchor_sets.len(),
-                "created SCC"
-            );
-
             Scc {
-                id: scc_id,
                 symbols,
                 dependencies,
                 anchor_sets,
             }
         })
         .collect();
-
-    // Reverse to get topological order: dependents before dependencies.
-    sccs.reverse();
-
-    debug!(scc_count = sccs.len(), "built condensed graph");
-
     CondensedGraph { sccs }
 }
 
 #[cfg(test)]
-#[expect(clippy::similar_names, reason = "test variable names like bar_scc/baz_scc are clear")]
+#[expect(
+    clippy::similar_names,
+    reason = "test variable names like bar_scc/baz_scc are clear"
+)]
 mod tests {
+    use std::collections::HashMap;
+
     use tarjanize_schemas::Visibility;
 
     use super::*;
+
+    /// Helper to find the index of an SCC containing a symbol.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "test helper, SCC count fits in u32"
+    )]
+    fn find_scc_idx(condensed: &CondensedGraph, symbol: &str) -> u32 {
+        condensed
+            .sccs
+            .iter()
+            .position(|s| s.symbols.contains(symbol))
+            .unwrap() as u32
+    }
 
     /// Helper to create a simple symbol for testing.
     fn make_symbol(cost: f64, deps: &[&str]) -> Symbol {
@@ -308,34 +314,26 @@ mod tests {
         assert_eq!(total_deps, 2);
 
         // Find the SCCs by their symbol content.
-        let foo_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::foo"))
-            .unwrap();
-        let bar_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::bar"))
-            .unwrap();
-        let baz_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::baz"))
-            .unwrap();
+        let foo_idx = find_scc_idx(&condensed, "my_crate::foo");
+        let bar_idx = find_scc_idx(&condensed, "my_crate::bar");
+        let baz_idx = find_scc_idx(&condensed, "my_crate::baz");
+
+        let foo_scc = &condensed.sccs[foo_idx as usize];
+        let bar_scc = &condensed.sccs[bar_idx as usize];
+        let baz_scc = &condensed.sccs[baz_idx as usize];
 
         // foo depends on bar.
-        assert!(foo_scc.dependencies.contains(&bar_scc.id));
+        assert!(foo_scc.dependencies.contains(&bar_idx));
         // bar depends on baz.
-        assert!(bar_scc.dependencies.contains(&baz_scc.id));
+        assert!(bar_scc.dependencies.contains(&baz_idx));
         // baz has no dependencies.
         assert!(baz_scc.dependencies.is_empty());
     }
 
     #[test]
-    fn test_topological_order_dependents_before_dependencies() {
-        // Verify SCCs are ordered with dependents before dependencies.
-        // This ordering is required by Phase 3's union-find algorithm.
+    fn test_postorder_dependencies_before_dependents() {
+        // Verify SCCs are in postorder: dependencies before dependents.
+        // This is the natural compilation order.
         let mut symbols = HashMap::new();
         // a → b → c (chain).
         symbols.insert("a".to_string(), make_symbol(10.0, &["my_crate::b"]));
@@ -354,26 +352,12 @@ mod tests {
         let symbol_graph = SymbolGraph { crates };
         let condensed = compute_condensed_graph(&symbol_graph);
 
-        // Build position map: SCC ID → index in sccs vector.
-        let position: HashMap<u32, usize> = condensed
-            .sccs
-            .iter()
-            .enumerate()
-            .map(|(i, scc)| (scc.id, i))
-            .collect();
-
-        // For every SCC, all its dependencies should appear later in the vector.
-        for scc in &condensed.sccs {
-            let scc_pos = position[&scc.id];
-            for &dep_id in &scc.dependencies {
-                let dep_pos = position[&dep_id];
+        // For every SCC, all its dependencies should appear earlier in the vector.
+        for (scc_idx, scc) in condensed.sccs.iter().enumerate() {
+            for &dep_idx in &scc.dependencies {
                 assert!(
-                    scc_pos < dep_pos,
-                    "SCC {} at position {} should come before its dependency {} at position {}",
-                    scc.id,
-                    scc_pos,
-                    dep_id,
-                    dep_pos
+                    (dep_idx as usize) < scc_idx,
+                    "dependency {dep_idx} should come before SCC {scc_idx}"
                 );
             }
         }
@@ -411,19 +395,14 @@ mod tests {
         assert_eq!(condensed.sccs.len(), 2);
 
         // Find the SCCs by their symbol content.
-        let foo_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("crate_a::foo"))
-            .unwrap();
-        let bar_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("crate_b::bar"))
-            .unwrap();
+        let foo_idx = find_scc_idx(&condensed, "crate_a::foo");
+        let bar_idx = find_scc_idx(&condensed, "crate_b::bar");
+
+        let foo_scc = &condensed.sccs[foo_idx as usize];
+        let bar_scc = &condensed.sccs[bar_idx as usize];
 
         // foo depends on bar (cross-crate).
-        assert!(foo_scc.dependencies.contains(&bar_scc.id));
+        assert!(foo_scc.dependencies.contains(&bar_idx));
         assert!(bar_scc.dependencies.is_empty());
     }
 
@@ -467,6 +446,7 @@ mod tests {
                 .into_iter()
                 .collect(),
                 kind: SymbolKind::Impl {
+                    name: "impl MyTrait for Foo".to_string(),
                     anchors: [
                         "my_crate::Foo".to_string(),
                         "my_crate::MyTrait".to_string(),
@@ -494,31 +474,24 @@ mod tests {
         assert_eq!(condensed.sccs.len(), 3);
 
         // Find the impl's SCC.
-        let impl_scc = condensed
+        let impl_idx = condensed
             .sccs
             .iter()
-            .find(|s| s.symbols.iter().any(|p| p.contains("impl")))
+            .position(|s| s.symbols.iter().any(|p| p.contains("impl")))
             .unwrap();
+        let impl_scc = &condensed.sccs[impl_idx];
 
         // The impl should have one anchor set entry.
         assert_eq!(impl_scc.anchor_sets.len(), 1);
 
         // Find the type and trait SCCs.
-        let foo_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::Foo"))
-            .unwrap();
-        let trait_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::MyTrait"))
-            .unwrap();
+        let foo_idx = find_scc_idx(&condensed, "my_crate::Foo");
+        let trait_idx = find_scc_idx(&condensed, "my_crate::MyTrait");
 
         // The anchor set should reference both type and trait SCCs.
         let anchor_set = impl_scc.anchor_sets.iter().next().unwrap();
-        assert!(anchor_set.anchors.contains(&foo_scc.id));
-        assert!(anchor_set.anchors.contains(&trait_scc.id));
+        assert!(anchor_set.anchors.contains(&foo_idx));
+        assert!(anchor_set.anchors.contains(&trait_idx));
         assert_eq!(anchor_set.anchors.len(), 2);
     }
 
@@ -569,18 +542,12 @@ mod tests {
         assert_eq!(condensed.sccs.len(), 2);
 
         // Find the SCCs.
-        let foo_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::foo"))
-            .unwrap();
-        let bar_scc = condensed
-            .sccs
-            .iter()
-            .find(|s| s.symbols.contains("my_crate::inner::bar"))
-            .unwrap();
+        let foo_idx = find_scc_idx(&condensed, "my_crate::foo");
+        let bar_idx = find_scc_idx(&condensed, "my_crate::inner::bar");
+
+        let foo_scc = &condensed.sccs[foo_idx as usize];
 
         // foo depends on bar.
-        assert!(foo_scc.dependencies.contains(&bar_scc.id));
+        assert!(foo_scc.dependencies.contains(&bar_idx));
     }
 }

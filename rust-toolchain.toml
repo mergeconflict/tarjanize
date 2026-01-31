@@ -1,3 +1,12 @@
+# Pin nightly toolchain for rustc_private support in cargo-tarjanize.
+# The rustc-dev component provides access to rustc internal crates.
+# The rust-src component is needed for some IDE features.
 [toolchain]
 channel = "nightly"
-components = ["clippy", "llvm-tools-preview", "rustfmt"]
+components = [
+    "clippy",
+    "llvm-tools-preview",
+    "rustfmt",
+    "rustc-dev",
+    "rust-src",
+]

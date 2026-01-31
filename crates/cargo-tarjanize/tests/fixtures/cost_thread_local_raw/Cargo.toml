@@ -1,0 +1,6 @@
+[package]
+name = "cost_thread_local_raw"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

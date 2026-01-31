@@ -1,0 +1,6 @@
+[package]
+name = "impl_trait_arg"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

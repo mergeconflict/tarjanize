@@ -1,0 +1,51 @@
+[package]
+name = "cargo-tarjanize"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../../README.md"
+description = "Extract symbol graphs from Rust workspaces using rustc"
+
+[lints]
+workspace = true
+
+# Tell rust-analyzer this crate uses rustc_private.
+# This enables IDE support for rustc internal crates.
+[package.metadata.rust-analyzer]
+rustc_private = true
+
+[[bin]]
+name = "cargo-tarjanize"
+path = "src/main.rs"
+
+[dependencies]
+# Output schema types
+tarjanize-schemas = { path = "../tarjanize-schemas" }
+
+# Serialization for JSON output and intermediate files
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Workspace metadata parsing
+cargo_metadata = "0.19"
+
+# Temporary directory for intermediate output files
+tempfile = "3"
+
+# Error handling
+anyhow = "1"
+
+# CLI argument parsing
+clap = { version = "4", features = ["derive"] }
+clap-verbosity-flag = { version = "3", default-features = false, features = ["tracing"] }
+
+# Structured logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+itertools = "0.14"
+
+# Self-profile data parsing for accurate cost estimation
+analyzeme = "12.0"
