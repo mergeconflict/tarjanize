@@ -116,7 +116,7 @@ impl ProfileData {
     ///
     /// Returns the total time in milliseconds, or None if no timing data exists.
     pub fn get_cost_ms(&self, path: &str) -> Option<f64> {
-        self.timings.get(path).map(|d| d.as_secs_f64() * 1000.0)
+        self.timings.get(path).map(Duration::as_millis_f64)
     }
 
     /// Get the number of unique paths with timing data.

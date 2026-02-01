@@ -15,6 +15,7 @@
 
 #![feature(rustc_private)]
 #![feature(box_patterns)]
+#![feature(duration_millis_float)]
 
 // These extern crate declarations pull in the rustc internal crates.
 // They must be declared here because rustc_private crates use a special
@@ -54,6 +55,10 @@ const CRATES: &[&str] = &["cargo_tarjanize"];
 #[command(author, version, about)]
 #[command(bin_name = "cargo tarjanize")]
 pub struct Cli {
+    /// Output file path for the symbol graph JSON
+    #[arg(short, long, value_name = "FILE")]
+    pub output: std::path::PathBuf,
+
     /// Verbosity level (-v for debug, -vv for trace, -q for warn, -qq for error)
     #[command(flatten)]
     pub verbose: Verbosity<InfoLevel>,

@@ -584,33 +584,15 @@ impl<'tcx> Extractor<'tcx> {
         use rustc_hir::intravisit::{self, Visitor};
         use rustc_hir::{Pat, PatExprKind, PatKind};
 
-        // Get the HIR body for this item.
-        let Some(body) = self.tcx.hir_maybe_body_owned_by(local_def_id) else {
-            return;
-        };
-
         // Visitor to find range patterns and extract const refs from bounds.
-        // Defined inline since it's specific to this function and uses the body context.
-        #[allow(
-            clippy::items_after_statements,
-            reason = "visitor is intentionally defined near its usage"
-        )]
         struct RangePatternVisitor<'a, 'tcx> {
             extractor: &'a Extractor<'tcx>,
             deps: &'a mut HashSet<String>,
         }
 
-        #[allow(
-            clippy::items_after_statements,
-            reason = "visitor impl defined near its usage"
-        )]
         impl<'tcx> Visitor<'tcx> for RangePatternVisitor<'_, 'tcx> {
-            #[allow(
-                clippy::renamed_function_params,
-                reason = "pat is more descriptive than trait's p"
-            )]
-            fn visit_pat(&mut self, pat: &'tcx Pat<'tcx>) {
-                if let PatKind::Range(lo, hi, _) = &pat.kind {
+            fn visit_pat(&mut self, p: &'tcx Pat<'tcx>) {
+                if let PatKind::Range(lo, hi, _) = &p.kind {
                     // Extract const refs from the lower bound.
                     if let Some(lo_expr) = lo {
                         self.extract_const_from_pat_expr(lo_expr);
@@ -621,14 +603,10 @@ impl<'tcx> Extractor<'tcx> {
                     }
                 }
                 // Continue visiting nested patterns.
-                intravisit::walk_pat(self, pat);
+                intravisit::walk_pat(self, p);
             }
         }
 
-        #[allow(
-            clippy::items_after_statements,
-            reason = "helper impl defined near its usage"
-        )]
         impl<'tcx> RangePatternVisitor<'_, 'tcx> {
             /// Extract a const reference from a range bound pattern expression.
             fn extract_const_from_pat_expr(
@@ -648,6 +626,11 @@ impl<'tcx> Extractor<'tcx> {
                 }
             }
         }
+
+        // Get the HIR body for this item.
+        let Some(body) = self.tcx.hir_maybe_body_owned_by(local_def_id) else {
+            return;
+        };
 
         let mut visitor = RangePatternVisitor {
             extractor: self,
@@ -1099,7 +1082,7 @@ impl<'tcx> Extractor<'tcx> {
                 for arm_id in arms {
                     let arm = &thir.arms[*arm_id];
                     // Walk the pattern - this is where const patterns appear.
-                    self.walk_thir_pattern(thir, &arm.pattern, deps);
+                    self.walk_thir_pattern(&arm.pattern, deps);
                     // Walk guard if present.
                     if let Some(guard) = &arm.guard {
                         self.walk_thir_expr(thir, *guard, deps);
@@ -1112,7 +1095,7 @@ impl<'tcx> Extractor<'tcx> {
             // Let expressions (if-let, let-else).
             ExprKind::Let { expr, pat } => {
                 self.walk_thir_expr(thir, *expr, deps);
-                self.walk_thir_pattern(thir, pat, deps);
+                self.walk_thir_pattern(pat, deps);
             }
 
             // Block - walk statements and optional tail expression.
@@ -1127,7 +1110,7 @@ impl<'tcx> Extractor<'tcx> {
                             else_block,
                             ..
                         } => {
-                            self.walk_thir_pattern(thir, pattern, deps);
+                            self.walk_thir_pattern(pattern, deps);
                             if let Some(init) = initializer {
                                 self.walk_thir_expr(thir, *init, deps);
                             }
@@ -1328,13 +1311,8 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// This is critical for capturing const references in patterns like
     /// `matches!(x, MAGIC)` which MIR inlines to literal comparisons.
-    #[allow(
-        clippy::only_used_in_recursion,
-        reason = "thir passed for consistency with walk_thir_expr"
-    )]
     fn walk_thir_pattern(
         &self,
-        thir: &thir::Thir<'tcx>,
         pat: &thir::Pat<'tcx>,
         deps: &mut HashSet<String>,
     ) {
@@ -1356,27 +1334,27 @@ impl<'tcx> Extractor<'tcx> {
             } => {
                 self.maybe_add_dep(adt_def.did(), deps);
                 for field_pat in subpatterns {
-                    self.walk_thir_pattern(thir, &field_pat.pattern, deps);
+                    self.walk_thir_pattern(&field_pat.pattern, deps);
                 }
             }
 
             // Leaf pattern (single-variant ADT).
             PatKind::Leaf { subpatterns } => {
                 for field_pat in subpatterns {
-                    self.walk_thir_pattern(thir, &field_pat.pattern, deps);
+                    self.walk_thir_pattern(&field_pat.pattern, deps);
                 }
             }
 
             // Deref patterns - walk the subpattern.
             PatKind::Deref { subpattern, .. }
             | PatKind::DerefPattern { subpattern, .. } => {
-                self.walk_thir_pattern(thir, subpattern, deps);
+                self.walk_thir_pattern(subpattern, deps);
             }
 
             // Binding pattern with possible subpattern.
             PatKind::Binding { subpattern, .. } => {
                 if let Some(subpat) = subpattern {
-                    self.walk_thir_pattern(thir, subpat, deps);
+                    self.walk_thir_pattern(subpat, deps);
                 }
             }
 
@@ -1392,20 +1370,20 @@ impl<'tcx> Extractor<'tcx> {
                 suffix,
             } => {
                 for p in prefix {
-                    self.walk_thir_pattern(thir, p, deps);
+                    self.walk_thir_pattern(p, deps);
                 }
                 if let Some(slice_pat) = slice {
-                    self.walk_thir_pattern(thir, slice_pat, deps);
+                    self.walk_thir_pattern(slice_pat, deps);
                 }
                 for p in suffix {
-                    self.walk_thir_pattern(thir, p, deps);
+                    self.walk_thir_pattern(p, deps);
                 }
             }
 
             // Or pattern (pat1 | pat2).
             PatKind::Or { pats } => {
                 for p in pats {
-                    self.walk_thir_pattern(thir, p, deps);
+                    self.walk_thir_pattern(p, deps);
                 }
             }
 
@@ -1426,9 +1404,13 @@ impl<'tcx> Extractor<'tcx> {
     /// Extract anchors for an impl block (orphan rule compliance).
     ///
     /// For `impl<P1..=Pn> Trait<T1..=Tn> for T0`, anchors include:
-    /// - T0 (self type) if it's a local ADT or contains one
-    /// - The trait if it's local
-    /// - T1..=Tn if they contain local ADTs
+    /// - T0 (self type) if it's a workspace-local ADT or contains one
+    /// - The trait if it's workspace-local
+    /// - T1..=Tn if they contain workspace-local ADTs
+    ///
+    /// Note: We check `is_workspace_crate` (not just `is_local`) because the
+    /// orphan rule considers all crates in the workspace as "local" for our
+    /// purposes - we can reorganize code across workspace crates.
     fn extract_impl_anchors(&self, def_id: DefId) -> HashSet<String> {
         let mut anchors = HashSet::new();
 
@@ -1442,8 +1424,8 @@ impl<'tcx> Extractor<'tcx> {
             let trait_ref = self.tcx.impl_trait_ref(def_id).skip_binder();
 
             // Trait itself.
-            if Self::is_local(trait_ref.def_id) {
-                anchors.insert(self.def_path_str(trait_ref.def_id));
+            if self.is_workspace_crate(trait_ref.def_id) {
+                anchors.insert(self.raw_def_path(trait_ref.def_id));
             }
 
             // Trait type parameters (skip Self which is first).
@@ -1457,7 +1439,7 @@ impl<'tcx> Extractor<'tcx> {
         anchors
     }
 
-    /// Collect local ADTs from a type for anchor purposes.
+    /// Collect workspace-local ADTs from a type for anchor purposes.
     ///
     /// Handles fundamental types (`&T`, `Box<T>`, `Pin<T>`) by unwrapping them
     /// to find the inner local type. Also recurses into type parameters of
@@ -1479,9 +1461,9 @@ impl<'tcx> Extractor<'tcx> {
                             self.collect_anchors_from_type(inner_ty, anchors);
                         }
                     }
-                } else if Self::is_local(adt_def.did()) {
-                    // Local ADT - this is an anchor.
-                    anchors.insert(self.def_path_str(adt_def.did()));
+                } else if self.is_workspace_crate(adt_def.did()) {
+                    // Workspace-local ADT - this is an anchor.
+                    anchors.insert(self.raw_def_path(adt_def.did()));
                 } else {
                     // External non-fundamental ADT (like Vec, HashMap).
                     // Under orphan rules, local types in type parameters can still
@@ -1504,13 +1486,13 @@ impl<'tcx> Extractor<'tcx> {
                 self.collect_anchors_from_type(*elem_ty, anchors);
             }
             ty::TyKind::Dynamic(predicates, _) => {
-                // dyn Trait - if the trait is local, it's an anchor.
+                // dyn Trait - if the trait is workspace-local, it's an anchor.
                 for pred in *predicates {
                     if let ty::ExistentialPredicate::Trait(trait_ref) =
                         pred.skip_binder()
-                        && Self::is_local(trait_ref.def_id)
+                        && self.is_workspace_crate(trait_ref.def_id)
                     {
-                        anchors.insert(self.def_path_str(trait_ref.def_id));
+                        anchors.insert(self.raw_def_path(trait_ref.def_id));
                     }
                 }
             }
@@ -1560,13 +1542,6 @@ impl<'tcx> Extractor<'tcx> {
         }
     }
 
-    /// Check if a `def_id` is defined in the current crate being compiled.
-    ///
-    /// Used for anchor extraction (orphan rule) where only the current crate matters.
-    fn is_local(def_id: DefId) -> bool {
-        def_id.krate == LOCAL_CRATE
-    }
-
     /// Check if a `def_id` belongs to a workspace crate.
     ///
     /// This returns true for the current crate (`LOCAL_CRATE`) and for any
@@ -1581,12 +1556,12 @@ impl<'tcx> Extractor<'tcx> {
         self.workspace_crates.contains(crate_name.as_str())
     }
 
-    /// Check if a `def_id` is nested inside a function or const body.
+    /// Check if a `def_id` is nested inside a function, closure, or const body.
     ///
-    /// Items defined inside function bodies (nested functions, statics from macro
-    /// expansion like tracing's `__CALLSITE`) can't be split independently from
-    /// their parent. We skip extracting them and collapse any dependencies on them
-    /// to the containing function.
+    /// Items defined inside function/closure bodies (nested functions, statics from
+    /// macro expansion like tracing's `__CALLSITE`, structs from `tokio::select!`)
+    /// can't be split independently from their parent. We skip extracting them and
+    /// collapse any dependencies on them to the containing function.
     fn is_nested_in_body(&self, def_id: DefId) -> bool {
         let mut current = def_id;
         loop {
@@ -1595,20 +1570,19 @@ impl<'tcx> Extractor<'tcx> {
             if parent == current || parent.is_crate_root() {
                 return false;
             }
-            // Check if parent is a function or const body.
+            // Check if parent is a function, closure, or const body.
             match self.tcx.def_kind(parent) {
                 DefKind::Fn
                 | DefKind::AssocFn
                 | DefKind::Const
-                | DefKind::AnonConst => {
+                | DefKind::AnonConst
+                | DefKind::Closure => {
                     return true;
                 }
-                DefKind::Mod => {
-                    // Reached a module boundary - not nested in a body.
-                    return false;
-                }
                 _ => {
-                    // Keep walking up.
+                    // Keep walking up. Modules can be defined inside closures
+                    // (e.g., `tokio::select!` generates `__tokio_select_util`),
+                    // so we can't stop at DefKind::Mod boundaries.
                     current = parent;
                 }
             }
@@ -1616,6 +1590,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Find the containing function if this `def_id` is nested inside one.
+    ///
+    /// For items inside closures, returns the function containing the closure.
     fn find_containing_function(&self, def_id: DefId) -> Option<DefId> {
         let mut current = def_id;
         loop {
@@ -1625,7 +1601,9 @@ impl<'tcx> Extractor<'tcx> {
             }
             match self.tcx.def_kind(parent) {
                 DefKind::Fn | DefKind::AssocFn => return Some(parent),
-                DefKind::Mod => return None,
+                // Keep walking through closures and modules - they can be nested
+                // inside functions (e.g., `tokio::select!` generates modules
+                // inside closures inside functions).
                 _ => current = parent,
             }
         }
@@ -1952,21 +1930,15 @@ impl<'tcx> Extractor<'tcx> {
 
         // Try lifetime argument.
         if let Some(region) = arg.as_region() {
-            #[expect(
-                clippy::match_same_arms,
-                reason = "explicit ReBound arm documents why late-bound lifetimes are skipped"
-            )]
             return match region.kind() {
                 // Named early-bound lifetimes: include in output.
                 // The name already includes the leading `'`.
                 ty::RegionKind::ReEarlyParam(early) => {
                     Some(early.name.to_string())
                 }
-                // Late-bound lifetimes: skip (these are elided in source).
-                ty::RegionKind::ReBound(..) => None,
                 // Static lifetime: always include.
                 ty::RegionKind::ReStatic => Some("'static".to_string()),
-                // Other lifetime kinds (erased, error, etc.): skip.
+                // Other lifetime kinds (late-bound, erased, error, etc.): skip.
                 _ => None,
             };
         }

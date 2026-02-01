@@ -52,8 +52,13 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
         .expect("failed to run cargo clean");
     assert!(clean_status.success(), "cargo clean failed");
 
-    // Run cargo-tarjanize.
+    // Create a temporary file for output.
+    let output_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+
+    // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
+        .arg("-o")
+        .arg(output_file.path())
         .current_dir(&fixture_path)
         .output()
         .expect("failed to run cargo-tarjanize");
@@ -63,8 +68,9 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
         panic!("cargo-tarjanize failed with status: {}", output.status);
     }
 
-    // Parse the JSON output.
-    serde_json::from_slice(&output.stdout).expect("failed to parse JSON output")
+    // Parse the JSON output from the file.
+    let file = std::fs::File::open(output_file.path()).expect("failed to open output file");
+    serde_json::from_reader(file).expect("failed to parse JSON output")
 }
 
 /// Try to run cargo-tarjanize on a fixture workspace.
@@ -90,8 +96,13 @@ fn try_extract_fixture(fixture_name: &str) -> Option<SymbolGraph> {
         return None;
     }
 
-    // Run cargo-tarjanize.
+    // Create a temporary file for output.
+    let output_file = tempfile::NamedTempFile::new().ok()?;
+
+    // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
+        .arg("-o")
+        .arg(output_file.path())
         .current_dir(&fixture_path)
         .output()
         .ok()?;
@@ -103,7 +114,8 @@ fn try_extract_fixture(fixture_name: &str) -> Option<SymbolGraph> {
         return None;
     }
 
-    serde_json::from_slice(&output.stdout).ok()
+    let file = std::fs::File::open(output_file.path()).ok()?;
+    serde_json::from_reader(file).ok()
 }
 
 /// Get a symbol by key suffix from the graph.

@@ -9,7 +9,6 @@
 //! 6. Merges them into a single `SymbolGraph` and outputs JSON
 
 use std::collections::HashMap;
-use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::{env, fs};
@@ -154,13 +153,13 @@ fn run_inner(cli: &Cli) -> Result<()> {
     let graph =
         aggregate_results(output_dir.path(), &workspace_crates, &profile_data)?;
 
-    // Output the combined symbol graph as JSON.
-    let json = serde_json::to_string_pretty(&graph)
-        .context("failed to serialize symbol graph")?;
-    io::stdout()
-        .write_all(json.as_bytes())
-        .context("failed to write output")?;
-    println!(); // Trailing newline
+    // Output the combined symbol graph as JSON to the specified file.
+    let file = fs::File::create(&cli.output).with_context(|| {
+        format!("failed to create output file {}", cli.output.display())
+    })?;
+    serde_json::to_writer_pretty(file, &graph).with_context(|| {
+        format!("failed to write output to {}", cli.output.display())
+    })?;
 
     Ok(())
 }

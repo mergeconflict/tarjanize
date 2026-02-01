@@ -53,8 +53,13 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
         .expect("failed to run cargo clean");
     assert!(clean_status.success(), "cargo clean failed");
 
-    // Run cargo-tarjanize.
+    // Create a temporary file for output.
+    let output_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+
+    // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
+        .arg("-o")
+        .arg(output_file.path())
         .current_dir(&fixture_path)
         .output()
         .expect("failed to run cargo-tarjanize");
@@ -64,8 +69,9 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
         panic!("cargo-tarjanize failed with status: {}", output.status);
     }
 
-    // Parse the JSON output.
-    serde_json::from_slice(&output.stdout).expect("failed to parse JSON output")
+    // Parse the JSON output from the file.
+    let file = std::fs::File::open(output_file.path()).expect("failed to open output file");
+    serde_json::from_reader(file).expect("failed to parse JSON output")
 }
 
 /// Try to run cargo-tarjanize on a fixture workspace.
@@ -92,8 +98,13 @@ fn try_extract_fixture(fixture_name: &str) -> Option<SymbolGraph> {
         return None;
     }
 
-    // Run cargo-tarjanize.
+    // Create a temporary file for output.
+    let output_file = tempfile::NamedTempFile::new().ok()?;
+
+    // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
+        .arg("-o")
+        .arg(output_file.path())
         .current_dir(&fixture_path)
         .output()
         .ok()?;
@@ -106,7 +117,8 @@ fn try_extract_fixture(fixture_name: &str) -> Option<SymbolGraph> {
         return None;
     }
 
-    serde_json::from_slice(&output.stdout).ok()
+    let file = std::fs::File::open(output_file.path()).ok()?;
+    serde_json::from_reader(file).ok()
 }
 
 /// Check if a symbol has a dependency on another symbol.
@@ -187,12 +199,6 @@ fn get_symbol_deps(
     crate_name: &str,
     symbol_name: &str,
 ) -> HashSet<String> {
-    let module = graph.crates.get(crate_name).expect("crate not found");
-
-    #[allow(
-        clippy::items_after_statements,
-        reason = "helper function defined near its usage"
-    )]
     fn find_in_module(module: &Module, name: &str) -> Option<HashSet<String>> {
         if let Some(symbol) = module.symbols.get(name) {
             return Some(symbol.dependencies.clone());
@@ -219,6 +225,7 @@ fn get_symbol_deps(
         None
     }
 
+    let module = graph.crates.get(crate_name).expect("crate not found");
     find_in_module(module, symbol_name).unwrap_or_default()
 }
 
@@ -261,6 +268,15 @@ fn assert_has_anchor(graph: &SymbolGraph, impl_pattern: &str, anchor: &str) {
     assert!(
         anchors.iter().any(|a| a.ends_with(anchor)),
         "impl {impl_pattern} should have anchor {anchor}\nAnchors: {anchors:?}\nGraph: {graph:#?}"
+    );
+}
+
+/// Assert that an impl has an anchor with the exact full path (including crate prefix).
+fn assert_has_anchor_exact(graph: &SymbolGraph, impl_pattern: &str, anchor: &str) {
+    let anchors = get_impl_anchors(graph, impl_pattern);
+    assert!(
+        anchors.iter().any(|a| a == anchor),
+        "impl {impl_pattern} should have exact anchor {anchor}\nAnchors: {anchors:?}"
     );
 }
 
@@ -1190,7 +1206,11 @@ fn test_anchor_external_trait_ref_type_param() {
 #[test]
 fn test_anchor_crate_prefixed_self_type() {
     let graph = extract_fixture("anchor_crate_prefixed_self_type");
-    assert_has_anchor(&graph, "impl MyTrait for MyType", "MyType");
+    // Verify anchors include the full crate-prefixed path, not just the type name.
+    // This is important for cross-crate workspace support. The fixture is renamed
+    // to "fixture" during test execution, so we check for "fixture::" prefix.
+    assert_has_anchor_exact(&graph, "impl MyTrait for MyType", "fixture::MyType");
+    assert_has_anchor_exact(&graph, "impl MyTrait for MyType", "fixture::MyTrait");
 }
 
 // =============================================================================
@@ -1957,4 +1977,21 @@ fn test_nested_fn() {
 
     // caller depends on outer (not on inner, which doesn't exist as a symbol).
     assert_has_edge(&graph, "caller", "outer");
+}
+
+/// Test: Items defined inside closures are collapsed to the containing function.
+///
+/// Macros like `tokio::select!` generate internal structs inside closures
+/// (e.g., `__tokio_select_util::Mask`). These should not appear as separate
+/// symbols - they should be collapsed to the function containing the closure.
+#[test]
+fn test_closure_internal_struct() {
+    let graph = extract_fixture("cost_closure_internal_struct");
+
+    // The internal struct `Mask` should not appear as a symbol.
+    assert_no_symbol(&graph, "Mask");
+    assert_no_symbol(&graph, "__internal_util");
+
+    // The containing function `run` should exist.
+    assert!(symbol_exists(&graph, "run"), "run should exist");
 }
