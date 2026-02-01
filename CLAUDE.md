@@ -18,6 +18,8 @@ cargo clippy --all-targets      # Lint (--all-targets required in virtual worksp
 
 **All code must pass `cargo clippy --all-targets` without warnings.** Fix any warnings before committing.
 
+This project uses [jj (Jujutsu)](https://github.com/martinvonz/jj) for version control. Use `jj` commands instead of `git` (e.g., `jj describe`, `jj new`, `jj st`).
+
 ## Project Overview
 
 **tarjanize** analyzes Rust workspace dependency structures to identify opportunities for splitting crates into smaller, parallelizable units for improved build times. Named after Robert Tarjan (SCC algorithms).
@@ -34,7 +36,7 @@ Phase 4: Reorganize Symbol Graph     → optimized_symbol_graph.json
 Phase 5: Generate Report             → report.md
 ```
 
-**Phase 2 is in progress**. See PLAN.md for full specification.
+**Phases 1-2 are complete.** Phase 3 is next. See PLAN.md for full specification.
 
 ## Code Style
 
@@ -48,11 +50,11 @@ Don't just describe the mechanics; justify the existence and design of the code.
 
 ## Workspace Structure
 
-This is a pure virtual workspace - all crates live under `crates/`.
+This is a pure virtual workspace - all crates live under `crates/`. Dependencies are centralized in `[workspace.dependencies]` and inherited via `.workspace = true`.
 
 ```
 tarjanize/
-├── Cargo.toml               # Virtual workspace manifest (includes lint config)
+├── Cargo.toml               # Virtual workspace manifest (dependencies, lints)
 └── crates/
     ├── tarjanize/           # CLI binary (post-processing commands)
     │   └── src/main.rs
@@ -123,6 +125,10 @@ Real Cargo projects in `tests/fixtures/` are used for integration tests. Each fi
 ## Static Verification
 
 Workspace-level lint configuration follows [M-STATIC-VERIFICATION](https://microsoft.github.io/rust-guidelines/guidelines/universal/index.html) from the Microsoft Pragmatic Rust Guidelines. See `[workspace.lints]` in the root `Cargo.toml` for the full configuration.
+
+**Prefer `#[expect]` over `#[allow]`** for suppressing lints. `#[expect]` warns if the lint is never triggered, catching stale suppressions.
+
+**CI runs with `RUSTFLAGS=-Dwarnings`**, so all warnings are errors. Test fixtures must use `#[expect(...)]` for intentional lint violations.
 
 Beyond `cargo clippy` and `cargo fmt`, consider running these tools periodically:
 
