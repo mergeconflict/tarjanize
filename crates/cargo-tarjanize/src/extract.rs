@@ -1019,7 +1019,7 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Walk a THIR expression and collect dependencies.
-    #[allow(
+    #[expect(
         clippy::too_many_lines,
         reason = "large match on ExprKind variants"
     )]

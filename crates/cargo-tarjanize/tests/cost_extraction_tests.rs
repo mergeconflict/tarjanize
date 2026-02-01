@@ -21,14 +21,10 @@ use std::process::Command;
 use tarjanize_schemas::{Module, SymbolGraph, SymbolKind};
 
 /// Path to the cargo-tarjanize binary.
-fn cargo_tarjanize_bin() -> std::path::PathBuf {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    Path::new(manifest_dir)
-        .parent() // crates/
-        .unwrap()
-        .parent() // workspace root
-        .unwrap()
-        .join("target/debug/cargo-tarjanize")
+fn cargo_tarjanize_bin() -> &'static str {
+    // CARGO_BIN_EXE_<name> is set by Cargo during test builds to the correct
+    // binary path, regardless of target directory (works with cargo-llvm-cov).
+    env!("CARGO_BIN_EXE_cargo-tarjanize")
 }
 
 /// Run cargo-tarjanize on a fixture workspace and return the extracted graph.

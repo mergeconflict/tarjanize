@@ -5,7 +5,7 @@
 //! and `ExprKind::ValueUnwrapUnsafeBinder` for these operations.
 
 #![feature(unsafe_binders)]
-#![allow(incomplete_features)]
+#![expect(incomplete_features)]
 
 use std::unsafe_binder::{unwrap_binder, wrap_binder};
 
