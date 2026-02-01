@@ -64,7 +64,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
     let all_workspace_crates: Vec<String> = metadata
         .workspace_packages()
         .iter()
-        .map(|pkg| pkg.name.clone())
+        .map(|pkg| pkg.name.to_string())
         .collect();
 
     let workspace_crates: Vec<String> = if cli.package.is_empty() {

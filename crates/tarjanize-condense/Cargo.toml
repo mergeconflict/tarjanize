@@ -13,11 +13,8 @@ description = "Compute SCCs and condense symbol graphs into DAGs"
 workspace = true
 
 [dependencies]
-tarjanize-schemas = { path = "../tarjanize-schemas" }
-indexmap = "2.13"
-petgraph = "0.8"
-serde_json = "1.0"
-tracing = "0.1"
-
-[dev-dependencies]
-proptest = "1.9"
+tarjanize-schemas.workspace = true
+indexmap.workspace = true
+petgraph.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

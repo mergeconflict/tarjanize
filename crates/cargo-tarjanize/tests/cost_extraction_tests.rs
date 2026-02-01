@@ -53,7 +53,8 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
     assert!(clean_status.success(), "cargo clean failed");
 
     // Create a temporary file for output.
-    let output_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    let output_file =
+        tempfile::NamedTempFile::new().expect("failed to create temp file");
 
     // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
@@ -69,7 +70,8 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
     }
 
     // Parse the JSON output from the file.
-    let file = std::fs::File::open(output_file.path()).expect("failed to open output file");
+    let file = std::fs::File::open(output_file.path())
+        .expect("failed to open output file");
     serde_json::from_reader(file).expect("failed to parse JSON output")
 }
 
@@ -278,10 +280,7 @@ fn test_profile_key_const() {
     assert_symbol_exists(&graph, "MY_CONST");
 
     let (key, symbol) = find_symbol(&graph, "MY_CONST").unwrap();
-    assert!(
-        key == "MY_CONST",
-        "Const key should be simple name: {key}"
-    );
+    assert!(key == "MY_CONST", "Const key should be simple name: {key}");
     assert!(matches!(
         &symbol.kind,
         SymbolKind::ModuleDef { kind, .. } if kind == "Const"
@@ -310,10 +309,7 @@ fn test_profile_key_macro() {
     assert_symbol_exists(&graph, "my_macro");
 
     let (key, symbol) = find_symbol(&graph, "my_macro").unwrap();
-    assert!(
-        key == "my_macro",
-        "Macro key should be simple name: {key}"
-    );
+    assert!(key == "my_macro", "Macro key should be simple name: {key}");
     assert!(matches!(
         &symbol.kind,
         SymbolKind::ModuleDef { kind, .. } if kind == "Macro"
@@ -366,7 +362,8 @@ fn test_profile_key_multiple_impls() {
     let graph = extract_fixture("profile_key_multiple_impls");
     // Multiple impls should be disambiguated with [N] suffix
     let keys = collect_all_keys(&graph);
-    let impl_keys: Vec<_> = keys.iter().filter(|k| k.contains("{{impl}}")).collect();
+    let impl_keys: Vec<_> =
+        keys.iter().filter(|k| k.contains("{{impl}}")).collect();
 
     assert!(
         impl_keys.len() >= 2,
@@ -390,7 +387,8 @@ fn test_profile_key_nested_module_impl() {
     assert_symbol_exists(&graph, "{{impl}}");
 
     // Verify the impl is in a submodule by checking the crate structure.
-    let crate_module = graph.crates.get("profile_key_nested_module_impl").unwrap();
+    let crate_module =
+        graph.crates.get("profile_key_nested_module_impl").unwrap();
     assert!(
         crate_module.submodules.contains_key("submod"),
         "Should have submod submodule"
@@ -561,7 +559,10 @@ fn test_cost_async_closure() {
     let graph = extract_fixture("async_closure");
     // Uses existing fixture - just verify extraction works
     let keys = collect_all_keys(&graph);
-    assert!(!keys.is_empty(), "Should extract symbols from async closure");
+    assert!(
+        !keys.is_empty(),
+        "Should extract symbols from async closure"
+    );
 }
 
 #[test]
@@ -684,7 +685,11 @@ fn test_cost_from_profile() {
     // Verify symbol exists and has a cost field
     let (_, symbol) = find_symbol(&graph, "profiled_fn").expect("should exist");
     // Cost should be positive (from profile data)
-    assert!(symbol.cost > 0.0, "Cost should be positive: {}", symbol.cost);
+    assert!(
+        symbol.cost > 0.0,
+        "Cost should be positive: {}",
+        symbol.cost
+    );
 }
 
 #[test]
@@ -830,7 +835,8 @@ fn test_cost_empty_function() {
 fn test_cost_sum_nested() {
     let graph = extract_fixture("cost_sum_nested");
     // Parent function should exist and have positive cost that includes nested fn
-    let (_, symbol) = find_symbol(&graph, "outer_with_nested").expect("should exist");
+    let (_, symbol) =
+        find_symbol(&graph, "outer_with_nested").expect("should exist");
     assert!(
         symbol.cost > 0.0,
         "Outer fn should have cost including nested: {}",
@@ -844,7 +850,8 @@ fn test_cost_sum_nested() {
 fn test_cost_sum_closures() {
     let graph = extract_fixture("cost_sum_closures");
     // Parent function should exist and have positive cost that includes closures
-    let (_, symbol) = find_symbol(&graph, "outer_with_closures").expect("should exist");
+    let (_, symbol) =
+        find_symbol(&graph, "outer_with_closures").expect("should exist");
     assert!(
         symbol.cost > 0.0,
         "Outer fn should have cost including closures: {}",
@@ -870,25 +877,13 @@ fn test_cost_thread_local_raw() {
 fn test_cost_virtual_workspace() {
     let graph = extract_fixture("cost_virtual_workspace");
     // Both crates should be extracted
-    assert!(
-        graph.crates.contains_key("crate_a"),
-        "Should have crate_a"
-    );
-    assert!(
-        graph.crates.contains_key("crate_b"),
-        "Should have crate_b"
-    );
+    assert!(graph.crates.contains_key("crate_a"), "Should have crate_a");
+    assert!(graph.crates.contains_key("crate_b"), "Should have crate_b");
     // Each crate's symbols should have costs
     let crate_a = graph.crates.get("crate_a").unwrap();
-    assert!(
-        !crate_a.symbols.is_empty(),
-        "crate_a should have symbols"
-    );
+    assert!(!crate_a.symbols.is_empty(), "crate_a should have symbols");
     let crate_b = graph.crates.get("crate_b").unwrap();
-    assert!(
-        !crate_b.symbols.is_empty(),
-        "crate_b should have symbols"
-    );
+    assert!(!crate_b.symbols.is_empty(), "crate_b should have symbols");
 }
 
 #[test]

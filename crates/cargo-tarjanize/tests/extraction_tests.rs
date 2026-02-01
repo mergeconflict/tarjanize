@@ -54,7 +54,8 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
     assert!(clean_status.success(), "cargo clean failed");
 
     // Create a temporary file for output.
-    let output_file = tempfile::NamedTempFile::new().expect("failed to create temp file");
+    let output_file =
+        tempfile::NamedTempFile::new().expect("failed to create temp file");
 
     // Run cargo-tarjanize with output file.
     let output = Command::new(cargo_tarjanize_bin())
@@ -70,7 +71,8 @@ fn extract_fixture(fixture_name: &str) -> SymbolGraph {
     }
 
     // Parse the JSON output from the file.
-    let file = std::fs::File::open(output_file.path()).expect("failed to open output file");
+    let file = std::fs::File::open(output_file.path())
+        .expect("failed to open output file");
     serde_json::from_reader(file).expect("failed to parse JSON output")
 }
 
@@ -272,7 +274,11 @@ fn assert_has_anchor(graph: &SymbolGraph, impl_pattern: &str, anchor: &str) {
 }
 
 /// Assert that an impl has an anchor with the exact full path (including crate prefix).
-fn assert_has_anchor_exact(graph: &SymbolGraph, impl_pattern: &str, anchor: &str) {
+fn assert_has_anchor_exact(
+    graph: &SymbolGraph,
+    impl_pattern: &str,
+    anchor: &str,
+) {
     let anchors = get_impl_anchors(graph, impl_pattern);
     assert!(
         anchors.iter().any(|a| a == anchor),
@@ -1209,8 +1215,16 @@ fn test_anchor_crate_prefixed_self_type() {
     // Verify anchors include the full crate-prefixed path, not just the type name.
     // This is important for cross-crate workspace support. The fixture is renamed
     // to "fixture" during test execution, so we check for "fixture::" prefix.
-    assert_has_anchor_exact(&graph, "impl MyTrait for MyType", "fixture::MyType");
-    assert_has_anchor_exact(&graph, "impl MyTrait for MyType", "fixture::MyTrait");
+    assert_has_anchor_exact(
+        &graph,
+        "impl MyTrait for MyType",
+        "fixture::MyType",
+    );
+    assert_has_anchor_exact(
+        &graph,
+        "impl MyTrait for MyType",
+        "fixture::MyTrait",
+    );
 }
 
 // =============================================================================
