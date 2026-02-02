@@ -915,6 +915,7 @@ dependencies = [
  "itertools",
  "mimalloc",
  "tarjanize-condense",
+ "tarjanize-cost",
  "tracing-subscriber",
 ]
 

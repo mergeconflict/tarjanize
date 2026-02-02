@@ -2,9 +2,9 @@
 
 A tool to analyze Rust workspace dependency structures and identify opportunities for splitting crates into smaller, parallelizable units to improve build times.
 
-**Why "tarjanize"?** The tool is named after [Robert Tarjan](https://en.wikipedia.org/wiki/Robert_Tarjan), whose algorithms are central to both phases of our analysis:
-- **Phase 2** uses Tarjan's SCC algorithm (1972) to identify strongly connected components
-- **Phase 3** uses union-find with path compression, whose near-linear time bound was proven by Tarjan & van Leeuwen (1984)
+**Why "tarjanize"?** The tool is named after [Robert Tarjan](https://en.wikipedia.org/wiki/Robert_Tarjan), whose algorithms are central to our analysis:
+- **SCC computation** uses Tarjan's algorithm (1972) to identify strongly connected components
+- **Union-find merging** uses path compression, whose near-linear time bound was proven by Tarjan & van Leeuwen (1984)
 
 ## Motivation
 
@@ -43,105 +43,25 @@ The algorithm is simple and provably correct:
 
 Before starting implementation, set up the development environment:
 
-### Tools
-
-- [ ] Install Lean 4 and Lake (build system)
-- [ ] Install Creusot and Why3 — Creusot translates Rust code with contracts into Why3's intermediate language, and Why3 dispatches verification conditions to SMT solvers (Z3, CVC5, Alt-Ergo)
-- [ ] Set up Rust project with `clap` for CLI, `serde` for JSON
-
-### Lean project
-
-Create the formal verification project:
-
-```bash
-lake new tarjanize-proofs
-```
-
-Add Mathlib dependency to `lakefile.lean`. We use Mathlib for:
-- `Set` and `Finset` — representing nodes and edges
-- `Set.ncard` — counting set cardinality (for dependent counts)
-- Basic lemmas about sets, functions, and relations
-
-### Core Lean definitions
-
-These definitions form the mathematical foundation shared across phases. We define them upfront so that Phases 2 and 3 can build on a common vocabulary.
-
-**Note**: The Lean code throughout this document is illustrative, showing the *intent* of each definition and theorem. The actual implementation will need adjustments for Mathlib compatibility, explicit type class constraints, and proof construction. The `sorry` placeholders indicate proofs to be completed during implementation.
-
-```lean
-import Mathlib.Data.Set.Basic
-import Mathlib.Data.Finset.Basic
-
--- A directed graph: the fundamental structure we're partitioning.
--- We represent it as a set of edges (pairs of nodes).
-structure Graph (α : Type*) where
-  edges : Set (α × α)
-
--- The nodes of a graph: anything that appears in an edge.
-def Graph.nodes (G : Graph α) : Set α :=
-  {x | ∃ y, (x, y) ∈ G.edges ∨ (y, x) ∈ G.edges}
-
--- Reachability: can we get from x to y following edges?
--- This is needed to define SCCs (mutually reachable nodes) and acyclicity.
-inductive Graph.Reachable (G : Graph α) : α → α → Prop
-  | single : (x, y) ∈ G.edges → G.Reachable x y
-  | trans : G.Reachable x y → G.Reachable y z → G.Reachable x z
-
--- Acyclicity: no node can reach itself.
--- This is the key property we must preserve — Cargo requires acyclic crate graphs.
-def Graph.Acyclic (G : Graph α) : Prop :=
-  ∀ x, ¬ G.Reachable x x
-
--- A partitioning assigns each node to a crate (represented as a natural number).
--- This is the output of our algorithm: which crate does each SCC belong to?
-structure Partitioning (α : Type*) where
-  assignment : α → ℕ
-
--- The induced crate graph: edges between crates based on edges between their nodes.
--- If node x depends on node y, and they're in different crates, there's a crate edge.
-def inducedCrateGraph (G : Graph α) (P : Partitioning α) : Graph ℕ :=
-  { edges := {(P.assignment x, P.assignment y) |
-              (x, y) ∈ G.edges ∧ P.assignment x ≠ P.assignment y} }
-
--- A valid partitioning: the induced crate graph must be acyclic.
--- This is the central property we prove about our algorithm's output.
-def ValidPartitioning (G : Graph α) (P : Partitioning α) : Prop :=
-  (inducedCrateGraph G P).Acyclic
-```
-
 ### Rust project
 
 ```bash
 cargo new tarjanize --bin
 ```
 
-- [ ] Define JSON Schema files (using `.schema.json` suffix):
-  - `symbol_graph.schema.json`
-  - `condensed_graph.schema.json`
+- [ ] Define JSON Schema file: `symbol_graph.schema.json`
 - [ ] Set up test fixtures directory with small sample workspaces
 
 ### Continuous Integration
 
-Set up CI (GitHub Actions or similar) to validate the entire project on every commit:
+Set up CI (GitHub Actions or similar) to validate the project on every commit:
 
-**Rust checks:**
 - [ ] `cargo build` — code compiles
 - [ ] `cargo test` — unit and integration tests pass
 - [ ] `cargo clippy` — no lint warnings
 - [ ] `cargo fmt --check` — code is formatted
-
-**Lean checks:**
-- [ ] `lake build` — all proofs type-check (in Lean, type-checking = proof validity)
-
-**Creusot checks:**
-- [ ] Run Creusot to generate Why3 files from annotated Rust code
-- [ ] Run Why3 to verify all contracts (dispatches to SMT solvers)
-
-**Integration checks:**
 - [ ] Run the full pipeline on test fixture workspaces
 - [ ] Validate output JSON against schemas
-
-This ensures that algorithm changes don't break proofs, implementation changes don't violate contracts, and the pipeline remains end-to-end functional.
 
 ## Pipeline Overview
 
@@ -160,26 +80,10 @@ This ensures that algorithm changes don't break proofs, implementation changes d
                                   │
                                   ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│  Phase 2: Compute SCCs and Condense Graph                         │
+│  Phase 2: Condense and Partition                                  │
 │  Input:  symbol_graph.json                                        │
-│  Output: condensed_graph.json (DAG of SCCs)                       │
-│  Properties: Acyclicity, Coverage, Connectedness, Maximality      │
-└─────────────────────────────────┬─────────────────────────────────┘
-                                  │
-                                  ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  Phase 3: Compute Optimal Partitioning (Union-Find Merging)       │
-│  Input:  condensed_graph.json                                     │
-│  Output: optimized_condensed_graph.json (new crate groupings)     │
-│  Properties: Acyclicity, Optimality, Coverage, Edge Preservation  │
-└─────────────────────────────────┬─────────────────────────────────┘
-                                  │
-                                  ▼
-┌───────────────────────────────────────────────────────────────────┐
-│  Phase 4: Generate Optimized Symbol Graph                         │
-│  Input:  symbol_graph.json, optimized_condensed_graph.json        │
 │  Output: optimized_symbol_graph.json (new crate/module structure) │
-│  Properties: Coverage, Edge Preservation                          │
+│  Properties: Acyclicity, Optimality, Coverage, Edge Preservation  │
 └─────────────────────────────────┬─────────────────────────────────┘
                                   │
                                   ▼
@@ -191,7 +95,7 @@ This ensures that algorithm changes don't break proofs, implementation changes d
                                   │
                                   ▼
 ┌───────────────────────────────────────────────────────────────────┐
-│  Phase 5: Generate Report                                         │
+│  Phase 3: Generate Report                                         │
 │  Input:  symbol_graph.json, optimized_symbol_graph.json           │
 │  Output: report.md (cost improvement and crate relationships)     │
 └───────────────────────────────────────────────────────────────────┘
@@ -209,16 +113,17 @@ Each phase is an independent transformation that reads from input file(s) and wr
 
 This approach produces useful results even when rust-analyzer can't fully analyze every symbol (common with macros, proc-macros, or incomplete code).
 
-Intermediate files (Phases 1-4) use **JSON** with **JSON Schema** validation (schema files use the `.schema.json` suffix). JSON is human-readable, has ubiquitous tooling (jq, editors), and excellent serde support. JSON Schema catches malformed files early, serves as documentation, and enables editor autocomplete. For very large workspaces, we may later add `--format messagepack`.
+Intermediate files use **JSON** with **JSON Schema** validation (schema files use the `.schema.json` suffix). JSON is human-readable, has ubiquitous tooling (jq, editors), and excellent serde support. JSON Schema catches malformed files early, serves as documentation, and enables editor autocomplete. For very large workspaces, we may later add `--format messagepack`.
 
-**Two schemas** cover the intermediate files:
+**One schema** covers both input and output of the main algorithm:
 
 | Schema | Description | Producers | Consumers |
 |--------|-------------|-----------|-----------|
-| SymbolGraph | Full symbol graph with crate/module hierarchy | Phases 1 and 4 | Phases 2, 4, and 5 |
-| CondensedGraph | DAG of SCCs grouped by crate | Phases 2 and 3 | Phases 3 and 4 |
+| SymbolGraph | Full symbol graph with crate/module hierarchy | Phases 1 and 2 | Phases 2 and 3 |
 
-The final output (Phase 5) is a **Markdown report** (`report.md`). See Phase 5 for details.
+The final output (Phase 3) is a **Markdown report** (`report.md`). See Phase 3 for details.
+
+**Internal representations**: Phase 2 uses internal data structures (petgraph's `DiGraph`, union-find, etc.) for SCC computation and partitioning. These are not serialized; use `RUST_LOG=debug` or `RUST_LOG=trace` to inspect intermediate state.
 
 ### SymbolGraph
 
@@ -266,41 +171,6 @@ the self type, trait, and trait type parameters—any of them can satisfy the ru
 
 See `schemas/symbol_graph.schema.json` for the complete JSON Schema definition.
 
-### CondensedGraph
-
-The symbol graph with SCCs condensed into atomic units, forming a DAG.
-
-**Design principles**:
-- References symbols via paths rather than duplicating symbol data
-- Crates contain their SCCs (nested structure mirrors current workspace layout)
-- Each SCC has a precomputed `cost` (sum of symbol costs) for build time calculations
-- Edges between SCCs are included so Phase 3 doesn't need to load `symbol_graph.json`
-
-**Key simplification**: Every symbol belongs to exactly one SCC. Single-symbol SCCs represent symbols with no cyclic dependencies. Multi-symbol SCCs represent symbols that must stay together due to cycles.
-
-**SCC IDs**: Generated deterministically from the paths of contained symbols (e.g., hash of sorted paths). This ensures stability across runs.
-
-#### Schema (`schemas/condensed_graph.schema.json`)
-
-```
-CondensedGraph
-├── crates: []
-│   └── Crate
-│       ├── name: string
-│       ├── cost: number (sum of SCC costs)
-│       └── sccs: []
-│           └── SCC
-│               ├── id: string
-│               ├── symbols: [] (paths referencing SymbolGraph)
-│               └── cost: number
-└── edges: []
-    └── Edge
-        ├── from: string (SCC id)
-        └── to: string (SCC id)
-```
-
-See `schemas/condensed_graph.schema.json` for the complete JSON Schema definition.
-
 ## CLI Interface
 
 The tool can run the full pipeline in one command, or execute individual phases for debugging and incremental workflows.
@@ -310,12 +180,9 @@ The tool can run the full pipeline in one command, or execute individual phases 
 tarjanize analyze /path/to/omicron --output-dir ./analysis
 
 # Run individual phases
-tarjanize extract /path/to/omicron -o symbol_graph.json                    # Phase 1
-tarjanize condense symbol_graph.json -o condensed_graph.json               # Phase 2
-tarjanize optimize condensed_graph.json -o optimized_condensed_graph.json  # Phase 3
-tarjanize reify symbol_graph.json optimized_condensed_graph.json \
-    -o optimized_symbol_graph.json                                              # Phase 4
-tarjanize report symbol_graph.json optimized_symbol_graph.json -o report.md  # Phase 5
+cargo tarjanize /path/to/omicron -o symbol_graph.json                      # Phase 1
+tarjanize condense symbol_graph.json -o optimized_symbol_graph.json        # Phase 2
+tarjanize report symbol_graph.json optimized_symbol_graph.json -o report.md  # Phase 3
 
 # Optional: use LLM to suggest better crate names
 tarjanize rename optimized_symbol_graph.json -o renamed_symbol_graph.json
@@ -440,12 +307,21 @@ Steps:
 
 **Known limitation**: Derive macros (`#[derive(...)]`) are not captured due to `sema.resolve_derive_macro()` returning None. Workspace-local derive macros are rare, so this is acceptable.
 
-## Phase 2: Compute SCCs and Condense Graph
+## Phase 2: Condense and Partition
 
 **Input**: `symbol_graph.json`
-**Output**: `condensed_graph.json`
+**Output**: `optimized_symbol_graph.json`
 
-This phase transforms the symbol graph into a DAG suitable for partitioning by condensing strongly connected components.
+This phase is the core of the algorithm. It computes strongly connected components (SCCs), merges them optimally using union-find, and produces a new `SymbolGraph` with the optimized crate structure. All intermediate representations (petgraph structures, union-find state) are internal and not serialized.
+
+### Overview
+
+1. **Build graph**: Parse `SymbolGraph` into petgraph's `DiGraph`
+2. **Condense**: Run petgraph's `condensation()` to find SCCs
+3. **Transitive reduction**: Compute transitive reduction to identify effective dependents
+4. **Partition**: Use union-find to merge SCCs into optimal crate groupings
+5. **Fix anchors**: Solve global hitting set for orphan rule constraints
+6. **Build output**: Construct new `SymbolGraph` with merged crates
 
 ### Why SCCs matter
 
@@ -453,56 +329,9 @@ Symbols within an SCC have cyclic dependencies and **must** stay in the same cra
 
 **Note**: SCCs are always contained within a single crate. Cross-crate cycles are impossible because Cargo enforces acyclic crate-level dependencies. If crate A depends on crate B, symbols in B cannot reference symbols in A, so no SCC can span both.
 
-**Parallelization opportunity**: Since SCCs cannot span crates, Phase 2 can parallelize the expensive work:
-1. Add coherence edges within each crate (parallel)
-2. Find and condense SCCs within each crate (parallel)
-3. **Sync point**: Combine results from all crates
-4. Build edges between SCCs across the full graph (sequential, but O(|E|) edge scan)
-
-### Algorithm
-
-1. **Collect impl anchors** for orphan rule constraints (Phase 3 will enforce)
-
-   Rust's orphan rule (see [Trait Implementation Coherence](https://doc.rust-lang.org/reference/items/implementations.html#trait-implementation-coherence)) requires that for `impl<P1..=Pn> Trait<T1..=Tn> for T0`, at least one of the following must be true:
-   - The **trait** is defined in the current crate, OR
-   - At least one of the **types** `T0..=Tn` (the self type T0 and trait type parameters T1..Tn) is defined in the current crate
-
-   **Key insight**: It's not just the self type that can satisfy the orphan rule—trait type parameters can too. For example, `impl ForeignTrait<MyLocalType> for ForeignType` is valid because `MyLocalType` is local.
-
-   Rather than adding synthetic edges to force impls into the same SCC as their anchors (which would reduce Phase 3's flexibility), we track impl anchors separately. For each impl:
-   - Record the SCC containing the self type T0 (if it's a workspace symbol)
-   - Record the SCC containing the trait (if it's a workspace symbol)
-   - Record the SCCs containing trait type parameters T1..Tn (if they're workspace symbols)
-
-   Phase 3 uses this information to ensure each impl ends up in the same output crate as at least one of its anchor SCCs. This gives Phase 3 flexibility to choose the optimal grouping while guaranteeing orphan rule compliance.
-
-2. **Find SCCs within each crate** using Tarjan's algorithm
-   - Can be parallelized since SCCs cannot span crates
-   - Assign unique ID and compute cost (sum of symbol costs) for each SCC
-   - Build mapping from symbol path → SCC ID
-
-3. **Build edges between SCCs**
-   - For each edge in the symbol graph, if source and target are in different SCCs, add an edge between those SCCs
-   - Exclude the synthetic coherence edges (they served their purpose in step 2)
-
-4. **Assemble output**: crates containing their SCCs, plus the SCC edge set
-
-**Time complexity**: O(|V| + |E|) where V is symbols and E is edges (Tarjan's algorithm is linear).
-
-### Formal properties
-
-The algorithm guarantees four properties:
-
-| Property | Description |
-|----------|-------------|
-| **Acyclicity** | The condensed graph is a DAG (cycles are eliminated by condensing SCCs) |
-| **Coverage** | Every symbol from the input belongs to exactly one SCC (no symbols lost or duplicated) |
-| **Connectedness** | All symbols within each SCC are mutually reachable |
-| **Maximality** | Each SCC is maximal (no symbol outside the SCC is mutually reachable with symbols inside) |
-
 ### Test code handling
 
-**Design decision**: Test code (`#[cfg(test)]` modules, `#[test]` functions) is treated identically to production code in SCC computation. No special handling is needed.
+**Design decision**: Test code (`#[cfg(test)]` modules, `#[test]` functions) is treated identically to production code. No special handling is needed.
 
 **Why this works**: The concern was that dev-dependencies might create artificial cycles. For example, if crate A depends on crate B, and B's tests use A as a dev-dependency, this appears cyclic at the crate level. However, at the symbol level:
 
@@ -514,178 +343,265 @@ b_test -> a -> b
 
 There is no cycle because **production code never depends on test code**. `#[cfg(test)]` items are invisible to production code, so you can never complete a cycle through test code. The edge `b -> b_test` cannot exist.
 
-**Implications for Phase 3**: The partitioning algorithm may recommend test-only crates (crates containing only test code). This is a legitimate recommendation—test utility crates exist in practice (`foo-testutils`, shared fixtures, etc.). If a user prefers to keep tests with their production code, that's a policy decision they can apply when interpreting the recommendations.
-
-### Implementation workflow
-
-This phase requires formal verification. Follow these steps in order:
-
-#### Step 2.1: Lean formalization
-
-Define the mathematical objects for SCCs:
-
-```lean
--- Strongly connected: mutually reachable
-def StronglyConnected (G : Graph α) (x y : α) : Prop :=
-  G.Reachable x y ∧ G.Reachable y x
-
--- An SCC is a maximal set of mutually reachable nodes
-structure SCC (G : Graph α) where
-  nodes : Set α
-  nonempty : nodes.Nonempty
-  connected : ∀ x y, x ∈ nodes → y ∈ nodes → StronglyConnected G x y
-  maximal : ∀ z, (∃ x ∈ nodes, StronglyConnected G x z) → z ∈ nodes
-
--- The condensed graph (SCCs as nodes)
-def condensedGraph (G : Graph α) (sccs : Set (SCC G)) : Graph (SCC G) :=
-  { edges := {(s1, s2) | ∃ x y, x ∈ s1.nodes ∧ y ∈ s2.nodes ∧
-                         (x, y) ∈ G.edges ∧ s1 ≠ s2} }
-```
-
-**Lean tasks:**
-- [ ] Define `StronglyConnected`
-- [ ] Define `SCC`
-- [ ] Define `condensedGraph`
-- [ ] Prove **Acyclicity**: condensed graph is always a DAG
-- [ ] Prove **Coverage**: every node belongs to exactly one SCC
-- [ ] Prove **Connectedness**: symbols within each SCC are mutually reachable
-- [ ] Prove **Maximality**: each SCC is maximal
-
-#### Step 2.2: Creusot annotations
-
-Add contracts to Rust stub functions before implementation.
-
-**Note**: The contracts below are illustrative pseudo-code showing the *intent* of each specification. Actual Creusot syntax requires defining model types (mathematical representations of data structures) and predicates. The implementation will need to:
-- Define `#[logic]` functions for predicates like `is_dag()`, `contains_symbol()`, etc.
-- Use Creusot's model types (`Seq`, `Set`, `Map`) rather than Rust iterators in specs
-- Handle the gap between runtime types and their mathematical models
-
-```rust
-use creusot_contracts::*;
-
-struct Edge {
-    from: SymbolPath,
-    to: SymbolPath,
-}
-
-#[requires(symbol_graph.is_valid())]
-#[ensures(result.is_dag())]
-#[ensures(forall<id: SymbolPath> symbol_graph.contains(id) ==>
-          exists<scc: SccId> result.contains_symbol(scc, id))]
-pub fn condense_graph(symbol_graph: &SymbolGraph) -> CondensedGraph {
-    unimplemented!()  // Stub for annotation
-}
-
-#[requires(symbols.len() > 0)]
-#[ensures(result.iter().all(|scc| scc.symbols.len() > 0))]
-#[ensures(result.iter().flat_map(|scc| scc.symbols.iter()).count() == symbols.len())]
-// Connectedness: all symbols within each SCC are mutually reachable
-#[ensures(forall<scc: &Scc> result.contains(scc) ==>
-          forall<x: SymbolPath, y: SymbolPath> scc.symbols.contains(x) && scc.symbols.contains(y) ==>
-            mutually_reachable(edges, x, y))]
-// Maximality: no symbol outside the SCC is mutually reachable with all symbols inside
-#[ensures(forall<scc: &Scc, z: SymbolPath> result.contains(scc) && !scc.symbols.contains(z) ==>
-          exists<x: SymbolPath> scc.symbols.contains(x) && !mutually_reachable(edges, x, z))]
-fn tarjan_scc(symbols: &[SymbolPath], edges: &[Edge]) -> Vec<Scc> {
-    unimplemented!()  // Stub for annotation
-}
-```
-
-**Creusot annotation tasks:**
-- [ ] Add `#[requires]` and `#[ensures]` to `condense_graph`
-- [ ] Add contracts to `tarjan_scc`
-- [ ] Verify contracts are well-formed (Creusot parses them)
-
-#### Step 2.3: Rust implementation
-
-Implement the annotated functions:
-
-- [ ] Implement coherence edge injection (derive from impl `self_type`/`trait` fields)
-- [ ] Implement Tarjan's SCC algorithm (or use petgraph)
-- [ ] Condense SCCs into single nodes
-- [ ] Build condensed DAG (excluding synthetic coherence edges)
-- [ ] Compute cost for each SCC
-- [ ] Serialize output to `condensed_graph.json`
-
-#### Step 2.4: Creusot verification
-
-- [ ] Run Creusot to verify implementation matches contracts
-- [ ] Fix any verification failures
-- [ ] Write tests verifying formal properties:
-  - Acyclicity: output is always a DAG
-  - Coverage: all input symbols appear in exactly one output SCC
-  - Connectedness: symbols within each SCC are mutually reachable
-  - Maximality: no symbol outside an SCC is mutually reachable with symbols inside
-
-## Phase 3: Compute Optimal Partitioning (Union-Find Merging)
-
-**Input**: `condensed_graph.json`
-**Output**: `optimized_condensed_graph.json`
-
-This phase computes the optimal crate partitioning using a **union-find** data structure to merge SCCs into crates. This is the core algorithm with the strongest formal requirements.
+**Implication**: The algorithm may recommend test-only crates (crates containing only test code). This is a legitimate recommendation—test utility crates exist in practice (`foo-testutils`, shared fixtures, etc.). If a user prefers to keep tests with their production code, that's a policy decision they can apply when interpreting the recommendations.
 
 ### Formal properties
 
-The algorithm guarantees four properties:
+The algorithm guarantees these properties:
 
 | Property | Description | How guaranteed |
 |----------|-------------|----------------|
-| **Acyclicity** | Crate dependency graph is a DAG | Merges follow dependency direction; no cycles possible |
+| **Acyclicity** | Output crate graph is a DAG | Merges follow dependency direction; condensation eliminates cycles |
 | **Optimality** | Minimum critical path cost among valid partitionings | SCCs merge when all dependents are in the same crate |
-| **Coverage** | Every SCC appears in exactly one crate | Union-find assigns each SCC to exactly one set |
-| **Edge Preservation** | All SCC dependencies preserved | Edges unchanged; only crate groupings change |
+| **Coverage** | Every symbol appears in exactly one output crate | Union-find assigns each SCC to exactly one set |
+| **Edge Preservation** | All symbol dependencies preserved | Edges unchanged; only crate groupings change |
 
-#### Definitions
+### Internal data structures
 
-- **dependents(n)**: the set of SCCs that depend on n (i.e., SCCs `m` where there exists an edge `m → n`)
-- **all_dependents_same_set(n)**: true if all dependents of n belong to the same union-find set (trivially true if n has 0 or 1 dependents)
+Phase 2 works with petgraph's `DiGraph` and parallel vectors rather than serialized JSON:
 
-### Merge criterion
+```rust
+// After condensation: DiGraph<Vec<usize>, ()>
+// Each node is an SCC containing symbol indices
+let condensed: DiGraph<Vec<usize>, ()> = condensation(graph, true);
 
-An SCC is merged into its dependents' crate **if all its dependents are already in the same crate**. This criterion:
-- Merges single-dependent SCCs (the common case)
-- Merges multi-dependent SCCs when their dependents have already been unified (e.g., diamonds)
-- Keeps SCCs separate when their dependents are in different crates (preserving parallelism)
+// Parallel vectors indexed by SCC node index
+let scc_costs: Vec<f64>;           // Sum of symbol costs per SCC
+let scc_anchors: Vec<Vec<u32>>;    // Anchor SCC indices per impl
 
-### Anchor constraints (hitting set problem)
+// Symbol index for path ↔ usize conversion
+let index: IndexVec<SymbolPath>;
 
-Each impl block has an **anchor set**: the SCCs containing workspace-local types/traits that can satisfy the orphan rule. When grouping SCCs into output crates, Phase 3 must ensure each impl ends up in the same crate as at least one of its anchors.
+// Union-find for merging SCCs into crates
+let uf: UnionFind<u32>;
+```
 
-When merging SCCs, their anchor sets combine. If the merged group has multiple anchor sets, Phase 3 must find a **hitting set**: a minimal set of SCCs that satisfies all anchor constraints. For example:
-- Impl A has anchors {x, y} (must be with x OR y)
-- Impl B has anchors {x, z} (must be with x OR z)
-- The minimal hitting set is {x} since it satisfies both constraints
+### Algorithm details
 
-This is NP-hard in general, but tractable in practice because:
-1. Most impls have 1-2 anchors (small sets)
-2. Anchor SCCs often overlap (traits and their impls tend to cluster)
-3. A greedy algorithm (pick the anchor that satisfies the most constraints) works well
+#### Step 1: Build graph and condense
 
-The algorithm must reject merges that would make anchor constraints unsatisfiable.
+1. Parse `SymbolGraph` into an index mapping symbol paths to `usize`
+2. Build `DiGraph<(), ()>` with symbols as nodes, dependencies as edges
+3. Run petgraph's `condensation()` → `DiGraph<Vec<usize>, ()>`
+4. Compute `scc_costs[i]` = sum of costs for symbols in SCC i
+5. For each impl, collect anchor SCC indices into `scc_anchors[i]`
 
-### Algorithm
+#### Step 2: Precompute reachable sets (HMR preparation)
 
-1. **Topological sort** the SCC DAG
+We use the Habib-Morvan-Rampon (HMR) algorithm to determine which dependencies are redundant. HMR computes the transitive reduction by tracking **reachable sets** — for each SCC, the set of all SCCs reachable from it (directly or transitively).
 
+**Why reachable sets?** An edge X → Y is redundant iff Y is already reachable through some other dependency of X. By maintaining reachable sets, we can test redundancy in O(1) time.
+
+**Precomputation:** We compute `reachable[scc]` for each SCC by processing in reverse topological order (leaves first, roots last):
+
+```rust
+// Process SCCs from leaves to roots
+for scc in reverse_topo_order {
+    reachable[scc] = {scc};
+    for dep in sorted_dependencies(scc) {  // sorted by topo order
+        if dep ∉ reachable[scc] {
+            reachable[scc] = reachable[scc] ∪ reachable[dep];
+        }
+        // else: dep is redundant (already reachable through another dependency)
+    }
+}
+```
+
+**Example:**
+```
+        B
+        │
+        ↓
+ A ───→ C ───→ D
+ │             ↑
+ └─────────────┘
+```
+
+Processing order: D, C, B, A
+
+| SCC | Dependencies | Reachable set computation | Final reachable |
+|-----|--------------|---------------------------|-----------------|
+| D   | (none)       | {D}                       | {D}             |
+| C   | D            | {C} ∪ reachable[D] = {C,D}| {C,D}           |
+| B   | C            | {B} ∪ reachable[C] = {B,C,D}| {B,C,D}       |
+| A   | C, D (sorted)| {A}, C∉{A}→{A,C,D}, D∈{A,C,D}→skip | {A,C,D} |
+
+For A, the edge A→D is redundant because after processing A→C, D is already in reachable[A].
+
+#### Step 3: Union-find merging with incremental HMR
+
+**Definitions:**
+- **dependents(X)**: SCCs that directly depend on X (have edges pointing to X in the original condensed graph)
+- **effective_dependents(X)**: dependents whose edges to X are not redundant — the minimal dependents under reachability
+
+**Key insight — set-level transitive reduction**: The transitive reduction can change when SCCs merge. Consider:
+
+```
+            B
+            │
+            ↓
+     A ───→ C ───→ D
+     │             ↑
+     └───→ E ──────┘
+```
+
+Initially, there are no redundant edges. But when E merges into A (its only dependent), the merged set {A,E} has edges to both C and D. At the **set level**, {A,E}→D is now redundant because {A,E}→C→D exists.
+
+**Algorithm — incremental HMR:**
+
+1. **Precompute `reachable[scc]`** for each SCC (see Step 2)
 2. **Initialize union-find**: each SCC starts in its own singleton set
+3. **For each set, track**:
+   - `set_sccs`: the SCCs that have been merged into this set
+   - `set_external_deps`: external dependencies (SCCs outside the set)
+   - `set_reachable`: reachable set for this merged set
+4. **Process SCCs in topological order** (dependents before dependencies):
+   - **Terminology**: A "root" is an SCC with no dependents; a "leaf" has no dependencies. Process roots toward leaves.
+   - If **zero dependents**: no-op (SCC is a root)
+   - If **all dependents in same set** (call it S):
+     - **Merge this SCC into S** using union-find
+     - **Update set_external_deps[S]**: add this SCC's external dependencies
+     - **Recompute set_reachable[S]** by applying HMR to set_external_deps[S]:
+       ```
+       set_reachable[S] = set_sccs[S]
+       for dep in set_external_deps[S] sorted by topo order:
+           if dep ∉ set_reachable[S]:
+               keep edge S→dep
+               set_reachable[S] = set_reachable[S] ∪ reachable[dep]
+           else:
+               redundant, remove from set_external_deps[S]
+       ```
+   - If **dependents in different sets**: no-op (SCC is a boundary)
+5. **When checking if an SCC X is a boundary**:
+   - For each dependent set S, check if S→X is in set_external_deps[S] (i.e., not redundant at the set level)
+   - X's **effective dependent sets** are only those where S→X is not redundant
 
-3. **Process SCCs in topological order** (dependents before their dependencies):
+**Worked example** (same graph as above):
 
-   **Terminology**: In this document, a "root" is an SCC with no dependents (nothing depends on it), and a "leaf" is an SCC with no dependencies (it depends on nothing). We process from roots toward leaves.
-   - For each SCC, find all its dependents
-   - If **zero dependents**: no-op (SCC is a root, remains in its own set)
-   - If **all dependents are in the same set**: `union()` this SCC into that set
-   - If **dependents are in different sets**: no-op (SCC is a boundary, remains in its own set)
+Processing order: A, B, E, C, D
 
-4. **Assemble output**: each union-find set becomes a crate, edges unchanged
+| Step | SCC | Dependents | Sets | Action | set_external_deps after |
+|------|-----|------------|------|--------|-------------------------|
+| 1 | A | ∅ | — | root | {A}: {C, E} |
+| 2 | B | ∅ | — | root | {B}: {C} |
+| 3 | E | A | {A} | merge | {A,E}: HMR({C,E,D}) = {C,E}* |
+| 4 | C | A,B | {A,E},{B} | boundary | unchanged |
+| 5 | D | E,C | {A,E},{C} | check set deps | {A,E}→D redundant**, {C}→D not |
 
-**Time complexity**: O(|V| + |E| · α(V)) where α is the inverse Ackermann function. Since α(V) ≤ 4 for any practical V, this is effectively **O(|V| + |E|)**.
+\* HMR on {C,E,D}: sort by topo → C,E,D. reachable={A,E}. C∉{A,E}→keep,reachable={A,E,C,D}. E∈{A,E}→skip (internal). D∈{A,E,C,D}→redundant!
 
-**Important**: To achieve this near-linear time bound, the union-find implementation must use both **path compression** and **union-by-rank** (or union-by-size). See Tarjan & van Leeuwen (1984) for the analysis, or Cormen et al. *Introduction to Algorithms* Chapter 21.
+\*\* At step 5, we check each dependent's set_external_deps. {A,E}'s deps are {C,E}, not D. So {A,E}→D doesn't exist at the set level.
 
-Processing order matters: by going top-down (dependents before their dependencies), we know the final set assignment of all dependents before deciding whether to merge.
+Result: D's only effective dependent set is {C}, so D merges into {C}. Final: **{A,E}, {B}, {C,D}**
 
-### Visualizing Union-Find Merging
+**Time complexity**: O(V × E) for precomputing reachable sets, plus O(E · α(V)) for the merge loop with set reachable updates. Total: O(V × E).
+
+#### Step 4: Fix anchor constraints (global hitting set)
+
+Each impl has an **anchor set**: SCCs containing workspace-local types/traits that can satisfy the orphan rule. The orphan rule requires each impl to end up in the same crate as at least one anchor.
+
+**Why postprocessing works**: An impl always depends on its anchors, so anchor SCCs are processed after the impl's SCC. In most cases, the anchor naturally merges into the impl's set. Violations only occur when an anchor becomes a "boundary" SCC.
+
+**Global hitting set algorithm:**
+
+1. Collect **all** unsatisfied anchor constraints across the entire DAG
+2. Solve a **single global weighted hitting set problem**:
+   - Universe: union-find sets containing at least one anchor
+   - Sets to hit: each unsatisfied constraint becomes a set of union-find sets
+   - Weight: total profiled compilation cost of each union-find set
+   - Goal: find minimum-weight collection satisfying all constraints
+3. Perform merges using the union-find structure
+
+**Why global optimization**: A per-set greedy approach can miss sharing opportunities. If sets S1 and S2 both accept anchor X, global optimization merges once instead of twice.
+
+**Complexity**: NP-hard in general, but tractable here because most impls have 1-2 anchors and most constraints are satisfied naturally.
+
+**Known issue — anchor constraints can create cycles:** The current algorithm (dependent-based merging followed by anchor constraint merging) can produce cyclic partition dependencies. Consider:
+
+```
+        B
+        │
+        ↓
+  A ───→ C ───→ D
+  │             ↑
+  └── impl_D ───┘ (anchor: D)
+```
+
+Where A depends on C and impl_D, B depends on C, C depends on D, and impl_D depends on D with anchor constraint to D.
+
+During dependent-based merging, impl_D merges into A's set (its only dependent). Then C and D become boundaries. During anchor constraint merging, D must join impl_D's set (now {A, impl_D}), producing:
+
+- {A, impl_D, D}
+- {B}
+- {C}
+
+This creates a cycle: {A, impl_D, D} → {C} (A depends on C) and {C} → {A, impl_D, D} (C depends on D).
+
+The expected result is {A}, {B}, {C, D, impl_D} — three crates forming a valid DAG. The solution likely involves either:
+1. Performing anchor merging before dependent-based merging
+2. Constraining dependent-based merging to not merge impls into non-anchor sets
+3. Some integrated approach
+
+This remains an open problem. See `test_anchor_constraints_can_create_partition_cycles` in `scc.rs` for a minimal reproducer.
+
+#### Step 5: Build output SymbolGraph
+
+1. **Group symbols by union-find set**: Each set becomes a new crate
+2. **Detect conflicts**: Multiple symbols with same (module_path, name) from different original crates
+3. **Assign final paths**:
+   - Non-conflicting: original module path
+   - Conflicting: module path + `conflict_from_{original_crate}`
+4. **Compute visibility**: Cross-crate edges → target must be `pub`
+5. **Generate crate names**: Deterministic placeholder `{original-crate}-{id}`
+6. **Build nested module trees** and serialize to `optimized_symbol_graph.json`
+
+#### Conflict detection and resolution
+
+When symbols from different original crates are merged into a single new crate, name conflicts can occur. Here's a worked example:
+
+**Input state:**
+```
+symbol_graph.json:
+  crate_a:
+    foo/bar.rs: fn x(), fn y()
+  crate_b:
+    foo/bar.rs: fn x(), fn z()
+
+After union-find merging:
+  crate_001: [SCC containing all of the above]
+```
+
+**Conflict detection:**
+```
+(["foo", "bar"], "x") -> [crate_a::x, crate_b::x]  // CONFLICT
+(["foo", "bar"], "y") -> [crate_a::y]              // ok
+(["foo", "bar"], "z") -> [crate_b::z]              // ok
+```
+
+**Final placements:**
+```
+x from crate_a -> ["foo", "bar", "conflict_from_crate_a"]
+x from crate_b -> ["foo", "bar", "conflict_from_crate_b"]
+y from crate_a -> ["foo", "bar"]
+z from crate_b -> ["foo", "bar"]
+```
+
+**Output module tree:**
+```
+lib
+└── foo
+    └── bar
+        ├── symbols: [y, z]
+        └── submodules:
+            ├── conflict_from_crate_a
+            │   └── symbols: [x]
+            └── conflict_from_crate_b
+                └── symbols: [x]
+```
+
+This approach preserves all symbols while avoiding name collisions. The `conflict_from_*` modules make it clear where each conflicting symbol originated.
+
+### Visualizing union-find merging
 
 Consider this dependency graph where each letter represents an SCC (arrows point from dependent to dependency):
 
@@ -718,8 +634,6 @@ Now consider a graph where C has multiple dependents in different sets:
     B
 ```
 
-Processing top-down: A, B, C, D
-
 | Step | SCC | Dependents | Their sets | Action | Sets after |
 |------|-----|------------|------------|--------|------------|
 | 1 | A | none | — | no-op (root) | {A}, {B}, {C}, {D} |
@@ -727,9 +641,7 @@ Processing top-down: A, B, C, D
 | 3 | C | A, B | {A}, {B} | no-op (boundary) | {A}, {B}, {C}, {D} |
 | 4 | D | C | {C} | union into {C} | {A}, {B}, {C,D} |
 
-Result: **Three crates: {A}, {B}, {C, D}**
-
-This allows `{A}` and `{B}` to compile in parallel after `{C, D}` finishes.
+Result: **Three crates: {A}, {B}, {C, D}** — allows parallel compilation.
 
 Now consider a diamond pattern:
 
@@ -782,499 +694,75 @@ Result: **Three crates: {A, B, C}, {D}, {E}**
 
 Here D remains separate because its dependents are in different sets. This preserves parallelism: `{A,B,C}` and `{E}` can compile in parallel after `{D}` finishes.
 
-### Implementation workflow
+Now consider a graph with a redundant dependency edge:
 
-This phase has the strongest formal requirements. Follow these steps in order:
-
-#### Step 3.1: Lean formalization
-
-Define union-find merging and prove the four properties.
-
-**Note on existing union-find formalizations**: The [Isabelle Archive of Formal Proofs](https://www.isa-afp.org/) contains a verified union-find implementation: [Relational Disjoint-Set Forests](https://www.isa-afp.org/entries/Relational_Disjoint_Set_Forests.html) by Walter Guttmann (2020), which includes proofs for path compression, path halving, path splitting, and union-by-rank. While this is in Isabelle rather than Lean, the proof structure and lemmas may be adaptable. As of 2025, there is no standard union-find formalization in Mathlib.
-
-**Definitions:**
-
-```lean
--- Dependents of a node (nodes that have edges TO this node)
-def Graph.dependents (G : Graph α) (x : α) : Set α :=
-  {y | (y, x) ∈ G.edges}
-
--- Union-find state: maps each node to its representative (root of its set)
--- In the algorithm, we build this incrementally; here we define the final result
-structure UnionFind (α : Type*) where
-  find : α → α
-  -- find is idempotent: find(find(x)) = find(x)
-  find_idempotent : ∀ x, find (find x) = find x
-
--- Two nodes are in the same set if they have the same representative
-def UnionFind.sameSet (uf : UnionFind α) (x y : α) : Prop :=
-  uf.find x = uf.find y
-
--- All dependents of x are in the same set
-def allDependentsSameSet (G : Graph α) (uf : UnionFind α) (x : α) : Prop :=
-  ∀ y z, y ∈ G.dependents x → z ∈ G.dependents x → uf.sameSet y z
-
--- The merge operation: if all dependents are in the same set, merge x into that set
--- This is the core of the algorithm, applied top-down (dependents before dependencies)
-def mergeStep (G : Graph α) (uf : UnionFind α) (x : α) : UnionFind α :=
-  if h : (G.dependents x).Nonempty ∧ allDependentsSameSet G uf x then
-    -- Merge x into the set containing its dependents
-    let representative := uf.find (G.dependents x).toFinset.min' h.1.toFinset
-    { find := fun y => if y = x then representative else uf.find y
-      find_idempotent := sorry }
-  else
-    uf  -- x stays in its own set (either no dependents, or dependents in different sets)
-
--- The full algorithm: fold mergeStep over nodes top-down (dependents before dependencies)
--- Starting from the identity union-find (each node is its own representative)
-noncomputable def unionFindMerge (G : Graph α) [Fintype α] (hdag : G.Acyclic)
-    (topoOrder : List α) : UnionFind α :=
-  topoOrder.foldl (mergeStep G) { find := id, find_idempotent := fun _ => rfl }
-
--- The partitioning induced by union-find: nodes with the same representative are in the same crate
-def ufToPartitioning (uf : UnionFind α) [Fintype α] : Partitioning α :=
-  -- Map representatives to crate numbers (implementation detail)
-  sorry
-
--- All crates in a partitioning
-def allCrates (P : Partitioning α) : Set ℕ :=
-  {c | ∃ x, P.assignment x = c}
-
--- Crate c1 depends on crate c2
-def dependsOn (G : Graph α) (P : Partitioning α) (c1 c2 : ℕ) : Prop :=
-  ∃ x y, P.assignment x = c1 ∧ P.assignment y = c2 ∧ (x, y) ∈ G.edges ∧ c1 ≠ c2
-
--- Critical path cost (cost of crate plus max cost of dependency chains)
-noncomputable def criticalPathCost (G : Graph α) (P : Partitioning α)
-    (cost : ℕ → ℕ) (crate : ℕ) : ℕ :=
-  let deps := {c | dependsOn G P crate c}
-  let maxDepCost := Finset.sup deps (criticalPathCost G P cost)
-  maxDepCost + cost crate
+```
+        B
+        │
+        ↓
+ A ───→ C ───→ D
+ │             ↑
+ └─────────────┘
 ```
 
-**Theorems to prove:**
+Here A depends on both C and D directly, but C also depends on D. The A→D edge is redundant from a parallelism perspective: A cannot compile until C is built, and C cannot compile until D is built.
 
-```lean
--- Key lemma: merging preserves acyclicity
--- If x merges into a set S, then x has no path to any node in S (since we process top-down)
-lemma merge_preserves_acyclicity (G : Graph α) [Fintype α] (hdag : G.Acyclic)
-    (uf : UnionFind α) (x : α) (hvalid : ValidPartitioning G (ufToPartitioning uf)) :
-    ValidPartitioning G (ufToPartitioning (mergeStep G uf x)) := by
-  sorry -- TO PROVE
+Without effective dependents (treating all dependents equally):
 
--- Theorem 1: Acyclicity
-theorem union_find_merge_acyclic (G : Graph α) [Fintype α]
-    (hdag : G.Acyclic) (topoOrder : List α) (htopo : IsTopoOrder G topoOrder) :
-    ValidPartitioning G (ufToPartitioning (unionFindMerge G hdag topoOrder)) := by
-  sorry -- TO PROVE (by induction on topoOrder using merge_preserves_acyclicity)
+| Step | SCC | Dependents | Their sets | Action | Sets after |
+|------|-----|------------|------------|--------|------------|
+| 1 | A | none | — | no-op (root) | {A}, {B}, {C}, {D} |
+| 2 | B | none | — | no-op (root) | {A}, {B}, {C}, {D} |
+| 3 | C | A, B | {A}, {B} | no-op (boundary) | {A}, {B}, {C}, {D} |
+| 4 | D | A, C | {A}, {C} | no-op (boundary) | {A}, {B}, {C}, {D} |
 
--- Theorem 2: Optimality (max critical path cost is minimized)
--- Note: merging x when all dependents are in set S doesn't increase critical path,
--- because x must be compiled before anything in S anyway
-theorem union_find_merge_optimal (G : Graph α) [Fintype α]
-    (hdag : G.Acyclic) (topoOrder : List α) (htopo : IsTopoOrder G topoOrder)
-    (cost : α → ℕ) :
-    ∀ P : Partitioning α, ValidPartitioning G P →
-      let ufPartition := ufToPartitioning (unionFindMerge G hdag topoOrder)
-      let rootCrates P := {c ∈ allCrates P | ∀ c', c' ∈ allCrates P → ¬dependsOn G P c' c}
-      let maxCost P := Finset.sup (rootCrates P) (criticalPathCost G P cost)
-      maxCost ufPartition ≤ maxCost P := by
-  sorry -- TO PROVE
+Result: **Four crates: {A}, {B}, {C}, {D}** — suboptimal, D is unnecessarily separate.
 
--- Theorem 3: Coverage (every node ends up in exactly one set)
-theorem union_find_merge_coverage (G : Graph α) [Fintype α]
-    (hdag : G.Acyclic) (topoOrder : List α) (htopo : IsTopoOrder G topoOrder) :
-    ∀ x ∈ G.nodes, ∃! c, (ufToPartitioning (unionFindMerge G hdag topoOrder)).assignment x = c := by
-  sorry -- TO PROVE (follows from union-find properties)
+With effective dependents:
 
--- Theorem 4: Edge Preservation
-theorem union_find_merge_edge_preservation (G : Graph α) [Fintype α]
-    (hdag : G.Acyclic) (topoOrder : List α) (htopo : IsTopoOrder G topoOrder) :
-    let P := ufToPartitioning (unionFindMerge G hdag topoOrder)
-    ∀ x y, (x, y) ∈ G.edges →
-      (P.assignment x = P.assignment y ∨
-       (P.assignment x, P.assignment y) ∈ (inducedCrateGraph G P).edges) := by
-  sorry -- TO PROVE
-```
+At step 4, D's direct dependents are {A, C}. Since A →* C (A transitively depends on C), A is dominated by C. So effective_dependents(D) = {C}.
 
-**Lean tasks:**
-- [ ] Define `UnionFind`, `sameSet`, `allDependentsSameSet`
-- [ ] Define `mergeStep`, `unionFindMerge`
-- [ ] Define `ufToPartitioning`
-- [ ] Define `allCrates`, `dependsOn`, `criticalPathCost`
-- [ ] Prove `merge_preserves_acyclicity` (key lemma)
-- [ ] Prove `union_find_merge_acyclic`
-- [ ] Prove `union_find_merge_optimal`
-- [ ] Prove `union_find_merge_coverage`
-- [ ] Prove `union_find_merge_edge_preservation`
-- [ ] Eliminate all `sorry`s
-- [ ] Document proof strategies
+| Step | SCC | Effective Dependents | Their sets | Action | Sets after |
+|------|-----|----------------------|------------|--------|------------|
+| 1 | A | none | — | no-op (root) | {A}, {B}, {C}, {D} |
+| 2 | B | none | — | no-op (root) | {A}, {B}, {C}, {D} |
+| 3 | C | A, B | {A}, {B} | no-op (boundary) | {A}, {B}, {C}, {D} |
+| 4 | D | C | {C} | union into {C} | {A}, {B}, {C,D} |
 
-#### Step 3.2: Creusot annotations
+Result: **Three crates: {A}, {B}, {C, D}** — optimal.
 
-Add contracts to Rust stub functions.
+### Crate naming
 
-**Note**: The contracts below are illustrative pseudo-code showing the *intent* of each specification. See the note in Step 2.2 regarding actual Creusot syntax.
+Phase 2 generates **stable placeholder names** using a deterministic algorithm: `{original-crate}-{top-module}` or `{original-crate}-{id}`. For more meaningful names, use the separate `tarjanize rename` command which uses an LLM.
 
-```rust
-use creusot_contracts::*;
+### Implementation tasks
 
-// Main algorithm entry point
-// Acyclicity
-#[requires(condensed_graph.is_dag())]
-#[ensures(result.is_dag())]
-// Optimality: max critical path cost of root crates is no worse than any valid partitioning
-#[ensures(result.max_root_critical_path_cost() <= condensed_graph.max_root_critical_path_cost())]
-// Coverage: every input SCC appears in exactly one output crate
-#[ensures(forall<scc: SccId> condensed_graph.contains_scc(scc) ==>
-          exists_unique<crate_id: CrateId> result.crate_contains_scc(crate_id, scc))]
-// Edge Preservation: all input edges are preserved
-#[ensures(result.edges == condensed_graph.edges)]
-pub fn compute_union_find_merge(
-    condensed_graph: &CondensedGraph
-) -> CondensedGraph {
-    unimplemented!()  // Stub for annotation
-}
-
-// Returns the set of SCCs that depend on this SCC (have edges pointing to it)
-#[ensures(forall<other: SccId>
-    result.contains(other) <==> condensed_graph.has_edge(other, scc_id))]
-fn dependents(condensed_graph: &CondensedGraph, scc_id: SccId) -> Set<SccId> {
-    unimplemented!()
-}
-
-// Returns true if all dependents of this SCC are in the same union-find set
-#[ensures(result <==> forall<a: SccId, b: SccId>
-    dependents(condensed_graph, scc_id).contains(a) &&
-    dependents(condensed_graph, scc_id).contains(b) ==>
-    uf.find(a) == uf.find(b))]
-fn all_dependents_same_set(
-    condensed_graph: &CondensedGraph,
-    uf: &UnionFind,
-    scc_id: SccId
-) -> bool {
-    unimplemented!()
-}
-
-// Perform one merge step: if all dependents are in the same set, merge this SCC into that set
-#[requires(uf.is_valid())]
-#[ensures(result.is_valid())]
-// If merged, the SCC now has the same representative as its dependents
-#[ensures(all_dependents_same_set(condensed_graph, uf, scc_id) &&
-          !dependents(condensed_graph, scc_id).is_empty() ==>
-          result.find(scc_id) == uf.find(dependents(condensed_graph, scc_id).any()))]
-// If not merged, the SCC keeps its own representative
-#[ensures(!all_dependents_same_set(condensed_graph, uf, scc_id) ||
-          dependents(condensed_graph, scc_id).is_empty() ==>
-          result.find(scc_id) == uf.find(scc_id))]
-fn merge_step(
-    condensed_graph: &CondensedGraph,
-    uf: UnionFind,
-    scc_id: SccId
-) -> UnionFind {
-    unimplemented!()
-}
-
-// Critical path cost: cost of crate plus max critical path cost of dependencies
-#[ensures(result == condensed_graph.crate_cost(crate_id) +
-          condensed_graph.dependencies(crate_id).iter()
-            .map(|dep| critical_path_cost(condensed_graph, *dep))
-            .max().unwrap_or(0))]
-fn critical_path_cost(condensed_graph: &CondensedGraph, crate_id: CrateId) -> usize {
-    unimplemented!()
-}
-```
-
-**Creusot annotation tasks:**
-- [ ] Add contracts to `compute_union_find_merge`
-- [ ] Add contracts to `dependents`
-- [ ] Add contracts to `all_dependents_same_set`
-- [ ] Add contracts to `merge_step`
-- [ ] Add contracts to `critical_path_cost`
-
-#### Step 3.3: Rust implementation
-
-Implement the annotated functions:
-
-- [ ] Implement `UnionFind` with path compression and union-by-rank
-- [ ] Implement `topological_sort` for the SCC DAG
-- [ ] Implement `dependents` (precompute as adjacency list for O(1) lookup per edge)
-- [ ] Implement `all_dependents_same_set` (iterate dependents, check `find()` equality)
-- [ ] Implement `merge_step` (conditionally call `union()`)
-- [ ] Implement `compute_union_find_merge` (fold top-down from roots to leaves)
-- [ ] Implement `critical_path_cost` for verification
-- [ ] Serialize output to `optimized_condensed_graph.json`
-
-#### Step 3.4: Creusot verification
-
-- [ ] Run Creusot to verify implementation
-- [ ] Test: output is always acyclic
-- [ ] Test: coverage — every input SCC appears in exactly one output crate
-- [ ] Test: edge preservation — all input edges are preserved in output
-- [ ] Test: optimality — no valid partitioning has lower max critical path cost (verified exhaustively for small graphs)
-- [ ] Test: diamond pattern produces single crate (regression test for the union-find improvement)
-
-**Note**: The optimality property (universal quantifier over all partitionings) may not verify in Creusot due to SMT solver limitations — that's acceptable since we proved it in Lean.
-
-## Phase 4: Generate Reorganized Symbol Graph
-
-**Input**: `symbol_graph.json`, `optimized_condensed_graph.json`
-**Output**: `optimized_symbol_graph.json`
-
-This phase transforms the optimized partitioning into a complete symbol graph with the new crate/module structure. The output uses the same schema as `symbol_graph.json`, enabling apples-to-apples comparison with the original.
-
-### Formal Properties
-
-| Property | Description |
-|----------|-------------|
-| **Soundness** | Every symbol in the output is referenced by some SCC in the condensed graph |
-| **Completeness** | Every symbol referenced by an SCC in the condensed graph appears exactly once in the output |
-| **Edge Preservation** | All edges from the input are preserved unchanged |
-| **Path Preservation** | Non-conflicting symbols retain their original module path; conflicting symbols have a single synthetic ancestor inserted |
-| **File Preservation** | Each symbol retains its original file path |
-| **Visibility** | Each symbol is visible to all symbols that reference it |
-
-### Algorithm
-
-1. **Build symbol index** from original graph
-   - Map path → (Symbol, original_crate, module_path)
-
-2. **Build crate assignment** from condensed graph
-   - Map path → new crate ID (needed for visibility computation)
-
-3. **Compute visibility** by examining edges
-   - Cross-crate reference → target must be `pub`
-   - Cross-module reference (same crate) → target must be `pub(crate)`
-   - **Note**: Visibility is only *widened*, never narrowed. If two crates merge and a `pub` symbol could become `pub(crate)`, we leave it as `pub` for backwards compatibility with any external consumers.
-
-4. **For each new crate**, build its module tree:
-   - Collect symbols by flattening SCCs → paths → lookup in symbol index
-   - Detect conflicts: multiple symbols with same (module_path, name) from different original crates
-   - Assign final paths:
-     - Non-conflicting: original module path
-     - Conflicting: module path + `conflict_from_{original_crate}`
-   - Update visibility for symbols that need widening
-   - Build nested module tree from (symbol, path) pairs
-
-5. **Generate crate names** from original crate names and module paths (LLM or fallback)
-
-6. **Assemble output**: new crates with generated names, edges unchanged
-
-**Time complexity**: O(|V| + |E|) where V is symbols and E is edges — each step is linear.
-
-### Crate Naming
-
-Phase 4 generates **stable placeholder names** using a deterministic fallback algorithm: `{original-crate}-{top-module}` or `{original-crate}-{id}`. This ensures reproducible outputs across runs.
-
-For more meaningful names, use the separate `tarjanize rename` command, which uses an LLM to suggest names based on crate contents:
-
-```bash
-# Generate optimized graph with placeholder names
-tarjanize reify symbol_graph.json optimized_condensed_graph.json -o optimized_symbol_graph.json
-
-# Optionally rename crates using LLM suggestions
-tarjanize rename optimized_symbol_graph.json -o renamed_symbol_graph.json
-```
-
-**LLM prompt structure** (for the `rename` command):
-```
-You are naming new Rust crates created by splitting/merging existing crates.
-
-For each crate below, suggest a name that:
-- Uses lowercase kebab-case (e.g., "nexus-db-silo")
-- Is concise (2-4 words)
-- Reflects the common theme of the contained modules
-- Uses the original crate name as a prefix when appropriate
-
-Use the submit_crate_names tool to provide your suggestions.
-
-## crate_001
-Original crates: nexus-db-queries
-Module paths: silo, silo::helpers, silo::config
-
-## crate_002
-Original crates: nexus-db-queries, nexus-auth
-Module paths: authz, authz::policy
-```
-
-**Tool schema** for structured output:
-```json
-{
-  "name": "submit_crate_names",
-  "description": "Submit the suggested names for each crate",
-  "input_schema": {
-    "type": "object",
-    "properties": {
-      "names": {
-        "type": "object",
-        "additionalProperties": { "type": "string" },
-        "description": "Map from crate ID to suggested name"
-      }
-    },
-    "required": ["names"]
-  }
-}
-```
-
-### Visualization
-
-**Input state:**
-```
-symbol_graph.json:
-  crate_a:
-    foo/bar.rs: fn x(), fn y()
-  crate_b:
-    foo/bar.rs: fn x(), fn z()
-
-optimized_condensed_graph.json:
-  crate_001: [SCC containing all of the above]
-```
-
-**Conflict detection:**
-```
-(["foo", "bar"], "x") -> [crate_a::x, crate_b::x]  // CONFLICT
-(["foo", "bar"], "y") -> [crate_a::y]              // ok
-(["foo", "bar"], "z") -> [crate_b::z]              // ok
-```
-
-**Final placements:**
-```
-x from crate_a -> ["foo", "bar", "conflict_from_crate_a"]
-x from crate_b -> ["foo", "bar", "conflict_from_crate_b"]
-y from crate_a -> ["foo", "bar"]
-z from crate_b -> ["foo", "bar"]
-```
-
-**Output module tree:**
-```
-lib
-└── foo
-    └── bar
-        ├── symbols: [y, z]
-        └── submodules:
-            ├── conflict_from_crate_a
-            │   └── symbols: [x]
-            └── conflict_from_crate_b
-                └── symbols: [x]
-```
-
-### Implementation Workflow
-
-#### Step 4.1: Lean Formalization
-
-```lean
--- Symbol placement: a symbol and its final module path
-structure SymbolPlacement (α : Type*) where
-  symbol : α
-  path : List String
-
--- A module tree
-inductive ModuleTree (α : Type*) where
-  | node : String → List α → List (ModuleTree α) → ModuleTree α
-
--- All symbols in a module tree
-def ModuleTree.allSymbols : ModuleTree α → List α
-  | .node _ syms children => syms ++ children.flatMap ModuleTree.allSymbols
-
--- Build module tree from placements (specification)
-def buildModuleTree (placements : List (SymbolPlacement α)) : ModuleTree α := sorry
-
--- Theorem 1: Soundness - every symbol in output came from placements
--- Theorem 2: Completeness - every placement appears exactly once in output
--- (Combined: output symbols = input symbols as sets, with no duplicates)
-theorem build_module_tree_soundness_completeness (placements : List (SymbolPlacement α)) :
-    (buildModuleTree placements).allSymbols.toFinset =
-    (placements.map (·.symbol)).toFinset := by
-  sorry
-
-theorem build_module_tree_no_duplication (placements : List (SymbolPlacement α)) :
-    (buildModuleTree placements).allSymbols.Nodup := by
-  sorry
-```
-
-**Lean tasks:**
-- [ ] Define `SymbolPlacement`, `ModuleTree`
-- [ ] Define `buildModuleTree`
-- [ ] Prove `build_module_tree_soundness_completeness`
-- [ ] Prove `build_module_tree_no_duplication`
-
-#### Step 4.2: Creusot Annotations
-
-```rust
-use creusot_contracts::*;
-
-// Soundness: output symbols ⊆ input placements
-// Completeness: input placements ⊆ output symbols (each exactly once)
-#[requires(forall<p: &SymbolPlacement> placements.contains(p) ==>
-           symbol_graph.contains(p.symbol.id))]
-#[ensures(forall<id: SymbolPath>
-    placements.iter().any(|p| p.symbol.id == id) <==>
-    result.contains_symbol(id))]
-#[ensures(result.symbol_count() == placements.len())]
-pub fn build_module_tree(placements: &[SymbolPlacement]) -> Module {
-    unimplemented!()
-}
-
-// Soundness: every output symbol is referenced by some SCC
-// Completeness: every SCC-referenced SymbolPath appears exactly once in output
-// Visibility: symbols with cross-crate edges targeting them are pub
-#[requires(symbol_graph.is_valid())]
-#[requires(condensed_graph.is_valid())]
-#[ensures(forall<def_id: SymbolPath>
-    condensed_graph.contains_def_id(def_id) <==>
-    result.contains_symbol(def_id))]
-#[ensures(result.edges == symbol_graph.edges)]
-#[ensures(forall<edge: &Edge> symbol_graph.edges.contains(edge) ==>
-    (result.crate_of(edge.from) != result.crate_of(edge.to)) ==>
-    result.symbol(edge.to).visibility == "pub")]
-pub fn generate_optimized_symbol_graph(
-    symbol_graph: &SymbolGraph,
-    condensed_graph: &CondensedGraph,
-) -> SymbolGraph {
-    unimplemented!()
-}
-```
-
-**Creusot tasks:**
-- [ ] Add contracts to `build_module_tree`
-- [ ] Add contracts to `generate_optimized_symbol_graph`
-- [ ] Add contracts to conflict detection helpers
-
-#### Step 4.3: Rust Implementation
-
-- [ ] Implement `traverse_modules` iterator
-- [ ] Implement symbol index construction
-- [ ] Implement symbol-to-new-crate mapping
-- [ ] Implement visibility computation (widen to pub for cross-crate edge targets)
-- [ ] Implement conflict detection
-- [ ] Implement `build_module_tree` using trie approach
-- [ ] Implement `sanitize_crate_name`
-- [ ] Implement `generate_crate_names_fallback` (deterministic placeholder names)
-- [ ] Implement `deduplicate_names`
+- [x] Implement symbol graph parsing and index construction
+- [x] Implement condensation using petgraph
+- [ ] Implement transitive reduction using `petgraph::algo::tred`
+- [ ] Build reverse adjacency list for effective dependents lookup
+- [ ] Implement union-find merge loop using effective dependents
+- [ ] Implement anchor constraint collection
+- [ ] Implement global hitting set solver (greedy heuristic)
+- [ ] Implement conflict detection for merged crates
+- [ ] Implement visibility computation
+- [ ] Implement module tree construction
+- [ ] Implement crate name generation
 - [ ] Serialize output to `optimized_symbol_graph.json`
+- [ ] Add debug/trace logging at key points
 
-#### Step 4.4: Creusot Verification
-
-- [ ] Run Creusot to verify implementation
-- [ ] Test soundness: every output symbol is referenced by some SCC
-- [ ] Test completeness: every SCC-referenced symbol appears exactly once in output
-- [ ] Test edge preservation: output edges equal input edges
-- [ ] Test path preservation: non-conflicting symbols retain original paths
-- [ ] Test file preservation: each symbol retains its original file path
-- [ ] Test visibility: each symbol is visible to all symbols that reference it
-
-#### Step 4.5: Rename command (optional LLM naming)
+### Rename command (optional LLM naming)
 
 - [ ] Implement `tarjanize rename` subcommand
-- [ ] Implement `generate_crate_names_llm` with Anthropic API
+- [ ] Implement LLM-based crate naming with Anthropic API
 - [ ] Load existing symbol graph, apply new names, write output
 
-## Phase 5: Generate Report
+## Phase 3: Generate Report
 
 **Input**: `symbol_graph.json`, `optimized_symbol_graph.json` (or `renamed_symbol_graph.json` if rename was used)
 **Output**: `report.md`
 
-The report is a human-readable Markdown summary of the optimization results. Phase 5 uses whatever crate names are present in its input file—placeholder names from Phase 4, or LLM-suggested names from the optional rename step. It is designed for understanding and communicating the benefits of the proposed split, not for driving automated implementation.
+The report is a human-readable Markdown summary of the optimization results. Phase 3 uses whatever crate names are present in its input file—placeholder names from Phase 2, or LLM-suggested names from the optional rename step. It is designed for understanding and communicating the benefits of the proposed split, not for driving automated implementation.
 
 ### Report contents
 
@@ -1309,52 +797,6 @@ omicron-nexus ────────────→ omicron-nexus
 - [ ] Write to `report.md`
 
 This phase is intentionally simple. The complex work of computing actual code changes (visibility upgrades, import updates, etc.) is deferred to the implementation tool described in Future Work.
-
-## Verification Approach
-
-This project uses **Lean 4** for proving the algorithm correct and **Creusot** for verifying the Rust implementation. Phases 2-4 have formal properties with both Lean proofs and Creusot verification. Phase 5 is a simple report generator without formal verification.
-
-### Why both Lean and Creusot?
-
-| Aspect | Lean 4 | Creusot |
-|--------|--------|---------|
-| **Proof method** | Constructive proofs checked by type theory | SMT solvers search for counterexamples |
-| **Generality** | Truly universal ("for ALL splits...") | May timeout on complex quantifiers |
-| **Failure mode** | Proof fails → you know something is wrong and *why* | Verification fails → bug? solver not smart enough? needs hints? |
-| **What it verifies** | Abstract algorithm design | Specific Rust implementation |
-
-**Why we need Lean (not just Creusot):**
-
-1. **Optimality is hard for SMT**: The property "no alternative partitioning has lower build time" is a universal quantifier over all possible partitionings. SMT solvers struggle with unbounded universal quantification; Lean proves it constructively.
-
-2. **Design vs. implementation**: Lean proves the *algorithm design* is correct. Creusot verifies the *implementation* matches some spec. If we skip Lean, we might correctly implement a flawed algorithm.
-
-3. **Understanding**: Writing Lean proofs forces us to understand *why* the algorithm works. This knowledge helps debug issues later.
-
-**Why we need Creusot (not just Lean):**
-
-1. **Specification gap**: Lean proves properties of abstract definitions, not our actual Rust code. Creusot bridges this gap.
-
-2. **Implementation bugs**: Even with a correct algorithm, we might implement it wrong. Creusot catches these.
-
-3. **Refactoring confidence**: As we optimize the Rust code, Creusot re-verifies correctness.
-
-**Confidence comparison:**
-
-| Phase | Property | Lean | Creusot |
-|-------|----------|------|---------|
-| 2 | Acyclicity | ✅ | ✅ |
-| 2 | Coverage | ✅ | ✅ |
-| 2 | Connectedness | ✅ | ✅ |
-| 2 | Maximality | ✅ | ✅ |
-| 3 | Acyclicity | ✅ | ✅ |
-| 3 | Optimality | ✅ | ❌ (universal quantifier) |
-| 3 | Coverage | ✅ | ✅ |
-| 3 | Edge Preservation | ✅ | ✅ |
-| 4 | Coverage | ✅ | ✅ |
-| 4 | Edge Preservation | ✅ | ✅ |
-
-The only property that cannot be verified in Creusot is Phase 3's Optimality (universal quantifier over all partitionings).
 
 ## Alternatives Considered
 
@@ -1417,7 +859,7 @@ These are out of scope for the initial implementation but would be valuable addi
    - Distinguishing between debug and release builds (LLVM optimization dominates release)
    - Empirical calibration by measuring actual compile times on sample crates
 
-   Note: The cost model only affects the *reported* improvement (Phase 5), not the partitioning algorithm itself—union-find merging is purely structural.
+   Note: The cost model only affects the *reported* improvement (Phase 3), not the partitioning algorithm itself—union-find merging is purely structural.
 
 2. **Implementation tool**: A tool that takes `symbol_graph.json` and `optimized_symbol_graph.json` as inputs and generates incremental PRs to transform the workspace from the original to the optimized structure. This is a complex undertaking that requires careful design:
    - **Diff computation**: Compare the two symbol graphs to determine which symbols moved between crates
@@ -1438,11 +880,10 @@ These are out of scope for the initial implementation but would be valuable addi
 - [GitHub Issue: Thoughts on improving omicron-nexus build times](https://github.com/oxidecomputer/omicron/issues/8015)
 - [rust-analyzer architecture](https://rust-analyzer.github.io/blog/2020/10/24/introducing-ungrammar.html)
 - [petgraph documentation](https://docs.rs/petgraph/latest/petgraph/)
-- [Lean 4 documentation](https://lean-lang.org/documentation/)
-- [Creusot verification tool](https://github.com/creusot-rs/creusot) — see the [guide](https://creusot-rs.github.io/creusot/) for contract syntax and [pearlite](https://creusot-rs.github.io/creusot/pearlite/) for the specification language
+- [petgraph tred module](https://docs.rs/petgraph/latest/petgraph/algo/tred/) — transitive reduction and closure algorithms
 - [MATLAB: Graph condensation](https://www.mathworks.com/help/matlab/ref/digraph.condensation.html) — defines "condensation" as the DAG of SCCs
 - [NetworkX: condensation](https://networkx.org/documentation/stable/reference/algorithms/generated/networkx.algorithms.components.condensation.html)
 - [CP-Algorithms: Strongly Connected Components](https://cp-algorithms.com/graph/strongly-connected-components.html)
+- [Wikipedia: Transitive reduction](https://en.wikipedia.org/wiki/Transitive_reduction) — the minimum equivalent graph preserving reachability
 - Tarjan, R. E., & van Leeuwen, J. (1984). "Worst-case analysis of set union algorithms." *Journal of the ACM*, 31(2), 245-281. — proves O(m·α(n)) bound for union-find with path compression and union-by-rank
 - Cormen, T. H., et al. *Introduction to Algorithms*, Chapter 21: "Data Structures for Disjoint Sets" — textbook treatment of union-find
-- [Isabelle AFP: Relational Disjoint-Set Forests](https://www.isa-afp.org/entries/Relational_Disjoint_Set_Forests.html) — verified union-find with path compression and union-by-rank in Isabelle/HOL

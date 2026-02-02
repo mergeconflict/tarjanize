@@ -1,23 +1,24 @@
-//! Graph condensation for dependency analysis.
+//! Graph condensation and partitioning for dependency analysis.
 //!
 //! This crate computes strongly connected components (SCCs) from a symbol
-//! graph and produces a condensed DAG. This is Phase 2 of the tarjanize
+//! graph, merges them into optimal crate groupings using union-find, and
+//! produces an optimized `SymbolGraph`. This is Phase 2 of the tarjanize
 //! pipeline.
 //!
 //! ## Algorithm
 //!
 //! 1. Build a directed graph with symbols as nodes, dependencies as edges
-//! 2. Run petgraph's `condensation` to find SCCs and build the condensed DAG
-//! 3. Collect impl anchors for orphan rule enforcement in Phase 3
+//! 2. Run petgraph's `condensation` to find SCCs
+//! 3. Use union-find to merge SCCs into optimal crate groupings
+//! 4. Fix anchor constraints (orphan rule) via global hitting set
+//! 5. Build output `SymbolGraph` with new crate structure
 //!
 //! ## Orphan Rule
 //!
 //! Rust's orphan rule requires trait impls to be in the same crate as either
-//! the trait or the self type. Rather than forcing impls and their anchors
-//! into the same SCC (which would reduce Phase 3's flexibility), we track
-//! impl anchors separately. Each SCC's `anchor_sets` field lists the SCCs containing
-//! its impl blocks' types and traits. Phase 3 uses this to ensure valid crate
-//! groupings.
+//! the trait or the self type. After union-find merging, some impl blocks may
+//! end up in crates without any of their anchors. The hitting set algorithm
+//! finds minimal merges to satisfy all anchor constraints.
 //!
 //! ## Usage
 //!
@@ -28,10 +29,6 @@
 //! let mut output = Vec::new();
 //! run(input, &mut output).unwrap();
 //! ```
-//!
-//! ## Re-exports
-//!
-//! This crate re-exports types from `tarjanize_schemas` for convenience.
 
 mod error;
 mod scc;
@@ -39,20 +36,17 @@ mod scc;
 use std::io::{Read, Write};
 
 use tarjanize_schemas::SymbolGraph;
-// Re-export schema types for convenience.
-#[doc(inline)]
-pub use tarjanize_schemas::{AnchorSet, CondensedGraph, Scc};
 use tracing::debug_span;
 
 #[doc(inline)]
 pub use crate::error::CondenseError;
 use crate::error::CondenseErrorKind;
-use crate::scc::compute_condensed_graph;
+use crate::scc::condense_and_partition;
 
-/// Run the condense operation.
+/// Run the condense and partition operation.
 ///
-/// Reads a `SymbolGraph` from the input, condenses it, and writes the
-/// `CondensedGraph` to the output as JSON.
+/// Reads a `SymbolGraph` from the input, computes SCCs, merges them into
+/// optimal crate groupings, and writes the optimized `SymbolGraph` to output.
 ///
 /// # Errors
 ///
@@ -86,11 +80,11 @@ pub fn run(
             CondenseError::new(CondenseErrorKind::Deserialization(e))
         })?;
 
-    // Step 2: Condense the graph.
-    let condensed = compute_condensed_graph(&symbol_graph);
+    // Step 2: Condense and partition the graph.
+    let optimized = condense_and_partition(&symbol_graph);
 
     // Step 3: Write output JSON.
-    serde_json::to_writer_pretty(&mut *output, &condensed)
+    serde_json::to_writer_pretty(&mut *output, &optimized)
         .map_err(|e| CondenseError::new(CondenseErrorKind::Serialization(e)))?;
     writeln!(output)?;
 
@@ -143,13 +137,12 @@ mod tests {
         let mut output = Vec::new();
         run(input_json.as_bytes(), &mut output).unwrap();
 
-        // Verify output is valid JSON.
-        let condensed: CondensedGraph = serde_json::from_slice(&output)
-            .expect("output should be valid JSON");
+        // Verify output is valid SymbolGraph JSON.
+        let optimized: SymbolGraph = serde_json::from_slice(&output)
+            .expect("output should be valid SymbolGraph JSON");
 
-        assert_eq!(condensed.sccs.len(), 1);
-        assert_eq!(condensed.sccs[0].symbols.len(), 1);
-        assert!(condensed.sccs[0].symbols.contains("my_crate::foo"));
+        // For a single symbol with no dependencies, it stays in its own crate.
+        assert_eq!(optimized.crates.len(), 1);
     }
 
     #[test]

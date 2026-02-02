@@ -47,6 +47,19 @@ enum Commands {
         #[arg(short, long)]
         output: Option<String>,
     },
+
+    /// Compute critical path cost of a symbol graph
+    ///
+    /// The critical path is the longest weighted path through the dependency
+    /// graph. This represents the minimum build time with infinite parallelism.
+    CriticalPath {
+        /// Input `symbol_graph.json` file (reads from stdin if not specified)
+        input: Option<String>,
+
+        /// Show the full critical path (list of symbols)
+        #[arg(short = 'p', long)]
+        show_path: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -80,6 +93,35 @@ fn main() -> Result<()> {
             };
 
             tarjanize_condense::run(reader, &mut *writer)?;
+            Ok(())
+        }
+
+        Commands::CriticalPath { input, show_path } => {
+            let stdin = std::io::stdin();
+            let reader: Box<dyn std::io::Read> = match input {
+                Some(path) => Box::new(BufReader::new(File::open(path)?)),
+                None => Box::new(stdin.lock()),
+            };
+
+            let result =
+                tarjanize_cost::critical_path_from_reader(reader, show_path)?;
+
+            println!("Critical path cost: {:.2} ms", result.cost);
+            println!("Total cost:         {:.2} ms", result.total_cost);
+            println!("Crate count:        {}", result.crate_count);
+            println!("Symbol count:       {}", result.symbol_count);
+            println!(
+                "Parallelism ratio:  {:.2}x",
+                result.total_cost / result.cost
+            );
+
+            if show_path && !result.path.is_empty() {
+                println!("\nCritical path ({} crates):", result.path.len());
+                for crate_name in &result.path {
+                    println!("  {crate_name}");
+                }
+            }
+
             Ok(())
         }
     }

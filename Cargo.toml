@@ -5,6 +5,7 @@ resolver = "3"
 [workspace.dependencies]
 # Internal crates
 tarjanize-condense = { path = "crates/tarjanize-condense" }
+tarjanize-cost = { path = "crates/tarjanize-cost" }
 tarjanize-schemas = { path = "crates/tarjanize-schemas" }
 
 # Serialization
