@@ -338,14 +338,13 @@ tarjanize analyze /path/to/workspace --features feature1,feature2
 # Analyze with all features enabled
 tarjanize analyze /path/to/workspace --all-features
 
-# Exclude test code from analysis
-tarjanize analyze /path/to/workspace --no-tests
-
 # Analyze only for a specific target
 tarjanize analyze /path/to/workspace --target x86_64-unknown-linux-gnu
 ```
 
 The resulting dependency graph reflects whichever configuration is analyzed. Different configurations may produce different optimal partitionings.
+
+**Note on test code**: Test code is included by default (via `--all-targets`) and treated the same as production code. See "Test code handling" in Phase 2 for the rationale.
 
 ## Phase 1: Extract Symbol Graph
 
@@ -500,6 +499,22 @@ The algorithm guarantees four properties:
 | **Coverage** | Every symbol from the input belongs to exactly one SCC (no symbols lost or duplicated) |
 | **Connectedness** | All symbols within each SCC are mutually reachable |
 | **Maximality** | Each SCC is maximal (no symbol outside the SCC is mutually reachable with symbols inside) |
+
+### Test code handling
+
+**Design decision**: Test code (`#[cfg(test)]` modules, `#[test]` functions) is treated identically to production code in SCC computation. No special handling is needed.
+
+**Why this works**: The concern was that dev-dependencies might create artificial cycles. For example, if crate A depends on crate B, and B's tests use A as a dev-dependency, this appears cyclic at the crate level. However, at the symbol level:
+
+```
+b_test -> a -> b
+   |           ^
+   +-----------+
+```
+
+There is no cycle because **production code never depends on test code**. `#[cfg(test)]` items are invisible to production code, so you can never complete a cycle through test code. The edge `b -> b_test` cannot exist.
+
+**Implications for Phase 3**: The partitioning algorithm may recommend test-only crates (crates containing only test code). This is a legitimate recommendation—test utility crates exist in practice (`foo-testutils`, shared fixtures, etc.). If a user prefers to keep tests with their production code, that's a policy decision they can apply when interpreting the recommendations.
 
 ### Implementation workflow
 
