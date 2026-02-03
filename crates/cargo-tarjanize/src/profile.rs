@@ -90,12 +90,13 @@ impl ProfileData {
                 // The stem is the path we pass to ProfilingData::new.
                 // e.g., "tarjanize_schemas-0060816.mm_profdata" -> "tarjanize_schemas-0060816"
                 if let Some(stem) = path.file_stem() {
+                    let stem_str = stem.to_string_lossy();
                     let stem_path = dir.join(stem);
+
                     match ProfilingData::new(&stem_path) {
                         Ok(profile) => {
                             // Extract crate name from profile filename.
                             // Format: "crate_name-XXXXXXX" where X is hex digits.
-                            let stem_str = stem.to_string_lossy();
                             let crate_name = extract_crate_name(&stem_str);
 
                             file_count += 1;
@@ -211,11 +212,13 @@ impl ProfileData {
     }
 
     /// Get the number of unique frontend paths with timing data.
+    #[expect(dead_code, reason = "useful for debugging and logging")]
     pub fn frontend_count(&self) -> usize {
         self.frontend_costs.len()
     }
 
     /// Get the number of unique CGUs with timing data.
+    #[expect(dead_code, reason = "useful for debugging and logging")]
     pub fn cgu_count(&self) -> usize {
         self.cgu_costs.len()
     }

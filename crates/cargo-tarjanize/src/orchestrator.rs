@@ -4,10 +4,12 @@
 //! 1. Reads workspace metadata to get the list of workspace crates
 //! 2. Creates temp directories for intermediate JSON files and profiling
 //! 3. Runs `cargo build --all-targets` with `RUSTC_WRAPPER` pointing to this binary
-//! 4. Reads mono-items output files written by the driver for backend cost distribution
-//! 5. Reads the per-crate JSON files written by the driver
-//! 6. Applies frontend/backend costs from profile data
-//! 7. Merges them into a single `SymbolGraph` and outputs JSON
+//! 4. Reads the per-crate JSON files written by the driver (already include costs)
+//! 5. Merges them into a single `SymbolGraph` and outputs JSON
+//!
+//! Cost application (frontend, backend, overhead) happens in the driver
+//! immediately after each crate compiles. This allows the driver to delete
+//! raw profile files early, avoiding disk space exhaustion on large workspaces.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,8 +22,7 @@ use tarjanize_schemas::{Crate, Module, SymbolGraph};
 use tempfile::TempDir;
 use tracing::{debug, info, warn};
 
-use crate::mono_items::MonoItemsMap;
-use crate::profile::ProfileData;
+use crate::driver::CrateResult;
 use crate::{Cli, ENV_VERBOSITY};
 
 /// Environment variable that tells the driver where to write output files.
@@ -120,7 +121,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
     let profile_dir =
         TempDir::new().context("failed to create profile directory")?;
 
-    // Run cargo build with our wrapper, capturing stderr for mono-items.
+    // Run cargo build with our wrapper.
     // We use `cargo build` instead of `cargo check` because:
     // 1. Backend (LLVM) timing requires actual codegen, not just type checking
     // 2. Mono-items are only printed during codegen, not during check
@@ -150,30 +151,16 @@ fn run_inner(cli: &Cli) -> Result<()> {
         .env("CARGO_INCREMENTAL", "0")
         .current_dir(manifest_dir);
 
-    let output = cmd.output().context("failed to run cargo build")?;
+    let status = cmd.status().context("failed to run cargo build")?;
 
-    if !output.status.success() {
-        // Print stderr on failure for debugging.
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        eprintln!("{stderr}");
-        anyhow::bail!("cargo build failed with status: {}", output.status);
+    if !status.success() {
+        anyhow::bail!("cargo build failed with status: {status}");
     }
 
-    // Parse mono-items from files written by the driver.
-    // The driver redirects rustc's stdout to these files.
-    let mono_items_by_crate =
-        load_mono_items_from_dir(output_dir.path(), &workspace_crates);
-
-    // Load profile data from the self-profile output.
-    let profile_data = ProfileData::load_from_dir(profile_dir.path());
-
     // Aggregate results from all JSON files in the output directory.
-    let graph = aggregate_results(
-        output_dir.path(),
-        &workspace_crates,
-        &profile_data,
-        &mono_items_by_crate,
-    )?;
+    // The driver has already applied costs and deleted profile files,
+    // so we just need to merge the Crate structures.
+    let graph = aggregate_results(output_dir.path(), &workspace_crates)?;
 
     // Output the combined symbol graph as JSON to the specified file.
     let file = fs::File::create(&cli.output).with_context(|| {
@@ -212,66 +199,14 @@ fn find_manifest_path(cli: &Cli) -> Result<std::path::PathBuf> {
     }
 }
 
-/// Load mono-items from files written by the driver.
-///
-/// The driver redirects rustc's `-Zprint-mono-items=yes` output to files
-/// in the output directory, named `{crate_name}_mono_items.txt`.
-fn load_mono_items_from_dir(
-    output_dir: &Path,
-    workspace_crates: &[String],
-) -> HashMap<String, MonoItemsMap> {
-    let mut mono_items_by_crate = HashMap::new();
-
-    for pkg_name in workspace_crates {
-        let crate_name = pkg_name.replace('-', "_");
-        let mono_items_path = output_dir.join(format!("{crate_name}_mono_items.txt"));
-
-        if !mono_items_path.exists() {
-            debug!(crate_name, "no mono-items file found");
-            continue;
-        }
-
-        let content = match fs::read_to_string(&mono_items_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    path = %mono_items_path.display(),
-                    error = %e,
-                    "failed to read mono-items file"
-                );
-                continue;
-            }
-        };
-
-        let map = MonoItemsMap::parse(content.as_bytes(), &crate_name);
-
-        let total_items: usize = map.cgu_to_items.values().map(Vec::len).sum();
-        debug!(
-            crate_name,
-            cgu_count = map.cgu_to_items.len(),
-            total_items,
-            "loaded mono-items from file"
-        );
-
-        if !map.is_empty() {
-            mono_items_by_crate.insert(crate_name, map);
-        }
-    }
-
-    mono_items_by_crate
-}
-
 /// Read all JSON files from the output directory and merge them into a `SymbolGraph`.
 ///
-/// Applies profile timing data to symbols and crate overhead.
+/// The driver has already applied costs to each crate, so we just merge.
 fn aggregate_results(
     output_dir: &Path,
     workspace_crates: &[String],
-    profile_data: &ProfileData,
-    mono_items_by_crate: &HashMap<String, MonoItemsMap>,
 ) -> Result<SymbolGraph> {
-    // First pass: collect all modules.
-    let mut modules: HashMap<String, Module> = HashMap::new();
+    let mut crates: HashMap<String, Crate> = HashMap::new();
 
     // Read all .json files in the output directory.
     for entry in
@@ -280,25 +215,26 @@ fn aggregate_results(
         let entry = entry?;
         let path = entry.path();
 
+        // Skip mono-items files (they're .txt, not .json).
         if path.extension().is_some_and(|ext| ext == "json") {
             let content = fs::read_to_string(&path).with_context(|| {
                 format!("failed to read {}", path.display())
             })?;
 
-            let partial: PartialResult = serde_json::from_str(&content)
+            let result: CrateResult = serde_json::from_str(&content)
                 .with_context(|| {
                     format!("failed to parse {}", path.display())
                 })?;
 
-            // Merge this crate's module into the result.
-            merge_module(&mut modules, partial.crate_name, partial.module);
+            // Merge this crate's data into the result.
+            merge_crate(&mut crates, result.crate_name, result.crate_data);
         }
     }
 
     // Verify we got results for all workspace crates.
     for pkg_name in workspace_crates {
         let crate_name = pkg_name.replace('-', "_");
-        if !modules.contains_key(&crate_name) {
+        if !crates.contains_key(&crate_name) {
             warn!(
                 pkg_name,
                 crate_name,
@@ -307,122 +243,67 @@ fn aggregate_results(
         }
     }
 
-    // Distribute backend costs from CGU timing to symbols.
-    let backend_costs = distribute_backend_costs(profile_data, mono_items_by_crate);
-    debug!(
-        symbol_count = backend_costs.len(),
-        "distributed backend costs to symbols"
-    );
-
-    // Build final crate map with costs applied.
-    let mut crates: HashMap<String, Crate> = HashMap::new();
-
-    for (crate_name, mut module) in modules {
-        // Apply frontend costs from profile data.
-        apply_frontend_costs(&mut module, &crate_name, profile_data);
-
-        // Apply backend costs from CGU distribution.
-        apply_backend_costs(&mut module, &crate_name, &backend_costs);
-
-        // Get crate overhead.
-        let overhead = profile_data
-            .get_crate_overhead(&crate_name)
-            .cloned()
-            .unwrap_or_default();
-
-        crates.insert(
-            crate_name,
-            Crate {
-                linking_ms: overhead.linking_ms,
-                metadata_ms: overhead.metadata_ms,
-                root: module,
-            },
-        );
-    }
-
-    info!(
-        frontend_paths = profile_data.frontend_count(),
-        cgu_count = profile_data.cgu_count(),
-        backend_symbols = backend_costs.len(),
-        "applied profile timing data"
-    );
+    info!(crate_count = crates.len(), "aggregated crate results");
 
     Ok(SymbolGraph { crates })
 }
 
-/// Distribute backend costs from CGU timing to individual symbols.
+/// Merge a Crate into the crates map.
 ///
-/// For each CGU, we have:
-/// - Total CGU cost from profile data
-/// - List of symbols in that CGU from mono-items
-///
-/// We distribute the CGU cost equally among its symbols. If a symbol appears
-/// in multiple CGUs (due to inlining), it gets a share from each.
-fn distribute_backend_costs(
-    profile_data: &ProfileData,
-    mono_items_by_crate: &HashMap<String, MonoItemsMap>,
-) -> HashMap<String, f64> {
-    let mut costs: HashMap<String, f64> = HashMap::new();
+/// If the crate already exists, merge the modules and take max of overhead.
+/// Multiple targets (lib, test, bin) may produce separate Crate results
+/// that need to be combined.
+fn merge_crate(
+    crates: &mut HashMap<String, Crate>,
+    crate_name: String,
+    crate_data: Crate,
+) {
+    use std::collections::hash_map::Entry;
 
-    let cgu_costs = profile_data.cgu_costs();
+    match crates.entry(crate_name) {
+        Entry::Vacant(e) => {
+            e.insert(crate_data);
+        }
+        Entry::Occupied(mut e) => {
+            let existing = e.get_mut();
 
-    for mono_items in mono_items_by_crate.values() {
-        for (cgu_name, items) in &mono_items.cgu_to_items {
-            // Look up the CGU cost.
-            let Some(cgu_duration) = cgu_costs.get(cgu_name) else {
-                // CGU not found in profile data - might be a different crate.
-                debug!(cgu_name, "CGU from mono-items not found in profile data");
-                continue;
-            };
+            // Merge root modules.
+            merge_module(&mut existing.root, crate_data.root);
 
-            if items.is_empty() {
-                continue;
+            // Take max of overhead (different targets may see different costs).
+            existing.linking_ms = existing.linking_ms.max(crate_data.linking_ms);
+            existing.metadata_ms =
+                existing.metadata_ms.max(crate_data.metadata_ms);
+        }
+    }
+}
+
+/// Merge a module's contents into an existing module.
+fn merge_module(existing: &mut Module, module: Module) {
+    use std::collections::hash_map::Entry;
+
+    // Merge symbols. For overlapping symbols (same code compiled in both lib
+    // and test targets), take max costs as a conservative estimate.
+    for (name, symbol) in module.symbols {
+        match existing.symbols.entry(name) {
+            Entry::Vacant(e) => {
+                e.insert(symbol);
             }
-
-            // Distribute cost equally among items in this CGU.
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "CGU item counts are small, precision loss is negligible"
-            )]
-            let cost_per_item =
-                cgu_duration.as_millis_f64() / items.len() as f64;
-
-            for item in items {
-                *costs.entry(item.clone()).or_default() += cost_per_item;
+            Entry::Occupied(mut e) => {
+                // Symbol exists in both - take max of costs.
+                let existing_sym = e.get_mut();
+                existing_sym.frontend_cost_ms =
+                    existing_sym.frontend_cost_ms.max(symbol.frontend_cost_ms);
+                existing_sym.backend_cost_ms =
+                    existing_sym.backend_cost_ms.max(symbol.backend_cost_ms);
+                // Keep existing dependencies/kind/etc - they should be the same.
             }
         }
     }
 
-    costs
-}
-
-/// Merge a module into the modules map.
-/// If the crate already exists, merge the new module's contents into it.
-fn merge_module(
-    modules: &mut HashMap<String, Module>,
-    crate_name: String,
-    module: Module,
-) {
-    use std::collections::hash_map::Entry;
-
-    match modules.entry(crate_name) {
-        Entry::Vacant(e) => {
-            e.insert(module);
-        }
-        Entry::Occupied(mut e) => {
-            // Merge symbols and submodules.
-            let existing = e.get_mut();
-
-            // Merge symbols (test targets may add test-only symbols).
-            for (name, symbol) in module.symbols {
-                existing.symbols.entry(name).or_insert(symbol);
-            }
-
-            // Recursively merge submodules.
-            for (name, submodule) in module.submodules {
-                merge_submodule(&mut existing.submodules, name, submodule);
-            }
-        }
+    // Recursively merge submodules.
+    for (name, submodule) in module.submodules {
+        merge_submodule(&mut existing.submodules, name, submodule);
     }
 }
 
@@ -439,88 +320,7 @@ fn merge_submodule(
             e.insert(module);
         }
         Entry::Occupied(mut e) => {
-            let existing = e.get_mut();
-            for (sym_name, symbol) in module.symbols {
-                existing.symbols.entry(sym_name).or_insert(symbol);
-            }
-            for (sub_name, sub) in module.submodules {
-                merge_submodule(&mut existing.submodules, sub_name, sub);
-            }
+            merge_module(e.get_mut(), module);
         }
-    }
-}
-
-/// Intermediate result written by the driver for each crate/target.
-#[derive(serde::Deserialize)]
-struct PartialResult {
-    crate_name: String,
-    module: Module,
-}
-
-/// Recursively apply frontend costs from profile data to symbols.
-///
-/// For each symbol, constructs its full path and looks up timing data.
-/// Symbol keys use rustc's `DefPath` format, which matches the profile output.
-fn apply_frontend_costs(
-    module: &mut Module,
-    path_prefix: &str,
-    profile_data: &ProfileData,
-) {
-    for (name, symbol) in &mut module.symbols {
-        let full_path = format!("{path_prefix}::{name}");
-
-        // Look up frontend timing data.
-        // Use 0.0 if not found (some symbols may not have frontend cost).
-        let cost = profile_data.get_frontend_cost_ms(&full_path).unwrap_or(0.0);
-        symbol.frontend_cost_ms = cost;
-    }
-
-    for (submod_name, submodule) in &mut module.submodules {
-        let submod_path = format!("{path_prefix}::{submod_name}");
-        apply_frontend_costs(submodule, &submod_path, profile_data);
-    }
-}
-
-/// Recursively apply backend costs from CGU distribution to symbols.
-///
-/// For impl blocks, we sum costs from all paths that start with the impl's
-/// anchor path. This handles both trait impl methods (which normalize to
-/// `Type::{{impl}}`) and inherent methods (which appear as `Type::method`).
-fn apply_backend_costs(
-    module: &mut Module,
-    path_prefix: &str,
-    backend_costs: &HashMap<String, f64>,
-) {
-    use tarjanize_schemas::SymbolKind;
-
-    for (name, symbol) in &mut module.symbols {
-        let full_path = format!("{path_prefix}::{name}");
-
-        // Look up backend cost from distribution.
-        let mut cost = backend_costs.get(&full_path).copied().unwrap_or(0.0);
-
-        // For impl blocks, sum all costs from paths starting with any anchor.
-        // Mono-items for inherent methods appear as `Type::method_name`,
-        // while trait impl methods are normalized to `Type::{{impl}}`.
-        // By summing all paths with matching prefix, we capture both.
-        if let SymbolKind::Impl { anchors, .. } = &symbol.kind {
-            for anchor in anchors {
-                // Sum costs from all paths that start with this anchor.
-                // This includes both `Type::method` and `Type::{{impl}}` paths.
-                let prefix = format!("{anchor}::");
-                for (path, &path_cost) in backend_costs {
-                    if path.starts_with(&prefix) {
-                        cost += path_cost;
-                    }
-                }
-            }
-        }
-
-        symbol.backend_cost_ms = cost;
-    }
-
-    for (submod_name, submodule) in &mut module.submodules {
-        let submod_path = format!("{path_prefix}::{submod_name}");
-        apply_backend_costs(submodule, &submod_path, backend_costs);
     }
 }

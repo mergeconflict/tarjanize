@@ -440,7 +440,7 @@ pub(crate) fn condense_and_partition(
     );
 
     // Step 9: Build output SymbolGraph.
-    build_output_graph(&index, set_to_symbols)
+    build_output_graph(&index, set_to_symbols, symbol_graph)
 }
 
 /// Builds the output `SymbolGraph` from grouped symbols.
@@ -448,20 +448,38 @@ pub(crate) fn condense_and_partition(
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
+///
+/// Crate-level overhead (`linking_ms`, `metadata_ms`) is distributed proportionally
+/// based on backend cost. If an original crate's symbols get split across multiple
+/// new crates, each new crate gets a fraction of the overhead proportional to how
+/// much backend work it received.
 fn build_output_graph(
     index: &SymbolIndex<'_>,
     set_to_symbols: HashMap<u32, Vec<usize>>,
+    original_graph: &SymbolGraph,
 ) -> SymbolGraph {
     // Sort sets by ID for deterministic output.
     let mut sets: Vec<_> = set_to_symbols.into_iter().collect();
     sets.sort_by_key(|(id, _)| *id);
 
+    // Precompute total symbol count per original crate for proportional overhead
+    // distribution. Symbol count is a rough proxy for both linking cost (symbols
+    // to resolve) and metadata cost (items to export).
+    let original_crate_symbol_counts: HashMap<&str, usize> = original_graph
+        .crates
+        .iter()
+        .map(|(name, crate_data)| {
+            (name.as_str(), count_module_symbols(&crate_data.root))
+        })
+        .collect();
+
     // Track used crate names to avoid collisions.
     let mut used_names: HashSet<String> = HashSet::new();
 
-    // Compute crate names for each set.
-    let mut set_crate_names: Vec<(u32, String, Vec<usize>)> = Vec::new();
+    // Compute crate names and overhead for each set.
+    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64, f64)> = Vec::new();
     for (set_id, symbol_indices) in sets {
+        // Collect unique original crates contributing to this set.
         let mut original_crates: Vec<&str> = symbol_indices
             .iter()
             .map(|&i| index.get_original_crate(i))
@@ -470,36 +488,78 @@ fn build_output_graph(
             .collect();
         original_crates.sort_unstable();
 
-        let base_name = original_crates.join("-");
+        // Count symbols from each original crate going to this new crate.
+        let mut symbol_counts_by_origin: HashMap<&str, usize> = HashMap::new();
+        for &sym_idx in &symbol_indices {
+            let origin = index.get_original_crate(sym_idx);
+            *symbol_counts_by_origin.entry(origin).or_default() += 1;
+        }
 
+        // Distribute overhead proportionally based on symbol count.
+        // If this new crate gets N symbols from an original crate that had M total,
+        // it gets N/M of that crate's linking and metadata overhead.
+        let mut linking_ms = 0.0;
+        let mut metadata_ms = 0.0;
+        for (origin, &count_from_origin) in &symbol_counts_by_origin {
+            let total_count = original_crate_symbol_counts
+                .get(origin)
+                .copied()
+                .unwrap_or(1);
+
+            #[expect(
+                clippy::cast_precision_loss,
+                reason = "symbol counts are small enough that f64 is precise"
+            )]
+            let fraction = count_from_origin as f64 / total_count as f64;
+
+            if let Some(orig_crate) = original_graph.crates.get(*origin) {
+                linking_ms += orig_crate.linking_ms * fraction;
+                metadata_ms += orig_crate.metadata_ms * fraction;
+            }
+        }
+
+        let base_name = original_crates.join("-");
         let crate_name = if used_names.contains(&base_name) {
             format!("{base_name}-{set_id}")
         } else {
             base_name
         };
         used_names.insert(crate_name.clone());
-        set_crate_names.push((set_id, crate_name, symbol_indices));
+        set_crate_data.push((set_id, crate_name, symbol_indices, linking_ms, metadata_ms));
     }
 
     // Pass 1: Compute old path → new path mapping.
+    let set_crate_names: Vec<_> = set_crate_data
+        .iter()
+        .map(|(id, name, indices, _, _)| (*id, name.clone(), indices.clone()))
+        .collect();
     let path_mapping = compute_path_mapping(index, &set_crate_names);
 
     // Pass 2: Build output graph using the mapping.
     let mut crates = HashMap::new();
-    for (_set_id, crate_name, symbol_indices) in set_crate_names {
+    for (_set_id, crate_name, symbol_indices, linking_ms, metadata_ms) in set_crate_data {
         let root_module =
             build_module_tree(index, &symbol_indices, &path_mapping);
         crates.insert(
             crate_name,
             tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
+                linking_ms,
+                metadata_ms,
                 root: root_module,
             },
         );
     }
 
     SymbolGraph { crates }
+}
+
+/// Counts total symbols in a module tree.
+fn count_module_symbols(module: &Module) -> usize {
+    let mut count = module.symbols.len();
+    for submodule in module.submodules.values() {
+        count += count_module_symbols(submodule);
+    }
+    count
 }
 
 /// Computes a mapping from old symbol paths to new symbol paths.
@@ -1267,4 +1327,90 @@ mod tests {
             vec![vec!["A"], vec!["B"], vec!["C", "D", "impl_D"]]
         );
     }
+
+    #[test]
+    fn test_overhead_distributed_by_symbol_count() {
+        // Test that crate overhead (linking_ms, metadata_ms) is distributed
+        // proportionally by symbol count when a crate is split.
+        //
+        // Original crate has:
+        // - linking_ms: 10.0, metadata_ms: 5.0
+        // - Symbol A (no deps, becomes its own crate)
+        // - Symbol B (no deps, becomes its own crate)
+        //
+        // When split into 2 crates with 1 symbol each, each gets 50% of overhead.
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "a".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                frontend_cost_ms: 0.0,
+                backend_cost_ms: 60.0,
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        symbols.insert(
+            "b".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                frontend_cost_ms: 0.0,
+                backend_cost_ms: 40.0,
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my_crate".to_string(),
+            tarjanize_schemas::Crate {
+                linking_ms: 10.0,
+                metadata_ms: 5.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+            },
+        );
+
+        let symbol_graph = SymbolGraph { crates };
+        let result = condense_and_partition(&symbol_graph);
+
+        // Two independent symbols → two crates.
+        assert_eq!(result.crates.len(), 2);
+
+        // Each crate has 1 of 2 symbols → 50% of overhead.
+        for crate_data in result.crates.values() {
+            assert!(
+                (crate_data.linking_ms - 5.0).abs() < 0.01,
+                "Expected linking_ms ~5.0, got {}",
+                crate_data.linking_ms
+            );
+            assert!(
+                (crate_data.metadata_ms - 2.5).abs() < 0.01,
+                "Expected metadata_ms ~2.5, got {}",
+                crate_data.metadata_ms
+            );
+        }
+
+        // Total overhead should equal original.
+        let total_linking: f64 = result.crates.values().map(|c| c.linking_ms).sum();
+        let total_metadata: f64 = result.crates.values().map(|c| c.metadata_ms).sum();
+        assert!(
+            (total_linking - 10.0).abs() < 0.01,
+            "Total linking should be 10.0, got {total_linking}"
+        );
+        assert!(
+            (total_metadata - 5.0).abs() < 0.01,
+            "Total metadata should be 5.0, got {total_metadata}"
+        );
+    }
+
 }

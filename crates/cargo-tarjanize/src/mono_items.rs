@@ -101,6 +101,7 @@ impl MonoItemsMap {
     }
 
     /// Check if the map has any items.
+    #[expect(dead_code, reason = "useful for debugging")]
     pub fn is_empty(&self) -> bool {
         self.cgu_to_items.is_empty()
     }
@@ -174,20 +175,20 @@ fn normalize_impl_shim(path: &str, crate_name: &str) -> Option<String> {
     let type_path = strip_generics(type_path);
 
     // Check if this looks like a path from our crate.
-    // Type paths from our crate look like `module::Type` (relative) or
-    // `crate_name::module::Type` (absolute).
+    // Type paths from our crate look like `Type` (root-level), `module::Type`
+    // (relative), or `crate_name::module::Type` (absolute).
     let full_type_path = if let Some(after_crate) = type_path.strip_prefix(crate_name) {
         // Verify it's exactly our crate (not `crate_name_extra`).
         if !after_crate.is_empty() && !after_crate.starts_with("::") {
             return None; // Different crate with similar prefix
         }
         type_path.clone()
-    } else if type_path.contains("::") {
-        // Relative path - add crate prefix
-        format!("{crate_name}::{type_path}")
     } else {
-        // Single identifier - probably not an impl we care about
-        return None;
+        // No crate prefix - add it. This handles both:
+        // - Single identifiers like `Cli` (root-level types)
+        // - Relative paths like `module::Type`
+        // CGU filtering already ensures we only process items from our crate.
+        format!("{crate_name}::{type_path}")
     };
 
     // Return as type-level impl path (matches anchor format).
@@ -342,6 +343,12 @@ mod tests {
         assert_eq!(
             normalize_impl_shim("<&module::Type as Trait>::method", "my_crate"),
             Some("my_crate::module::Type::{{impl}}".to_string())
+        );
+        // Single identifier (root-level type) -> gets crate prefix added.
+        // This handles types like `Cli` in `<Cli as clap::Parser>::parse`.
+        assert_eq!(
+            normalize_impl_shim("<Cli as clap::Parser>::parse", "my_crate"),
+            Some("my_crate::Cli::{{impl}}".to_string())
         );
     }
 
