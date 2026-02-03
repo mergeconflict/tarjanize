@@ -142,8 +142,8 @@ fn has_edge(graph: &SymbolGraph, from: &str, to: &str) -> bool {
         false
     }
 
-    for module in graph.crates.values() {
-        if check_module(module, from, to) {
+    for crate_data in graph.crates.values() {
+        if check_module(&crate_data.root, from, to) {
             return true;
         }
     }
@@ -181,8 +181,8 @@ fn collect_all_dependencies(graph: &SymbolGraph) -> Vec<String> {
     }
 
     let mut deps = Vec::new();
-    for module in graph.crates.values() {
-        collect_module_deps(module, &mut deps);
+    for crate_data in graph.crates.values() {
+        collect_module_deps(&crate_data.root, &mut deps);
     }
     deps
 }
@@ -222,8 +222,8 @@ fn get_symbol_deps(
         None
     }
 
-    let module = graph.crates.get(crate_name).expect("crate not found");
-    find_in_module(module, symbol_name).unwrap_or_default()
+    let crate_data = graph.crates.get(crate_name).expect("crate not found");
+    find_in_module(&crate_data.root, symbol_name).unwrap_or_default()
 }
 
 /// Get an impl symbol's anchors from the graph.
@@ -251,8 +251,8 @@ fn get_impl_anchors(
         None
     }
 
-    for module in graph.crates.values() {
-        if let Some(anchors) = find_in_module(module) {
+    for crate_data in graph.crates.values() {
+        if let Some(anchors) = find_in_module(&crate_data.root) {
             return anchors;
         }
     }
@@ -1262,8 +1262,8 @@ fn get_symbol_kind(graph: &SymbolGraph, name: &str) -> Option<String> {
         None
     }
 
-    for module in graph.crates.values() {
-        if let Some(kind) = find_in_module(module, name) {
+    for crate_data in graph.crates.values() {
+        if let Some(kind) = find_in_module(&crate_data.root, name) {
             return Some(kind);
         }
     }
@@ -1298,8 +1298,8 @@ fn get_impl_name(graph: &SymbolGraph) -> Option<String> {
         None
     }
 
-    for module in graph.crates.values() {
-        if let Some(name) = find_in_module(module) {
+    for crate_data in graph.crates.values() {
+        if let Some(name) = find_in_module(&crate_data.root) {
             return Some(name);
         }
     }
@@ -1334,8 +1334,8 @@ fn get_symbol_visibility(
         None
     }
 
-    for module in graph.crates.values() {
-        if let Some(vis) = find_in_module(module, name) {
+    for crate_data in graph.crates.values() {
+        if let Some(vis) = find_in_module(&crate_data.root, name) {
             return Some(vis);
         }
     }

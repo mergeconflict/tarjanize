@@ -106,10 +106,11 @@ mod tests {
     use super::*;
 
     /// Helper to create a simple symbol for testing.
-    fn make_symbol(cost: f64, deps: &[&str]) -> Symbol {
+    fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
-            cost,
+            frontend_cost_ms: 0.0,
+            backend_cost_ms: 0.0,
             dependencies: deps.iter().map(|&s| s.to_string()).collect(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -121,14 +122,18 @@ mod tests {
     #[test]
     fn test_run_roundtrip() {
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(42.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 

@@ -86,11 +86,38 @@ pub fn run(args: &[String]) -> ExitCode {
     compiler_args.push("-Zno-steal-thir".to_string());
 
     // Add self-profiling flags to collect compilation timing data.
+    // We need `default` for core events, `llvm` for backend costs per CGU,
+    // and `args` for DefPath associations.
     compiler_args.push(format!(
         "-Zself-profile={}",
         callbacks.config.profile_dir.display()
     ));
-    compiler_args.push("-Zself-profile-events=default,args".to_string());
+    compiler_args.push("-Zself-profile-events=default,llvm,args".to_string());
+
+    // Print mono-items for backend cost distribution.
+    // This tells us which symbols are codegen'd into which CGU.
+    // We redirect stdout to a file because cargo swallows rustc's stdout.
+    compiler_args.push("-Zprint-mono-items=yes".to_string());
+
+    // Capture mono-items output by redirecting stdout to a file.
+    // Rustc's `-Zprint-mono-items` outputs to stdout, which cargo swallows.
+    // We redirect to a file that the orchestrator reads later.
+    // Use append mode since multiple targets (lib, bin, test) may compile.
+    let mono_items_path = callbacks
+        .config
+        .output_dir
+        .join(format!("{}_mono_items.txt", callbacks.crate_name));
+
+    // Redirect stdout to the mono-items file during compilation.
+    // The gag crate provides safe file descriptor redirection.
+    // When `_redirect` is dropped, stdout is automatically restored.
+    let mono_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&mono_items_path)
+        .expect("failed to open mono-items file");
+    let _redirect =
+        gag::Redirect::stdout(mono_file).expect("failed to redirect stdout");
 
     run_via_rustc_driver(&compiler_args, &mut callbacks)
 }

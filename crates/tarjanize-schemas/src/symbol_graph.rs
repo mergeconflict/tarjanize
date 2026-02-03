@@ -10,20 +10,59 @@ use std::collections::{HashMap, HashSet};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+/// Returns true if the value is zero (for serde `skip_serializing_if`).
+///
+/// Takes `&f64` because serde's `skip_serializing_if` passes by reference.
+#[expect(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "serde skip_serializing_if requires &self"
+)]
+fn is_zero(value: &f64) -> bool {
+    *value == 0.0
+}
+
 /// Root structure representing the entire symbol graph of a workspace.
 ///
 /// The symbol graph captures all symbols and their dependencies within a
-/// Rust workspace. Crates are represented as their root modules, which
-/// contain symbols and nested submodules. Dependencies are stored directly
-/// on each symbol rather than as a separate edge list.
+/// Rust workspace. Each crate contains its root module (with symbols and
+/// submodules) plus crate-level overhead costs. Dependencies are stored
+/// directly on each symbol rather than as a separate edge list.
 #[derive(
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
 pub struct SymbolGraph {
-    /// All crates in the workspace, keyed by crate name. Each crate is
-    /// represented as its root module, which contains all symbols and
-    /// submodules.
-    pub crates: HashMap<String, Module>,
+    /// All crates in the workspace, keyed by crate name.
+    pub crates: HashMap<String, Crate>,
+}
+
+/// A crate in the workspace with its module tree and overhead costs.
+///
+/// Each crate has:
+/// - A root module containing all symbols and submodules
+/// - Fixed overhead costs (linking, metadata generation) that apply
+///   regardless of which symbols are included
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
+pub struct Crate {
+    /// Linking time in milliseconds.
+    ///
+    /// Fixed cost for linking the crate's artifacts. This includes `link_crate`,
+    /// `link_binary`, and `link_rlib` events from self-profile. Not parallelizable.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = 0.0))]
+    pub linking_ms: f64,
+
+    /// Metadata generation time in milliseconds.
+    ///
+    /// Fixed cost for generating crate metadata (`generate_crate_metadata`).
+    /// This is required for downstream crates to depend on this one.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = 0.0))]
+    pub metadata_ms: f64,
+
+    /// The root module containing all symbols and submodules.
+    pub root: Module,
 }
 
 /// A module (or crate root) containing symbols and submodules.
@@ -52,23 +91,36 @@ pub struct Module {
 /// A symbol in the crate - either a module-level definition or an impl block.
 ///
 /// Symbols are the vertices in the dependency graph. Each symbol has a
-/// source file, compilation cost estimate, dependencies, and kind-specific
+/// source file, compilation cost estimates, dependencies, and kind-specific
 /// details. Symbol names are stored as keys in the parent Module's `HashMap`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct Symbol {
     /// Path to the symbol's file relative to the crate root.
     pub file: String,
 
-    /// Compilation cost of this symbol in milliseconds.
+    /// Frontend compilation cost in milliseconds.
     ///
-    /// When profiling is enabled (`--profile` flag), this is populated from
-    /// rustc's self-profile data. Otherwise defaults to 1.0.
+    /// Includes parsing, type checking, borrow checking, and other serial
+    /// compilation phases. Populated from rustc's self-profile data when
+    /// profiling is enabled. Defaults to 0.0.
     ///
-    /// Given two symbols A and B:
-    /// - Cost of compiling A and B in sequence: `A.cost + B.cost`
-    /// - Cost of compiling A and B in parallel: `max(A.cost, B.cost)`
+    /// Frontend costs are serial - when compiling symbols A and B:
+    /// `total_frontend = A.frontend_cost_ms + B.frontend_cost_ms`
+    #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(min = 0.0))]
-    pub cost: f64,
+    pub frontend_cost_ms: f64,
+
+    /// Backend compilation cost in milliseconds.
+    ///
+    /// Includes LLVM codegen, which can run in parallel across CGUs.
+    /// Populated by distributing CGU costs to symbols via mono-items mapping.
+    /// Defaults to 0.0.
+    ///
+    /// Backend costs can parallelize - when compiling symbols A and B in
+    /// parallel: `total_backend = max(A.backend_cost_ms, B.backend_cost_ms)`
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = 0.0))]
+    pub backend_cost_ms: f64,
 
     /// Fully qualified paths of symbols this symbol depends on. A dependency
     /// means this symbol's definition references the target in some way
@@ -223,19 +275,20 @@ mod tests {
 
     prop_compose! {
         /// Strategy for generating arbitrary Symbol values with non-negative
-        /// integer cost.
+        /// integer costs.
         ///
         /// Note that floating-point values don't survive roundtrip
         /// serialization/deserialization perfectly.
         fn arb_symbol()
             (
                 file in arb_name(),
-                cost in (0..1_000_000).prop_map(f64::from),
+                frontend_cost_ms in (0..1_000_000).prop_map(f64::from),
+                backend_cost_ms in (0..1_000_000).prop_map(f64::from),
                 dependencies in hash_set(arb_path(), 0..5),
                 kind in arb_symbol_kind(),
             )
         -> Symbol {
-            Symbol { file, cost, dependencies, kind }
+            Symbol { file, frontend_cost_ms, backend_cost_ms, dependencies, kind }
         }
     }
 
@@ -265,10 +318,24 @@ mod tests {
         )
     }
 
+    /// Strategy for generating arbitrary Crate values.
+    fn arb_crate() -> impl Strategy<Value = Crate> {
+        (
+            (0..1_000_000).prop_map(f64::from),
+            (0..1_000_000).prop_map(f64::from),
+            arb_module(),
+        )
+            .prop_map(|(linking_ms, metadata_ms, root)| Crate {
+                linking_ms,
+                metadata_ms,
+                root,
+            })
+    }
+
     prop_compose! {
         /// Strategy for generating arbitrary SymbolGraph values.
         fn arb_symbol_graph()
-            (crates in hash_map(arb_name(), arb_module(), 1..10))
+            (crates in hash_map(arb_name(), arb_crate(), 1..10))
         -> SymbolGraph {
             SymbolGraph { crates }
         }

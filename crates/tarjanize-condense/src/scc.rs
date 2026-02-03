@@ -37,8 +37,8 @@ impl<'a> SymbolIndex<'a> {
     /// Builds an index by walking the entire `SymbolGraph`.
     fn build(symbol_graph: &'a SymbolGraph) -> Self {
         let mut index = SymbolIndex::default();
-        for (crate_name, root_module) in &symbol_graph.crates {
-            index.add_module(crate_name, root_module);
+        for (crate_name, crate_data) in &symbol_graph.crates {
+            index.add_module(crate_name, &crate_data.root);
         }
         index
     }
@@ -196,10 +196,11 @@ mod tests {
     }
 
     /// Helper to create a simple symbol for testing.
-    fn make_symbol(cost: f64, deps: &[&str]) -> Symbol {
+    fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
-            cost,
+            frontend_cost_ms: 0.0,
+            backend_cost_ms: 0.0,
             dependencies: deps.iter().map(|&s| s.to_string()).collect(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -211,14 +212,18 @@ mod tests {
     #[test]
     fn test_single_symbol_single_scc() {
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -235,15 +240,19 @@ mod tests {
     #[test]
     fn test_two_independent_symbols() {
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
-        symbols.insert("bar".to_string(), make_symbol(20.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol(&[]));
+        symbols.insert("bar".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -260,17 +269,19 @@ mod tests {
     fn test_cycle_forms_single_scc() {
         let mut symbols = HashMap::new();
         // foo depends on bar, bar depends on foo (cycle).
-        symbols
-            .insert("foo".to_string(), make_symbol(10.0, &["my_crate::bar"]));
-        symbols
-            .insert("bar".to_string(), make_symbol(20.0, &["my_crate::foo"]));
+        symbols.insert("foo".to_string(), make_symbol(&["my_crate::bar"]));
+        symbols.insert("bar".to_string(), make_symbol(&["my_crate::foo"]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -287,18 +298,20 @@ mod tests {
     fn test_chain_creates_dependencies() {
         let mut symbols = HashMap::new();
         // foo → bar → baz (chain, no cycles).
-        symbols
-            .insert("foo".to_string(), make_symbol(10.0, &["my_crate::bar"]));
-        symbols
-            .insert("bar".to_string(), make_symbol(20.0, &["my_crate::baz"]));
-        symbols.insert("baz".to_string(), make_symbol(30.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol(&["my_crate::bar"]));
+        symbols.insert("bar".to_string(), make_symbol(&["my_crate::baz"]));
+        symbols.insert("baz".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -336,16 +349,20 @@ mod tests {
         // This is the natural compilation order.
         let mut symbols = HashMap::new();
         // a → b → c (chain).
-        symbols.insert("a".to_string(), make_symbol(10.0, &["my_crate::b"]));
-        symbols.insert("b".to_string(), make_symbol(10.0, &["my_crate::c"]));
-        symbols.insert("c".to_string(), make_symbol(10.0, &[]));
+        symbols.insert("a".to_string(), make_symbol(&["my_crate::b"]));
+        symbols.insert("b".to_string(), make_symbol(&["my_crate::c"]));
+        symbols.insert("c".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -366,25 +383,32 @@ mod tests {
     #[test]
     fn test_cross_crate_dependency() {
         let mut crate_a_symbols = HashMap::new();
-        crate_a_symbols
-            .insert("foo".to_string(), make_symbol(10.0, &["crate_b::bar"]));
+        crate_a_symbols.insert("foo".to_string(), make_symbol(&["crate_b::bar"]));
 
         let mut crate_b_symbols = HashMap::new();
-        crate_b_symbols.insert("bar".to_string(), make_symbol(20.0, &[]));
+        crate_b_symbols.insert("bar".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
         crates.insert(
             "crate_a".to_string(),
-            Module {
-                symbols: crate_a_symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols: crate_a_symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
         crates.insert(
             "crate_b".to_string(),
-            Module {
-                symbols: crate_b_symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols: crate_b_symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -414,7 +438,8 @@ mod tests {
             "Foo".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                cost: 0.0,
+                frontend_cost_ms: 0.0,
+                backend_cost_ms: 0.0,
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Struct".to_string(),
@@ -426,7 +451,8 @@ mod tests {
             "MyTrait".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                cost: 0.0,
+                frontend_cost_ms: 0.0,
+                backend_cost_ms: 0.0,
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Trait".to_string(),
@@ -438,7 +464,8 @@ mod tests {
             "impl MyTrait for Foo".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                cost: 0.0,
+                frontend_cost_ms: 0.0,
+                backend_cost_ms: 0.0,
                 dependencies: [
                     "my_crate::Foo".to_string(),
                     "my_crate::MyTrait".to_string(),
@@ -460,9 +487,13 @@ mod tests {
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols,
-                submodules: HashMap::new(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
             },
         );
 
@@ -509,13 +540,11 @@ mod tests {
     #[test]
     fn test_submodule_symbol() {
         let mut inner_symbols = HashMap::new();
-        inner_symbols.insert("bar".to_string(), make_symbol(20.0, &[]));
+        inner_symbols.insert("bar".to_string(), make_symbol(&[]));
 
         let mut root_symbols = HashMap::new();
-        root_symbols.insert(
-            "foo".to_string(),
-            make_symbol(10.0, &["my_crate::inner::bar"]),
-        );
+        root_symbols
+            .insert("foo".to_string(), make_symbol(&["my_crate::inner::bar"]));
 
         let mut submodules = HashMap::new();
         submodules.insert(
@@ -529,9 +558,13 @@ mod tests {
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Module {
-                symbols: root_symbols,
-                submodules,
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols: root_symbols,
+                    submodules,
+                },
             },
         );
 
