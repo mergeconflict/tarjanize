@@ -91,7 +91,6 @@ pub struct CriticalPathResult {
 ///
 /// The critical path is the longest weighted path through the crate dependency
 /// DAG. This represents the minimum build time with infinite parallelism.
-#[expect(clippy::too_many_lines, reason = "single logical algorithm, splitting would hurt readability")]
 pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     let (crate_names, crate_costs, symbol_count, graph) =
         build_crate_graph(symbol_graph);
@@ -111,115 +110,107 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     let total_cost: f64 = crate_costs.iter().sum();
 
     // Topological sort. The graph should be a DAG, but if there are cycles
-    // (shouldn't happen after SCC condensation), report total cost.
-    let Ok(sorted) = toposort(&graph, None) else {
-        return CriticalPathResult {
-            cost: total_cost,
-            path: Vec::new(),
-            path_details: Vec::new(),
-            all_crates: Vec::new(),
-            total_cost,
-            crate_count: crate_names.len(),
-            symbol_count,
-        };
+    // (can happen when dev-dependencies create apparent cycles), we skip
+    // critical path computation but still report per-crate costs.
+    let sorted = if let Ok(s) = toposort(&graph, None) {
+        Some(s)
+    } else {
+        eprintln!("WARNING: cycle detected in crate dependency graph (likely dev-dependencies), skipping critical path");
+        None
     };
 
     // DP: dist[c] = cost to build crate c and all its transitive dependencies.
-    // Process in topological order (dependencies come before dependents).
-    let mut dist: Vec<f64> = crate_costs.clone();
-    let mut predecessor: Vec<Option<NodeIndex>> = vec![None; crate_names.len()];
+    // Compute critical path if we have a valid topological order.
+    let (critical_cost, path, path_details, dist) = if let Some(sorted) = sorted {
+        // DP: dist[c] = cost to build crate c and all its transitive dependencies.
+        let mut dist: Vec<f64> = crate_costs.clone();
+        let mut predecessor: Vec<Option<NodeIndex>> = vec![None; crate_names.len()];
 
-    for &node in &sorted {
-        let node_cost = crate_costs[node.index()];
+        for &node in &sorted {
+            let node_cost = crate_costs[node.index()];
 
-        // Find max distance among dependencies (incoming edges).
-        let mut max_dep_dist = 0.0f64;
-        let mut max_dep_node: Option<NodeIndex> = None;
+            // Find max distance among dependencies (incoming edges).
+            let mut max_dep_dist = 0.0f64;
+            let mut max_dep_node: Option<NodeIndex> = None;
 
-        for dep in graph.neighbors_directed(node, Direction::Incoming) {
-            if dist[dep.index()] > max_dep_dist {
-                max_dep_dist = dist[dep.index()];
-                max_dep_node = Some(dep);
+            for dep in graph.neighbors_directed(node, Direction::Incoming) {
+                if dist[dep.index()] > max_dep_dist {
+                    max_dep_dist = dist[dep.index()];
+                    max_dep_node = Some(dep);
+                }
             }
+
+            dist[node.index()] = node_cost + max_dep_dist;
+            predecessor[node.index()] = max_dep_node;
         }
 
-        dist[node.index()] = node_cost + max_dep_dist;
-        predecessor[node.index()] = max_dep_node;
-    }
+        // Find the crate with maximum distance (end of critical path).
+        let (max_node, &max_cost) = dist
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+            .unwrap();
 
-    // Find the crate with maximum distance (end of critical path).
-    let (max_node, &max_cost) = dist
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap();
+        // Reconstruct the critical path by following predecessors from the end node.
+        let mut path_nodes = Vec::new();
+        let mut current = Some(NodeIndex::new(max_node));
+        while let Some(node) = current {
+            path_nodes.push(node);
+            current = predecessor[node.index()];
+        }
+        path_nodes.reverse();
 
-    // Reconstruct the critical path by following predecessors from the end node.
-    let mut path_nodes = Vec::new();
-    let mut current = Some(NodeIndex::new(max_node));
-    while let Some(node) = current {
-        path_nodes.push(node);
-        current = predecessor[node.index()];
-    }
-    path_nodes.reverse();
+        // Build path names and details.
+        let path: Vec<String> = path_nodes
+            .iter()
+            .map(|node| crate_names.get_index(node.index()).unwrap().clone())
+            .collect();
 
-    // Build path names and details.
-    let path: Vec<String> = path_nodes
-        .iter()
-        .map(|node| crate_names.get_index(node.index()).unwrap().clone())
-        .collect();
+        let path_details: Vec<CrateOnPath> = path_nodes
+            .iter()
+            .map(|&node| {
+                let name = crate_names.get_index(node.index()).unwrap().clone();
+                let cost = crate_costs[node.index()];
+                let cumulative_cost = dist[node.index()];
 
-    let path_details: Vec<CrateOnPath> = path_nodes
-        .iter()
-        .map(|&node| {
-            let name = crate_names.get_index(node.index()).unwrap().clone();
-            let cost = crate_costs[node.index()];
-            let cumulative_cost = dist[node.index()];
+                let dependencies: Vec<String> = graph
+                    .neighbors_directed(node, Direction::Incoming)
+                    .map(|dep| crate_names.get_index(dep.index()).unwrap().clone())
+                    .collect();
 
-            // Get direct dependencies (incoming edges = crates this one depends on).
-            let dependencies: Vec<String> = graph
-                .neighbors_directed(node, Direction::Incoming)
-                .map(|dep| crate_names.get_index(dep.index()).unwrap().clone())
-                .collect();
+                CrateOnPath { name, cost, cumulative_cost, dependencies }
+            })
+            .collect();
 
-            CrateOnPath {
-                name,
-                cost,
-                cumulative_cost,
-                dependencies,
-            }
-        })
-        .collect();
+        (max_cost, path, path_details, Some(dist))
+    } else {
+        // Cycles detected - can't compute critical path.
+        (total_cost, Vec::new(), Vec::new(), None)
+    };
 
-    // Build all_crates: every crate with its cost and dependencies, sorted by cost descending.
+    // Build all_crates: every crate with its cost, sorted by cost descending.
+    // If we have dist from DP, use cumulative costs; otherwise just use crate cost.
     let mut all_crates: Vec<CrateOnPath> = crate_names
         .iter()
         .enumerate()
         .map(|(idx, name)| {
             let node = NodeIndex::new(idx);
             let cost = crate_costs[idx];
-            let cumulative_cost = dist[idx];
+            let cumulative_cost = dist.as_ref().map_or(cost, |d| d[idx]);
 
-            // Get direct dependencies (incoming edges = crates this one depends on).
             let dependencies: Vec<String> = graph
                 .neighbors_directed(node, Direction::Incoming)
                 .map(|dep| crate_names.get_index(dep.index()).unwrap().clone())
                 .collect();
 
-            CrateOnPath {
-                name: name.clone(),
-                cost,
-                cumulative_cost,
-                dependencies,
-            }
+            CrateOnPath { name: name.clone(), cost, cumulative_cost, dependencies }
         })
         .collect();
 
-    // Sort by cost descending (highest cost first).
     all_crates.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap());
 
     CriticalPathResult {
-        cost: max_cost,
+        cost: critical_cost,
         path,
         path_details,
         all_crates,

@@ -443,35 +443,57 @@ pub(crate) fn condense_and_partition(
     build_output_graph(&index, set_to_symbols, symbol_graph)
 }
 
+/// Coefficient for estimating metadata time from frontend cost.
+///
+/// Based on linear regression against real build data (R² = 0.705):
+/// `metadata_ms = METADATA_SLOPE * frontend_ms + METADATA_INTERCEPT`
+///
+/// See `docs/cost-model-validation.md` Appendix A.7 for derivation.
+const METADATA_SLOPE: f64 = 0.26;
+
+/// Fixed per-crate overhead for metadata generation in milliseconds.
+///
+/// This represents the baseline cost of generating metadata for any crate,
+/// independent of its symbol count or complexity.
+const METADATA_INTERCEPT: f64 = 1662.0;
+
+/// Coefficient for estimating linking time from dependency crate count.
+///
+/// Based on linear regression against real build data (R² = 0.555):
+/// `linking_ms = LINKING_SLOPE * dep_crate_count + LINKING_INTERCEPT`
+///
+/// The number of crates depended on is the best predictor of linking time,
+/// better than frontend cost (R² = 0.40) or symbol count (R² ≈ 0).
+///
+/// See `docs/cost-model-validation.md` Appendix A.8 for derivation.
+const LINKING_SLOPE: f64 = 160.0;
+
+/// Fixed per-crate overhead for linking in milliseconds.
+///
+/// This represents the baseline linking cost for any crate, independent of
+/// its dependency count.
+const LINKING_INTERCEPT: f64 = 678.0;
+
 /// Builds the output `SymbolGraph` from grouped symbols.
 ///
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
 ///
-/// Crate-level overhead (`linking_ms`, `metadata_ms`) is distributed proportionally
-/// based on backend cost. If an original crate's symbols get split across multiple
-/// new crates, each new crate gets a fraction of the overhead proportional to how
-/// much backend work it received.
+/// Crate-level overhead is computed as follows:
+/// - `linking_ms`: Estimated from the number of unique external crates that
+///   symbols in this crate depend on (R² = 0.555). This is much better than
+///   symbol-count-based distribution (R² ≈ 0).
+/// - `metadata_ms`: Estimated from total frontend cost using a linear model
+///   (R² = 0.705).
 fn build_output_graph(
     index: &SymbolIndex<'_>,
     set_to_symbols: HashMap<u32, Vec<usize>>,
-    original_graph: &SymbolGraph,
+    _original_graph: &SymbolGraph,
 ) -> SymbolGraph {
     // Sort sets by ID for deterministic output.
     let mut sets: Vec<_> = set_to_symbols.into_iter().collect();
     sets.sort_by_key(|(id, _)| *id);
-
-    // Precompute total symbol count per original crate for proportional overhead
-    // distribution. Symbol count is a rough proxy for both linking cost (symbols
-    // to resolve) and metadata cost (items to export).
-    let original_crate_symbol_counts: HashMap<&str, usize> = original_graph
-        .crates
-        .iter()
-        .map(|(name, crate_data)| {
-            (name.as_str(), count_module_symbols(&crate_data.root))
-        })
-        .collect();
 
     // Track used crate names to avoid collisions.
     let mut used_names: HashSet<String> = HashSet::new();
@@ -480,43 +502,47 @@ fn build_output_graph(
     let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64, f64)> = Vec::new();
     for (set_id, symbol_indices) in sets {
         // Collect unique original crates contributing to this set.
-        let mut original_crates: Vec<&str> = symbol_indices
+        let original_crates_set: HashSet<&str> = symbol_indices
             .iter()
             .map(|&i| index.get_original_crate(i))
-            .collect::<HashSet<_>>()
-            .into_iter()
             .collect();
+        let mut original_crates: Vec<&str> =
+            original_crates_set.iter().copied().collect();
         original_crates.sort_unstable();
 
-        // Count symbols from each original crate going to this new crate.
-        let mut symbol_counts_by_origin: HashMap<&str, usize> = HashMap::new();
+        // Count unique external crates that this synthetic crate depends on.
+        // "External" means not one of the original crates that contributed to
+        // this synthetic crate.
+        let mut dep_crates: HashSet<&str> = HashSet::new();
         for &sym_idx in &symbol_indices {
-            let origin = index.get_original_crate(sym_idx);
-            *symbol_counts_by_origin.entry(origin).or_default() += 1;
-        }
-
-        // Distribute overhead proportionally based on symbol count.
-        // If this new crate gets N symbols from an original crate that had M total,
-        // it gets N/M of that crate's linking and metadata overhead.
-        let mut linking_ms = 0.0;
-        let mut metadata_ms = 0.0;
-        for (origin, &count_from_origin) in &symbol_counts_by_origin {
-            let total_count = original_crate_symbol_counts
-                .get(origin)
-                .copied()
-                .unwrap_or(1);
-
-            #[expect(
-                clippy::cast_precision_loss,
-                reason = "symbol counts are small enough that f64 is precise"
-            )]
-            let fraction = count_from_origin as f64 / total_count as f64;
-
-            if let Some(orig_crate) = original_graph.crates.get(*origin) {
-                linking_ms += orig_crate.linking_ms * fraction;
-                metadata_ms += orig_crate.metadata_ms * fraction;
+            let symbol = index.get_symbol(sym_idx);
+            for dep_path in &symbol.dependencies {
+                // Extract crate name from path like "crate_name::module::item"
+                if let Some(dep_crate) = dep_path.split("::").next() {
+                    // Only count external dependencies
+                    if !original_crates_set.contains(dep_crate) {
+                        dep_crates.insert(dep_crate);
+                    }
+                }
             }
         }
+
+        // Estimate linking time from external dependency count.
+        // The number of crates depended on is the best predictor (R² = 0.555).
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "dependency counts are small enough that f64 is precise"
+        )]
+        let linking_ms =
+            LINKING_SLOPE * dep_crates.len() as f64 + LINKING_INTERCEPT;
+
+        // Estimate metadata time from total frontend cost of symbols in this crate.
+        // Frontend cost is the best single predictor of metadata time (R² = 0.705).
+        let total_frontend_ms: f64 = symbol_indices
+            .iter()
+            .map(|&i| index.get_symbol(i).frontend_cost_ms)
+            .sum();
+        let metadata_ms = METADATA_SLOPE * total_frontend_ms + METADATA_INTERCEPT;
 
         let base_name = original_crates.join("-");
         let crate_name = if used_names.contains(&base_name) {
@@ -551,15 +577,6 @@ fn build_output_graph(
     }
 
     SymbolGraph { crates }
-}
-
-/// Counts total symbols in a module tree.
-fn count_module_symbols(module: &Module) -> usize {
-    let mut count = module.symbols.len();
-    for submodule in module.submodules.values() {
-        count += count_module_symbols(submodule);
-    }
-    count
 }
 
 /// Computes a mapping from old symbol paths to new symbol paths.
@@ -1329,23 +1346,120 @@ mod tests {
     }
 
     #[test]
-    fn test_overhead_distributed_by_symbol_count() {
-        // Test that crate overhead (linking_ms, metadata_ms) is distributed
-        // proportionally by symbol count when a crate is split.
+    fn test_linking_estimated_from_dep_count() {
+        // Test that linking time is estimated from the number of external crate
+        // dependencies using the formula: linking_ms = 160 * dep_count + 678
         //
-        // Original crate has:
-        // - linking_ms: 10.0, metadata_ms: 5.0
-        // - Symbol A (no deps, becomes its own crate)
-        // - Symbol B (no deps, becomes its own crate)
+        // Setup:
+        // - crate_a has symbol A with no external deps → linking = 678
+        // - crate_b has symbol B depending on external crate "ext" → linking = 160 + 678 = 838
+        let mut crates = HashMap::new();
+
+        // Crate A: no external dependencies
+        let mut symbols_a = HashMap::new();
+        symbols_a.insert(
+            "a".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                frontend_cost_ms: 100.0,
+                backend_cost_ms: 0.0,
+                dependencies: HashSet::new(), // No deps
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        crates.insert(
+            "crate_a".to_string(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0, // Original value; ignored
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols: symbols_a,
+                    submodules: HashMap::new(),
+                },
+            },
+        );
+
+        // Crate B: depends on external crate "ext"
+        let mut symbols_b = HashMap::new();
+        let mut deps_b = HashSet::new();
+        deps_b.insert("ext::some_fn".to_string());
+        symbols_b.insert(
+            "b".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                frontend_cost_ms: 100.0,
+                backend_cost_ms: 0.0,
+                dependencies: deps_b,
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        crates.insert(
+            "crate_b".to_string(),
+            tarjanize_schemas::Crate {
+                linking_ms: 0.0,
+                metadata_ms: 0.0,
+                root: Module {
+                    symbols: symbols_b,
+                    submodules: HashMap::new(),
+                },
+            },
+        );
+
+        let symbol_graph = SymbolGraph { crates };
+        let result = condense_and_partition(&symbol_graph);
+
+        // Two independent symbols → two crates.
+        assert_eq!(result.crates.len(), 2);
+
+        // Find crates by their symbol content.
+        let crate_a = result
+            .crates
+            .values()
+            .find(|c| c.root.symbols.contains_key("a"))
+            .expect("crate with symbol a");
+        let crate_b = result
+            .crates
+            .values()
+            .find(|c| c.root.symbols.contains_key("b"))
+            .expect("crate with symbol b");
+
+        // Crate A: 0 external deps → linking = 160 * 0 + 678 = 678
+        let expected_a = LINKING_SLOPE * 0.0 + LINKING_INTERCEPT;
+        assert!(
+            (crate_a.linking_ms - expected_a).abs() < 0.01,
+            "Expected linking_ms ~{expected_a}, got {}",
+            crate_a.linking_ms
+        );
+
+        // Crate B: 1 external dep (ext) → linking = 160 * 1 + 678 = 838
+        let expected_b = LINKING_SLOPE * 1.0 + LINKING_INTERCEPT;
+        assert!(
+            (crate_b.linking_ms - expected_b).abs() < 0.01,
+            "Expected linking_ms ~{expected_b}, got {}",
+            crate_b.linking_ms
+        );
+    }
+
+    #[test]
+    fn test_metadata_estimated_from_frontend_cost() {
+        // Test that metadata is estimated from frontend cost using the formula:
+        // metadata_ms = 0.26 * frontend_ms + 1662
         //
-        // When split into 2 crates with 1 symbol each, each gets 50% of overhead.
+        // Two independent symbols with different frontend costs become separate
+        // crates, each with metadata estimated from its frontend cost.
         let mut symbols = HashMap::new();
         symbols.insert(
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                frontend_cost_ms: 0.0,
-                backend_cost_ms: 60.0,
+                frontend_cost_ms: 1000.0, // Expected: 0.26 * 1000 + 1662 = 1922
+                backend_cost_ms: 0.0,
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1357,8 +1471,8 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                frontend_cost_ms: 0.0,
-                backend_cost_ms: 40.0,
+                frontend_cost_ms: 5000.0, // Expected: 0.26 * 5000 + 1662 = 2962
+                backend_cost_ms: 0.0,
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1371,8 +1485,8 @@ mod tests {
         crates.insert(
             "my_crate".to_string(),
             tarjanize_schemas::Crate {
-                linking_ms: 10.0,
-                metadata_ms: 5.0,
+                linking_ms: 0.0,
+                metadata_ms: 0.0, // Original value; ignored for split crates
                 root: Module {
                     symbols,
                     submodules: HashMap::new(),
@@ -1386,30 +1500,31 @@ mod tests {
         // Two independent symbols → two crates.
         assert_eq!(result.crates.len(), 2);
 
-        // Each crate has 1 of 2 symbols → 50% of overhead.
-        for crate_data in result.crates.values() {
-            assert!(
-                (crate_data.linking_ms - 5.0).abs() < 0.01,
-                "Expected linking_ms ~5.0, got {}",
-                crate_data.linking_ms
-            );
-            assert!(
-                (crate_data.metadata_ms - 2.5).abs() < 0.01,
-                "Expected metadata_ms ~2.5, got {}",
-                crate_data.metadata_ms
-            );
-        }
+        // Find crates by their symbol content.
+        let crate_a = result
+            .crates
+            .values()
+            .find(|c| c.root.symbols.contains_key("a"))
+            .expect("crate with symbol a");
+        let crate_b = result
+            .crates
+            .values()
+            .find(|c| c.root.symbols.contains_key("b"))
+            .expect("crate with symbol b");
 
-        // Total overhead should equal original.
-        let total_linking: f64 = result.crates.values().map(|c| c.linking_ms).sum();
-        let total_metadata: f64 = result.crates.values().map(|c| c.metadata_ms).sum();
+        // Verify metadata estimated from formula: 0.26 * frontend + 1662
+        let expected_a = METADATA_SLOPE * 1000.0 + METADATA_INTERCEPT; // 1922
+        let expected_b = METADATA_SLOPE * 5000.0 + METADATA_INTERCEPT; // 2962
+
         assert!(
-            (total_linking - 10.0).abs() < 0.01,
-            "Total linking should be 10.0, got {total_linking}"
+            (crate_a.metadata_ms - expected_a).abs() < 0.01,
+            "Expected metadata_ms ~{expected_a}, got {}",
+            crate_a.metadata_ms
         );
         assert!(
-            (total_metadata - 5.0).abs() < 0.01,
-            "Total metadata should be 5.0, got {total_metadata}"
+            (crate_b.metadata_ms - expected_b).abs() < 0.01,
+            "Expected metadata_ms ~{expected_b}, got {}",
+            crate_b.metadata_ms
         );
     }
 
