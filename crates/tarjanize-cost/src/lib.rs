@@ -45,6 +45,23 @@ use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use tarjanize_schemas::{Module, SymbolGraph};
 
+/// Details about a single crate on the critical path.
+#[derive(Debug, Clone)]
+pub struct CrateOnPath {
+    /// Crate name.
+    pub name: String,
+
+    /// Estimated cost of this crate alone (frontend + backend + overhead).
+    pub cost: f64,
+
+    /// Cumulative cost from the start of the critical path to this crate
+    /// (includes this crate's cost and all its transitive dependencies on the path).
+    pub cumulative_cost: f64,
+
+    /// Direct dependencies of this crate (crate names).
+    pub dependencies: Vec<String>,
+}
+
 /// Result of critical path analysis.
 #[derive(Debug, Clone)]
 pub struct CriticalPathResult {
@@ -52,8 +69,13 @@ pub struct CriticalPathResult {
     pub cost: f64,
 
     /// Crates on the critical path, from deepest dependency to top-level.
-    /// Only populated if `compute_path` was true.
     pub path: Vec<String>,
+
+    /// Detailed information for each crate on the critical path.
+    pub path_details: Vec<CrateOnPath>,
+
+    /// All crates with their costs, sorted by cost descending.
+    pub all_crates: Vec<CrateOnPath>,
 
     /// Total cost of all crates (sequential build time).
     pub total_cost: f64,
@@ -69,15 +91,8 @@ pub struct CriticalPathResult {
 ///
 /// The critical path is the longest weighted path through the crate dependency
 /// DAG. This represents the minimum build time with infinite parallelism.
-///
-/// # Arguments
-///
-/// * `symbol_graph` - The symbol graph to analyze
-/// * `compute_path` - If true, also compute the actual path (list of crates)
-pub fn critical_path(
-    symbol_graph: &SymbolGraph,
-    compute_path: bool,
-) -> CriticalPathResult {
+#[expect(clippy::too_many_lines, reason = "single logical algorithm, splitting would hurt readability")]
+pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     let (crate_names, crate_costs, symbol_count, graph) =
         build_crate_graph(symbol_graph);
 
@@ -85,6 +100,8 @@ pub fn critical_path(
         return CriticalPathResult {
             cost: 0.0,
             path: Vec::new(),
+            path_details: Vec::new(),
+            all_crates: Vec::new(),
             total_cost: 0.0,
             crate_count: 0,
             symbol_count: 0,
@@ -99,6 +116,8 @@ pub fn critical_path(
         return CriticalPathResult {
             cost: total_cost,
             path: Vec::new(),
+            path_details: Vec::new(),
+            all_crates: Vec::new(),
             total_cost,
             crate_count: crate_names.len(),
             symbol_count,
@@ -125,9 +144,7 @@ pub fn critical_path(
         }
 
         dist[node.index()] = node_cost + max_dep_dist;
-        if compute_path {
-            predecessor[node.index()] = max_dep_node;
-        }
+        predecessor[node.index()] = max_dep_node;
     }
 
     // Find the crate with maximum distance (end of critical path).
@@ -137,23 +154,75 @@ pub fn critical_path(
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap();
 
-    // Reconstruct path if requested.
-    let path = if compute_path {
-        let mut result = Vec::new();
-        let mut current = Some(NodeIndex::new(max_node));
-        while let Some(node) = current {
-            result.push(crate_names.get_index(node.index()).unwrap().clone());
-            current = predecessor[node.index()];
-        }
-        result.reverse();
-        result
-    } else {
-        Vec::new()
-    };
+    // Reconstruct the critical path by following predecessors from the end node.
+    let mut path_nodes = Vec::new();
+    let mut current = Some(NodeIndex::new(max_node));
+    while let Some(node) = current {
+        path_nodes.push(node);
+        current = predecessor[node.index()];
+    }
+    path_nodes.reverse();
+
+    // Build path names and details.
+    let path: Vec<String> = path_nodes
+        .iter()
+        .map(|node| crate_names.get_index(node.index()).unwrap().clone())
+        .collect();
+
+    let path_details: Vec<CrateOnPath> = path_nodes
+        .iter()
+        .map(|&node| {
+            let name = crate_names.get_index(node.index()).unwrap().clone();
+            let cost = crate_costs[node.index()];
+            let cumulative_cost = dist[node.index()];
+
+            // Get direct dependencies (incoming edges = crates this one depends on).
+            let dependencies: Vec<String> = graph
+                .neighbors_directed(node, Direction::Incoming)
+                .map(|dep| crate_names.get_index(dep.index()).unwrap().clone())
+                .collect();
+
+            CrateOnPath {
+                name,
+                cost,
+                cumulative_cost,
+                dependencies,
+            }
+        })
+        .collect();
+
+    // Build all_crates: every crate with its cost and dependencies, sorted by cost descending.
+    let mut all_crates: Vec<CrateOnPath> = crate_names
+        .iter()
+        .enumerate()
+        .map(|(idx, name)| {
+            let node = NodeIndex::new(idx);
+            let cost = crate_costs[idx];
+            let cumulative_cost = dist[idx];
+
+            // Get direct dependencies (incoming edges = crates this one depends on).
+            let dependencies: Vec<String> = graph
+                .neighbors_directed(node, Direction::Incoming)
+                .map(|dep| crate_names.get_index(dep.index()).unwrap().clone())
+                .collect();
+
+            CrateOnPath {
+                name: name.clone(),
+                cost,
+                cumulative_cost,
+                dependencies,
+            }
+        })
+        .collect();
+
+    // Sort by cost descending (highest cost first).
+    all_crates.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap());
 
     CriticalPathResult {
         cost: max_cost,
         path,
+        path_details,
+        all_crates,
         total_cost,
         crate_count: crate_names.len(),
         symbol_count,
@@ -163,14 +232,13 @@ pub fn critical_path(
 /// Convenience function to compute critical path from JSON input.
 pub fn critical_path_from_reader(
     mut input: impl Read,
-    compute_path: bool,
 ) -> Result<CriticalPathResult, serde_json::Error> {
     let mut json = String::new();
     input
         .read_to_string(&mut json)
         .map_err(serde_json::Error::io)?;
     let symbol_graph: SymbolGraph = serde_json::from_str(&json)?;
-    Ok(critical_path(&symbol_graph, compute_path))
+    Ok(critical_path(&symbol_graph))
 }
 
 /// Builds a crate-level dependency graph.
@@ -184,14 +252,19 @@ pub fn critical_path_from_reader(
 fn build_crate_graph(
     symbol_graph: &SymbolGraph,
 ) -> (IndexSet<String>, Vec<f64>, usize, DiGraph<usize, ()>) {
-    // First, collect all symbol paths and map them to their crate.
-    let mut symbol_to_crate: HashMap<String, String> = HashMap::new();
+    // Build crate name index with normalized names (hyphens → underscores).
+    let crate_names: IndexSet<String> = symbol_graph
+        .crates
+        .keys()
+        .map(|name| normalize_crate_name(name))
+        .collect();
+
+    // Compute costs and symbol count for each crate.
     let mut crate_costs: HashMap<String, f64> = HashMap::new();
     let mut symbol_count = 0;
 
     for (crate_name, crate_data) in &symbol_graph.crates {
-        // Collect symbol paths for dependency resolution.
-        collect_symbol_paths(crate_name, &crate_data.root, &mut symbol_to_crate);
+        let normalized_name = normalize_crate_name(crate_name);
         symbol_count += count_symbols_in_module(&crate_data.root);
 
         // Compute wall-clock cost using the formula:
@@ -200,12 +273,9 @@ fn build_crate_graph(
         let backend_time = max_module_backend_cost(&crate_data.root);
         let overhead = crate_data.linking_ms + crate_data.metadata_ms;
 
-        crate_costs.insert(crate_name.clone(), frontend_time + backend_time + overhead);
+        crate_costs.insert(normalized_name, frontend_time + backend_time + overhead);
     }
 
-    // Build crate name index.
-    let crate_names: IndexSet<String> =
-        symbol_graph.crates.keys().cloned().collect();
     let costs: Vec<f64> = crate_names
         .iter()
         .map(|name| crate_costs.get(name).copied().unwrap_or(0.0))
@@ -219,12 +289,12 @@ fn build_crate_graph(
 
     // For each crate, find which other crates it depends on.
     for (crate_name, crate_data) in &symbol_graph.crates {
-        if let Some(crate_idx) = crate_names.get_index_of(crate_name) {
-            let deps =
-                collect_crate_dependencies(&crate_data.root, &symbol_to_crate);
+        let normalized_name = normalize_crate_name(crate_name);
+        if let Some(crate_idx) = crate_names.get_index_of(&normalized_name) {
+            let deps = collect_crate_dependencies(&crate_data.root, &crate_names);
             for dep_crate in deps {
-                // Skip self-dependencies.
-                if &dep_crate == crate_name {
+                // Skip self-dependencies (dep_crate is already normalized).
+                if dep_crate == normalized_name {
                     continue;
                 }
                 if let Some(dep_idx) = crate_names.get_index_of(&dep_crate) {
@@ -242,23 +312,12 @@ fn build_crate_graph(
     (crate_names, costs, symbol_count, graph)
 }
 
-/// Recursively collects symbol paths for dependency resolution.
-fn collect_symbol_paths(
-    module_path: &str,
-    module: &Module,
-    symbol_to_crate: &mut HashMap<String, String>,
-) {
-    for symbol_name in module.symbols.keys() {
-        let path = format!("{module_path}::{symbol_name}");
-        // Extract crate name from module path (first component).
-        let crate_name = module_path.split("::").next().unwrap_or(module_path);
-        symbol_to_crate.insert(path, crate_name.to_string());
-    }
-
-    for (submodule_name, submodule) in &module.submodules {
-        let submodule_path = format!("{module_path}::{submodule_name}");
-        collect_symbol_paths(&submodule_path, submodule, symbol_to_crate);
-    }
+/// Normalizes a crate name by replacing hyphens with underscores.
+///
+/// Cargo uses hyphens in package names but rustc uses underscores in crate names.
+/// We normalize to underscores for consistent matching.
+fn normalize_crate_name(name: &str) -> String {
+    name.replace('-', "_")
 }
 
 /// Collects total frontend cost across all symbols in a module tree.
@@ -309,22 +368,27 @@ fn count_symbols_in_module(module: &Module) -> usize {
 }
 
 /// Collects all crates that symbols in this module depend on.
-fn collect_crate_dependencies(
-    module: &Module,
-    symbol_to_crate: &HashMap<String, String>,
-) -> HashSet<String> {
+///
+/// Extracts the crate name from each dependency path (first `::` component)
+/// and normalizes it (hyphens → underscores).
+fn collect_crate_dependencies(module: &Module, known_crates: &IndexSet<String>) -> HashSet<String> {
     let mut deps = HashSet::new();
 
     for symbol in module.symbols.values() {
         for dep_path in &symbol.dependencies {
-            if let Some(dep_crate) = symbol_to_crate.get(dep_path) {
-                deps.insert(dep_crate.clone());
+            // Extract crate name from dependency path (first component before ::).
+            let dep_crate = dep_path.split("::").next().unwrap_or(dep_path);
+            let normalized = normalize_crate_name(dep_crate);
+
+            // Only include if it's a known crate in our graph.
+            if known_crates.contains(&normalized) {
+                deps.insert(normalized);
             }
         }
     }
 
     for submodule in module.submodules.values() {
-        deps.extend(collect_crate_dependencies(submodule, symbol_to_crate));
+        deps.extend(collect_crate_dependencies(submodule, known_crates));
     }
 
     deps
@@ -377,7 +441,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // Frontend is summed: 10 + 20 = 30
         assert!((result.cost - 30.0).abs() < f64::EPSILON);
@@ -413,7 +477,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         assert!((result.cost - 170.0).abs() < f64::EPSILON);
     }
@@ -469,7 +533,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // frontend = 15, backend = max(10, 100, 50) = 100
         assert!((result.cost - 115.0).abs() < f64::EPSILON);
@@ -495,7 +559,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // frontend(10) + backend(0) + linking(5) + metadata(3) = 18
         assert!((result.cost - 18.0).abs() < f64::EPSILON);
@@ -523,7 +587,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // Single crate, so critical path = total cost = 30
         assert!((result.cost - 30.0).abs() < f64::EPSILON);
@@ -566,7 +630,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // Critical path is max(100, 50) = 100
         assert!((result.cost - 100.0).abs() < f64::EPSILON);
@@ -612,7 +676,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // Critical path = crate_b + crate_a = 150
         assert!((result.cost - 150.0).abs() < f64::EPSILON);
@@ -688,7 +752,7 @@ mod tests {
         );
 
         let graph = SymbolGraph { crates };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         // Critical path = d(30) + b(100) + a(10) = 140
         assert!((result.cost - 140.0).abs() < f64::EPSILON);
@@ -702,7 +766,7 @@ mod tests {
         let graph = SymbolGraph {
             crates: HashMap::new(),
         };
-        let result = critical_path(&graph, true);
+        let result = critical_path(&graph);
 
         assert!((result.cost).abs() < f64::EPSILON);
         assert!(result.path.is_empty());

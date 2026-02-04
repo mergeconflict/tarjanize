@@ -48,18 +48,39 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Compute critical path cost of a symbol graph
+    /// Compute build costs and critical path of a symbol graph
     ///
-    /// The critical path is the longest weighted path through the dependency
-    /// graph. This represents the minimum build time with infinite parallelism.
-    CriticalPath {
+    /// Shows per-crate costs and the critical path (longest weighted path through
+    /// the dependency graph), which represents minimum build time with infinite
+    /// parallelism.
+    Cost {
         /// Input `symbol_graph.json` file (reads from stdin if not specified)
         input: Option<String>,
-
-        /// Show the full critical path (list of symbols)
-        #[arg(short = 'p', long)]
-        show_path: bool,
     },
+}
+
+/// Prints a single crate's details in table format.
+fn print_crate_detail(crate_detail: &tarjanize_cost::CrateOnPath) {
+    // Format dependencies: show first few, then count if many.
+    let deps_str = if crate_detail.dependencies.is_empty() {
+        "(none)".to_string()
+    } else if crate_detail.dependencies.len() <= 3 {
+        crate_detail.dependencies.join(", ")
+    } else {
+        format!(
+            "{}, ... (+{} more)",
+            crate_detail.dependencies[..3].join(", "),
+            crate_detail.dependencies.len() - 3
+        )
+    };
+
+    println!(
+        "{:>12.2}  {:>12.2}  {:<40}  {}",
+        crate_detail.cost,
+        crate_detail.cumulative_cost,
+        crate_detail.name,
+        deps_str
+    );
 }
 
 fn main() -> Result<()> {
@@ -96,15 +117,14 @@ fn main() -> Result<()> {
             Ok(())
         }
 
-        Commands::CriticalPath { input, show_path } => {
+        Commands::Cost { input } => {
             let stdin = std::io::stdin();
             let reader: Box<dyn std::io::Read> = match input {
                 Some(path) => Box::new(BufReader::new(File::open(path)?)),
                 None => Box::new(stdin.lock()),
             };
 
-            let result =
-                tarjanize_cost::critical_path_from_reader(reader, show_path)?;
+            let result = tarjanize_cost::critical_path_from_reader(reader)?;
 
             println!("Critical path cost: {:.2} ms", result.cost);
             println!("Total cost:         {:.2} ms", result.total_cost);
@@ -115,10 +135,31 @@ fn main() -> Result<()> {
                 result.total_cost / result.cost
             );
 
-            if show_path && !result.path.is_empty() {
-                println!("\nCritical path ({} crates):", result.path.len());
-                for crate_name in &result.path {
-                    println!("  {crate_name}");
+            if !result.path_details.is_empty() {
+                println!("\nCritical path ({} crates):\n", result.path.len());
+
+                println!(
+                    "{:>12}  {:>12}  {:<40}  Dependencies",
+                    "Cost (ms)", "Cumulative", "Crate"
+                );
+                println!("{}", "-".repeat(100));
+
+                for crate_detail in &result.path_details {
+                    print_crate_detail(crate_detail);
+                }
+            }
+
+            if !result.all_crates.is_empty() {
+                println!("\nAll crates by cost ({} crates):\n", result.all_crates.len());
+
+                println!(
+                    "{:>12}  {:>12}  {:<40}  Dependencies",
+                    "Cost (ms)", "Cumulative", "Crate"
+                );
+                println!("{}", "-".repeat(100));
+
+                for crate_detail in &result.all_crates {
+                    print_crate_detail(crate_detail);
                 }
             }
 

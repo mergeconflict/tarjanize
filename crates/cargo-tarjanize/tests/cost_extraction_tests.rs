@@ -909,3 +909,54 @@ fn test_cost_range_pattern_const() {
     assert_symbol_exists(&graph, "MAX_VALUE");
     assert_symbol_exists(&graph, "classify");
 }
+
+/// Collects all dependency crate names from a module tree.
+fn collect_dep_crates(module: &Module) -> HashSet<String> {
+    let mut crates = HashSet::new();
+    for symbol in module.symbols.values() {
+        for dep in &symbol.dependencies {
+            if let Some(crate_name) = dep.split("::").next() {
+                crates.insert(crate_name.to_string());
+            }
+        }
+    }
+    for submodule in module.submodules.values() {
+        crates.extend(collect_dep_crates(submodule));
+    }
+    crates
+}
+
+/// Regression test: Cross-crate dependencies must be captured even when
+/// package names use hyphens.
+///
+/// Cargo uses hyphens in package names (e.g., `crate-b`) but rustc uses
+/// underscores in crate names (e.g., `crate_b`). The extraction must normalize
+/// these when checking if a dependency belongs to a workspace crate.
+///
+/// Without the fix, dependencies to workspace crates with hyphenated package
+/// names would be silently dropped, breaking critical path analysis.
+#[test]
+#[expect(clippy::uninlined_format_args, reason = "can't inline HashSet debug")]
+fn test_cross_crate_hyphen_names() {
+    let graph = extract_fixture("cross_crate_hyphen_names");
+
+    // Both crates should be extracted (with underscored names).
+    assert!(
+        graph.crates.contains_key("crate_a"),
+        "Should have crate_a"
+    );
+    assert!(
+        graph.crates.contains_key("crate_b"),
+        "Should have crate_b"
+    );
+
+    // crate_a depends on crate_b - verify the cross-crate dependency is captured.
+    let crate_a = graph.crates.get("crate_a").unwrap();
+    let dep_crates = collect_dep_crates(&crate_a.root);
+
+    assert!(
+        dep_crates.contains("crate_b"),
+        "crate_a should have dependency on crate_b, but found deps: {:?}",
+        dep_crates
+    );
+}

@@ -290,13 +290,14 @@ fn merge_module(existing: &mut Module, module: Module) {
                 e.insert(symbol);
             }
             Entry::Occupied(mut e) => {
-                // Symbol exists in both - take max of costs.
+                // Symbol exists in both - take max of costs and union deps.
                 let existing_sym = e.get_mut();
                 existing_sym.frontend_cost_ms =
                     existing_sym.frontend_cost_ms.max(symbol.frontend_cost_ms);
                 existing_sym.backend_cost_ms =
                     existing_sym.backend_cost_ms.max(symbol.backend_cost_ms);
-                // Keep existing dependencies/kind/etc - they should be the same.
+                // Union dependencies - lib and test targets may see different deps.
+                existing_sym.dependencies.extend(symbol.dependencies);
             }
         }
     }
@@ -322,5 +323,118 @@ fn merge_submodule(
         Entry::Occupied(mut e) => {
             merge_module(e.get_mut(), module);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tarjanize_schemas::{Symbol, SymbolKind, Visibility};
+
+    use super::*;
+
+    /// Helper to create a symbol with specified dependencies.
+    fn make_symbol(deps: &[&str]) -> Symbol {
+        Symbol {
+            file: "test.rs".to_string(),
+            frontend_cost_ms: 1.0,
+            backend_cost_ms: 1.0,
+            dependencies: deps.iter().map(|&s| s.to_string()).collect(),
+            kind: SymbolKind::ModuleDef {
+                kind: "Function".to_string(),
+                visibility: Visibility::Public,
+            },
+        }
+    }
+
+    /// Regression test: merging lib and test targets must union dependencies.
+    ///
+    /// When `--all-targets` is used, the same symbol may be compiled in both
+    /// lib and test targets. The lib target typically has cross-crate deps
+    /// (it exports APIs used by other crates), while the test target may have
+    /// fewer deps (tests often only use internal APIs).
+    ///
+    /// If test results are processed first and we keep only the first symbol's
+    /// deps, we lose the lib's cross-crate dependencies. This breaks critical
+    /// path analysis because crates appear to have no dependencies.
+    #[test]
+    fn test_merge_module_unions_dependencies() {
+        // Simulate test target: symbol with no cross-crate deps.
+        let test_symbol = make_symbol(&["my_crate::internal_fn"]);
+
+        // Simulate lib target: same symbol but with cross-crate deps.
+        let lib_symbol = make_symbol(&[
+            "my_crate::internal_fn",
+            "other_crate::external_type",
+            "another_crate::another_fn",
+        ]);
+
+        // Create "existing" module (from test target, processed first).
+        let mut existing = Module {
+            symbols: HashMap::from([("foo".to_string(), test_symbol)]),
+            submodules: HashMap::new(),
+        };
+
+        // Create "incoming" module (from lib target, processed second).
+        let incoming = Module {
+            symbols: HashMap::from([("foo".to_string(), lib_symbol)]),
+            submodules: HashMap::new(),
+        };
+
+        // Merge lib into test.
+        merge_module(&mut existing, incoming);
+
+        // Verify the merged symbol has ALL dependencies from both targets.
+        let merged = existing.symbols.get("foo").expect("symbol should exist");
+        let deps: HashSet<&str> =
+            merged.dependencies.iter().map(String::as_str).collect();
+
+        assert!(
+            deps.contains("my_crate::internal_fn"),
+            "should have internal dep"
+        );
+        assert!(
+            deps.contains("other_crate::external_type"),
+            "should have cross-crate dep from lib target"
+        );
+        assert!(
+            deps.contains("another_crate::another_fn"),
+            "should have cross-crate dep from lib target"
+        );
+    }
+
+    /// Test that merge takes max of costs from both targets.
+    #[test]
+    fn test_merge_module_takes_max_costs() {
+        let mut sym1 = make_symbol(&[]);
+        sym1.frontend_cost_ms = 10.0;
+        sym1.backend_cost_ms = 5.0;
+
+        let mut sym2 = make_symbol(&[]);
+        sym2.frontend_cost_ms = 8.0;
+        sym2.backend_cost_ms = 12.0;
+
+        let mut existing = Module {
+            symbols: HashMap::from([("foo".to_string(), sym1)]),
+            submodules: HashMap::new(),
+        };
+
+        let incoming = Module {
+            symbols: HashMap::from([("foo".to_string(), sym2)]),
+            submodules: HashMap::new(),
+        };
+
+        merge_module(&mut existing, incoming);
+
+        let merged = existing.symbols.get("foo").unwrap();
+        assert!(
+            (merged.frontend_cost_ms - 10.0).abs() < f64::EPSILON,
+            "should take max frontend cost"
+        );
+        assert!(
+            (merged.backend_cost_ms - 12.0).abs() < f64::EPSILON,
+            "should take max backend cost"
+        );
     }
 }

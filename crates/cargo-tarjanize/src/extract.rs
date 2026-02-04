@@ -71,10 +71,17 @@ impl<'tcx> Extractor<'tcx> {
         crate_name: &str,
         workspace_crates: &[String],
     ) -> Self {
+        // Normalize package names (hyphens) to crate names (underscores).
+        // Cargo uses hyphens in package names but rustc uses underscores.
+        let workspace_crates: HashSet<String> = workspace_crates
+            .iter()
+            .map(|name| name.replace('-', "_"))
+            .collect();
+
         Self {
             tcx,
             crate_name: crate_name.to_string(),
-            workspace_crates: workspace_crates.iter().cloned().collect(),
+            workspace_crates,
             symbols: HashMap::new(),
         }
     }
