@@ -36,10 +36,9 @@ impl MonoItemsMap {
         // Regex to match: MONO_ITEM (fn|static) <path> @@ <cgu_name>[linkage]
         // The path may contain generic parameters like `<T>` or `<impl Trait>`.
         // CGU names have format like `crate_name.hash-cgu.N`.
-        let re = Regex::new(
-            r"^MONO_ITEM\s+(fn|static)\s+(.+?)\s+@@\s+([^\[\s]+)\[",
-        )
-        .expect("valid regex");
+        let re =
+            Regex::new(r"^MONO_ITEM\s+(fn|static)\s+(.+?)\s+@@\s+([^\[\s]+)\[")
+                .expect("valid regex");
 
         let mut map = MonoItemsMap::default();
         let mut line_count = 0;
@@ -67,9 +66,13 @@ impl MonoItemsMap {
                 }
 
                 // Normalize the path to match our symbol paths.
-                let Some(normalized) = normalize_mono_item(raw_path, crate_name)
+                let Some(normalized) =
+                    normalize_mono_item(raw_path, crate_name)
                 else {
-                    trace!(raw_path, "skipped mono-item (normalization failed)");
+                    trace!(
+                        raw_path,
+                        "skipped mono-item (normalization failed)"
+                    );
                     continue;
                 };
 
@@ -165,9 +168,9 @@ fn normalize_impl_shim(path: &str, crate_name: &str) -> Option<String> {
 
     // Find the type portion (after `<` and before ` as` or `>`).
     let inner = path.strip_prefix('<')?;
-    let type_end = inner.find(" as ").unwrap_or_else(|| {
-        inner.find(">::").unwrap_or(inner.len())
-    });
+    let type_end = inner
+        .find(" as ")
+        .unwrap_or_else(|| inner.find(">::").unwrap_or(inner.len()));
     let type_path = &inner[..type_end];
 
     // Strip generics and references from the type path.
@@ -177,19 +180,20 @@ fn normalize_impl_shim(path: &str, crate_name: &str) -> Option<String> {
     // Check if this looks like a path from our crate.
     // Type paths from our crate look like `Type` (root-level), `module::Type`
     // (relative), or `crate_name::module::Type` (absolute).
-    let full_type_path = if let Some(after_crate) = type_path.strip_prefix(crate_name) {
-        // Verify it's exactly our crate (not `crate_name_extra`).
-        if !after_crate.is_empty() && !after_crate.starts_with("::") {
-            return None; // Different crate with similar prefix
-        }
-        type_path.clone()
-    } else {
-        // No crate prefix - add it. This handles both:
-        // - Single identifiers like `Cli` (root-level types)
-        // - Relative paths like `module::Type`
-        // CGU filtering already ensures we only process items from our crate.
-        format!("{crate_name}::{type_path}")
-    };
+    let full_type_path =
+        if let Some(after_crate) = type_path.strip_prefix(crate_name) {
+            // Verify it's exactly our crate (not `crate_name_extra`).
+            if !after_crate.is_empty() && !after_crate.starts_with("::") {
+                return None; // Different crate with similar prefix
+            }
+            type_path.clone()
+        } else {
+            // No crate prefix - add it. This handles both:
+            // - Single identifiers like `Cli` (root-level types)
+            // - Relative paths like `module::Type`
+            // CGU filtering already ensures we only process items from our crate.
+            format!("{crate_name}::{type_path}")
+        };
 
     // Return as type-level impl path (matches anchor format).
     Some(format!("{full_type_path}::{{{{impl}}}}"))
@@ -260,10 +264,7 @@ mod tests {
     #[test]
     fn test_aggregate_closures() {
         assert_eq!(aggregate_closures("crate::foo"), "crate::foo");
-        assert_eq!(
-            aggregate_closures("crate::foo::{closure#0}"),
-            "crate::foo"
-        );
+        assert_eq!(aggregate_closures("crate::foo::{closure#0}"), "crate::foo");
         assert_eq!(
             aggregate_closures("crate::foo::{closure#0}::{closure#1}"),
             "crate::foo"
@@ -325,12 +326,18 @@ mod tests {
     fn test_normalize_impl_shim() {
         // Type at crate root -> type-level impl.
         assert_eq!(
-            normalize_impl_shim("<my_crate::Type as Trait>::method", "my_crate"),
+            normalize_impl_shim(
+                "<my_crate::Type as Trait>::method",
+                "my_crate"
+            ),
             Some("my_crate::Type::{{impl}}".to_string())
         );
         // Type in submodule -> type-level impl.
         assert_eq!(
-            normalize_impl_shim("<my_crate::module::Type as Trait>::method", "my_crate"),
+            normalize_impl_shim(
+                "<my_crate::module::Type as Trait>::method",
+                "my_crate"
+            ),
             Some("my_crate::module::Type::{{impl}}".to_string())
         );
         // Relative path (no crate prefix) -> gets crate prefix added.

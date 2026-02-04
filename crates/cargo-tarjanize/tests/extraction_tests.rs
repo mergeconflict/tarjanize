@@ -18,7 +18,53 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use tarjanize_schemas::{Module, SymbolGraph};
+use tarjanize_schemas::{Crate, Module, SymbolGraph};
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Iterate over all crates (compilation units) in the symbol graph.
+///
+/// With the Package/Target/Crate structure, crates are nested under
+/// `packages[pkg].targets[target]`. This helper flattens that for tests
+/// that need to iterate over all crates.
+fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
+    graph.packages.values().flat_map(|pkg| pkg.targets.values())
+}
+
+/// Get a crate by name (looks for lib target in package with matching name).
+///
+/// Handles the name normalization: package names use hyphens, crate names use
+/// underscores. First tries exact match, then tries with hyphen/underscore
+/// conversion.
+fn get_crate_by_name<'a>(
+    graph: &'a SymbolGraph,
+    crate_name: &str,
+) -> Option<&'a Crate> {
+    // Try package name with hyphens (e.g., "my-crate")
+    if let Some(pkg) = graph.packages.get(crate_name) {
+        return pkg.targets.get("lib");
+    }
+    // Try package name with underscores converted to hyphens
+    let hyphenated = crate_name.replace('_', "-");
+    if let Some(pkg) = graph.packages.get(&hyphenated) {
+        return pkg.targets.get("lib");
+    }
+    // Try underscored name (crate name format)
+    let underscored = crate_name.replace('-', "_");
+    for (pkg_name, pkg) in &graph.packages {
+        if pkg_name.replace('-', "_") == underscored {
+            return pkg.targets.get("lib");
+        }
+    }
+    None
+}
+
+/// Check if a crate exists in the graph (by package/crate name).
+fn has_crate(graph: &SymbolGraph, name: &str) -> bool {
+    get_crate_by_name(graph, name).is_some()
+}
 
 /// Path to the cargo-tarjanize binary.
 fn cargo_tarjanize_bin() -> &'static str {
@@ -142,7 +188,7 @@ fn has_edge(graph: &SymbolGraph, from: &str, to: &str) -> bool {
         false
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if check_module(&crate_data.root, from, to) {
             return true;
         }
@@ -181,7 +227,7 @@ fn collect_all_dependencies(graph: &SymbolGraph) -> Vec<String> {
     }
 
     let mut deps = Vec::new();
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         collect_module_deps(&crate_data.root, &mut deps);
     }
     deps
@@ -222,7 +268,8 @@ fn get_symbol_deps(
         None
     }
 
-    let crate_data = graph.crates.get(crate_name).expect("crate not found");
+    let crate_data =
+        get_crate_by_name(graph, crate_name).expect("crate not found");
     find_in_module(&crate_data.root, symbol_name).unwrap_or_default()
 }
 
@@ -251,7 +298,7 @@ fn get_impl_anchors(
         None
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if let Some(anchors) = find_in_module(&crate_data.root) {
             return anchors;
         }
@@ -997,8 +1044,13 @@ fn test_std_only_no_deps() {
     let graph = extract_fixture("std_only_no_deps");
     // caller should have no local dependencies (only uses std)
     let all_deps = collect_all_dependencies(&graph);
-    let local_deps: Vec<_> =
-        all_deps.iter().filter(|d| !d.contains("std::")).collect();
+    // Filter out:
+    // - External crate names (no `::` in them, e.g., "std", "core")
+    // - Old-style std deps (contain "std::")
+    let local_deps: Vec<_> = all_deps
+        .iter()
+        .filter(|d| d.contains("::") && !d.contains("std::"))
+        .collect();
     // Only dependencies should be to the function itself or synthesized test main
     assert!(
         local_deps.is_empty()
@@ -1207,18 +1259,18 @@ fn test_anchor_external_trait_ref_type_param() {
 #[test]
 fn test_anchor_crate_prefixed_self_type() {
     let graph = extract_fixture("anchor_crate_prefixed_self_type");
-    // Verify anchors include the full crate-prefixed path, not just the type name.
-    // This is important for cross-crate workspace support. The fixture is renamed
-    // to "fixture" during test execution, so we check for "fixture::" prefix.
+    // Verify anchors include the full package/target-prefixed path, not just the
+    // type name. This is important for cross-crate workspace support. The fixture
+    // package is "fixture", so we check for "[fixture/lib]::" prefix.
     assert_has_anchor_exact(
         &graph,
         "impl MyTrait for MyType",
-        "fixture::MyType",
+        "[fixture/lib]::MyType",
     );
     assert_has_anchor_exact(
         &graph,
         "impl MyTrait for MyType",
-        "fixture::MyTrait",
+        "[fixture/lib]::MyTrait",
     );
 }
 
@@ -1262,7 +1314,7 @@ fn get_symbol_kind(graph: &SymbolGraph, name: &str) -> Option<String> {
         None
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if let Some(kind) = find_in_module(&crate_data.root, name) {
             return Some(kind);
         }
@@ -1298,7 +1350,7 @@ fn get_impl_name(graph: &SymbolGraph) -> Option<String> {
         None
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if let Some(name) = find_in_module(&crate_data.root) {
             return Some(name);
         }
@@ -1334,7 +1386,7 @@ fn get_symbol_visibility(
         None
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if let Some(vis) = find_in_module(&crate_data.root, name) {
             return Some(vis);
         }
@@ -1863,9 +1915,9 @@ fn test_virtual_workspace_nested_crates() {
     let graph = extract_fixture("virtual_workspace_nested_crates");
     // The nested member_a crate should be found and extracted.
     assert!(
-        graph.crates.contains_key("member_a"),
+        has_crate(&graph, "member_a"),
         "member_a should be in the graph: {:?}",
-        graph.crates.keys().collect::<Vec<_>>()
+        graph.packages.keys().collect::<Vec<_>>()
     );
     // The hello function should exist.
     assert!(
@@ -1889,14 +1941,14 @@ fn test_dev_dep_cycle() {
 
     // Both crates should be extracted.
     assert!(
-        graph.crates.contains_key("crate_a"),
+        has_crate(&graph, "crate_a"),
         "crate_a should be in the graph: {:?}",
-        graph.crates.keys().collect::<Vec<_>>()
+        graph.packages.keys().collect::<Vec<_>>()
     );
     assert!(
-        graph.crates.contains_key("crate_b"),
+        has_crate(&graph, "crate_b"),
         "crate_b should be in the graph: {:?}",
-        graph.crates.keys().collect::<Vec<_>>()
+        graph.packages.keys().collect::<Vec<_>>()
     );
 
     // crate_b::function_in_b should depend on crate_a (via function_in_a call).
@@ -1904,6 +1956,68 @@ fn test_dev_dep_cycle() {
     assert!(
         deps.iter().any(|d| d.contains("crate_a")),
         "function_in_b should depend on crate_a, but found: {deps:?}"
+    );
+}
+
+/// Test: lib and test targets are extracted separately with correct cfg(test) handling.
+///
+/// When compiling a lib target (no --test flag), #[cfg(test)] code should be
+/// excluded. When compiling a test target (--test flag), #[cfg(test)] code
+/// should be included. This test verifies rustc's cfg handling works correctly
+/// through our extraction pipeline.
+///
+/// Uses `dev_dep_cycle` fixture which has a `#[cfg(test)]` module in `crate_a`.
+#[test]
+fn test_lib_and_test_target_separation() {
+    let graph = extract_fixture("dev_dep_cycle");
+
+    // Get crate_a's package.
+    let pkg = graph
+        .packages
+        .get("crate_a")
+        .expect("crate_a package should exist");
+
+    // Both lib and test targets should be extracted.
+    assert!(
+        pkg.targets.contains_key("lib"),
+        "lib target should exist, found: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pkg.targets.contains_key("test"),
+        "test target should exist, found: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+
+    let lib_target = pkg.targets.get("lib").unwrap();
+    let test_target = pkg.targets.get("test").unwrap();
+
+    // Lib target should NOT have the #[cfg(test)] "tests" submodule.
+    assert!(
+        !lib_target.root.submodules.contains_key("tests"),
+        "lib target should NOT contain #[cfg(test)] module, but found submodules: {:?}",
+        lib_target.root.submodules.keys().collect::<Vec<_>>()
+    );
+
+    // Lib target should have the public function.
+    assert!(
+        lib_target.root.symbols.contains_key("function_in_a"),
+        "lib target should have function_in_a"
+    );
+
+    // Test target SHOULD have the #[cfg(test)] "tests" submodule.
+    assert!(
+        test_target.root.submodules.contains_key("tests"),
+        "test target should contain #[cfg(test)] module, but found submodules: {:?}",
+        test_target.root.submodules.keys().collect::<Vec<_>>()
+    );
+
+    // The tests module should have the test function.
+    let tests_module = test_target.root.submodules.get("tests").unwrap();
+    assert!(
+        tests_module.symbols.contains_key("test_using_crate_b"),
+        "tests module should have test_using_crate_b, found: {:?}",
+        tests_module.symbols.keys().collect::<Vec<_>>()
     );
 }
 

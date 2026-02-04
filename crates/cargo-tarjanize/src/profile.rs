@@ -207,7 +207,10 @@ impl ProfileData {
     /// Get crate overhead costs.
     ///
     /// Returns None if no overhead was recorded for this crate.
-    pub fn get_crate_overhead(&self, crate_name: &str) -> Option<&CrateOverhead> {
+    pub fn get_crate_overhead(
+        &self,
+        crate_name: &str,
+    ) -> Option<&CrateOverhead> {
         self.crate_overhead.get(crate_name)
     }
 
@@ -445,7 +448,10 @@ mod tests {
 
     #[test]
     fn test_categorize_event_backend() {
-        assert_eq!(categorize_event("LLVM_module_codegen"), EventCategory::Backend);
+        assert_eq!(
+            categorize_event("LLVM_module_codegen"),
+            EventCategory::Backend
+        );
         assert_eq!(categorize_event("codegen_module"), EventCategory::Backend);
     }
 
@@ -477,10 +483,7 @@ mod tests {
             extract_crate_name("tarjanize_schemas-0060816"),
             "tarjanize_schemas"
         );
-        assert_eq!(
-            extract_crate_name("my-crate-name-abc123"),
-            "my-crate-name"
-        );
+        assert_eq!(extract_crate_name("my-crate-name-abc123"), "my-crate-name");
         // No hex suffix - use whole name.
         assert_eq!(extract_crate_name("simple_crate"), "simple_crate");
     }

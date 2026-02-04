@@ -59,26 +59,26 @@ enum Commands {
     },
 }
 
-/// Prints a single crate's details in table format.
-fn print_crate_detail(crate_detail: &tarjanize_cost::CrateOnPath) {
+/// Prints a single target's details in table format.
+fn print_target_detail(target_detail: &tarjanize_cost::TargetOnPath) {
     // Format dependencies: show first few, then count if many.
-    let deps_str = if crate_detail.dependencies.is_empty() {
+    let deps_str = if target_detail.dependencies.is_empty() {
         "(none)".to_string()
-    } else if crate_detail.dependencies.len() <= 3 {
-        crate_detail.dependencies.join(", ")
+    } else if target_detail.dependencies.len() <= 3 {
+        target_detail.dependencies.join(", ")
     } else {
         format!(
             "{}, ... (+{} more)",
-            crate_detail.dependencies[..3].join(", "),
-            crate_detail.dependencies.len() - 3
+            target_detail.dependencies[..3].join(", "),
+            target_detail.dependencies.len() - 3
         )
     };
 
     println!(
         "{:>12.2}  {:>12.2}  {:<40}  {}",
-        crate_detail.cost,
-        crate_detail.cumulative_cost,
-        crate_detail.name,
+        target_detail.cost,
+        target_detail.cumulative_cost,
+        target_detail.name,
         deps_str
     );
 }
@@ -128,7 +128,7 @@ fn main() -> Result<()> {
 
             println!("Critical path cost: {:.2} ms", result.cost);
             println!("Total cost:         {:.2} ms", result.total_cost);
-            println!("Crate count:        {}", result.crate_count);
+            println!("Target count:       {}", result.target_count);
             println!("Symbol count:       {}", result.symbol_count);
             println!(
                 "Parallelism ratio:  {:.2}x",
@@ -136,30 +136,33 @@ fn main() -> Result<()> {
             );
 
             if !result.path_details.is_empty() {
-                println!("\nCritical path ({} crates):\n", result.path.len());
+                println!("\nCritical path ({} targets):\n", result.path.len());
 
                 println!(
                     "{:>12}  {:>12}  {:<40}  Dependencies",
-                    "Cost (ms)", "Cumulative", "Crate"
+                    "Cost (ms)", "Cumulative", "Target"
                 );
                 println!("{}", "-".repeat(100));
 
-                for crate_detail in &result.path_details {
-                    print_crate_detail(crate_detail);
+                for target_detail in &result.path_details {
+                    print_target_detail(target_detail);
                 }
             }
 
-            if !result.all_crates.is_empty() {
-                println!("\nAll crates by cost ({} crates):\n", result.all_crates.len());
+            if !result.all_targets.is_empty() {
+                println!(
+                    "\nAll targets by cost ({} targets):\n",
+                    result.all_targets.len()
+                );
 
                 println!(
                     "{:>12}  {:>12}  {:<40}  Dependencies",
-                    "Cost (ms)", "Cumulative", "Crate"
+                    "Cost (ms)", "Cumulative", "Target"
                 );
                 println!("{}", "-".repeat(100));
 
-                for crate_detail in &result.all_crates {
-                    print_crate_detail(crate_detail);
+                for target_detail in &result.all_targets {
+                    print_target_detail(target_detail);
                 }
             }
 

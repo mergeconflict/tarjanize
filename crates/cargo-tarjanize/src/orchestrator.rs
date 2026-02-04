@@ -11,14 +11,14 @@
 //! immediately after each crate compiles. This allows the driver to delete
 //! raw profile files early, avoiding disk space exhaustion on large workspaces.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Command, ExitCode};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
-use cargo_metadata::MetadataCommand;
-use tarjanize_schemas::{Crate, Module, SymbolGraph};
+use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
+use tarjanize_schemas::{Package, SymbolGraph};
 use tempfile::TempDir;
 use tracing::{debug, info, warn};
 
@@ -36,6 +36,10 @@ pub const ENV_WORKSPACE_CRATES: &str = "TARJANIZE_WORKSPACE_CRATES";
 /// Environment variable that tells the driver where to write self-profile data.
 /// When set, the driver adds `-Zself-profile` flags to rustc invocations.
 pub const ENV_PROFILE_DIR: &str = "TARJANIZE_PROFILE_DIR";
+
+/// Filename for the crate mapping file within the output directory.
+/// Maps crate names (underscores) to package names (may have hyphens).
+const CRATE_MAPPING_FILENAME: &str = "crate_mapping.json";
 
 /// Run the orchestrator: coordinate cargo check and aggregate results.
 pub fn run(cli: &Cli) -> ExitCode {
@@ -121,6 +125,10 @@ fn run_inner(cli: &Cli) -> Result<()> {
     let profile_dir =
         TempDir::new().context("failed to create profile directory")?;
 
+    // Write crate mapping file for use during result aggregation.
+    // This maps crate names (underscores) to package names (hyphens).
+    write_crate_mapping(&metadata, output_dir.path())?;
+
     // Run cargo build with our wrapper.
     // We use `cargo build` instead of `cargo check` because:
     // 1. Backend (LLVM) timing requires actual codegen, not just type checking
@@ -159,8 +167,9 @@ fn run_inner(cli: &Cli) -> Result<()> {
 
     // Aggregate results from all JSON files in the output directory.
     // The driver has already applied costs and deleted profile files,
-    // so we just need to merge the Crate structures.
-    let graph = aggregate_results(output_dir.path(), &workspace_crates)?;
+    // so we just need to merge the Crate structures and add dependencies.
+    let graph =
+        aggregate_results(output_dir.path(), &workspace_crates, &metadata)?;
 
     // Output the combined symbol graph as JSON to the specified file.
     let file = fs::File::create(&cli.output).with_context(|| {
@@ -199,242 +208,452 @@ fn find_manifest_path(cli: &Cli) -> Result<std::path::PathBuf> {
     }
 }
 
-/// Read all JSON files from the output directory and merge them into a `SymbolGraph`.
+/// Read all JSON files from the output directory and build a `SymbolGraph`.
 ///
-/// The driver has already applied costs to each crate, so we just merge.
+/// The driver has already applied costs to each crate. We build the Package/Target
+/// structure, populate dependencies from cargo metadata, and transform symbol paths
+/// from crate-name format to package/target format.
 fn aggregate_results(
     output_dir: &Path,
     workspace_crates: &[String],
+    metadata: &Metadata,
 ) -> Result<SymbolGraph> {
-    let mut crates: HashMap<String, Crate> = HashMap::new();
+    // Load the crate mapping that was written before cargo build.
+    let crate_mapping = load_crate_mapping(output_dir)?;
 
-    // Read all .json files in the output directory.
+    let mut packages: HashMap<String, Package> = HashMap::new();
+
+    // Read all .json files in the output directory (excluding crate_mapping.json).
     for entry in
         fs::read_dir(output_dir).context("failed to read output directory")?
     {
         let entry = entry?;
         let path = entry.path();
 
-        // Skip mono-items files (they're .txt, not .json).
-        if path.extension().is_some_and(|ext| ext == "json") {
-            let content = fs::read_to_string(&path).with_context(|| {
-                format!("failed to read {}", path.display())
-            })?;
-
-            let result: CrateResult = serde_json::from_str(&content)
-                .with_context(|| {
-                    format!("failed to parse {}", path.display())
-                })?;
-
-            // Merge this crate's data into the result.
-            merge_crate(&mut crates, result.crate_name, result.crate_data);
+        // Skip non-JSON files and the crate mapping file.
+        let is_json = path.extension().is_some_and(|ext| ext == "json");
+        let is_mapping = path
+            .file_name()
+            .is_some_and(|n| n == CRATE_MAPPING_FILENAME);
+        if !is_json || is_mapping {
+            continue;
         }
+
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+
+        let result: CrateResult = serde_json::from_str(&content)
+            .with_context(|| format!("failed to parse {}", path.display()))?;
+
+        // Parse filename to extract target key.
+        // Filename format: {crate_name}_{target_key}.json
+        // where target_key has / replaced with _ (e.g., bin_foo for bin/foo)
+        let target_key =
+            parse_target_key_from_filename(&path, &result.crate_name);
+
+        // Look up the package name from the crate mapping.
+        // Fall back to the heuristic if not found (shouldn't happen for
+        // workspace crates, but handles edge cases).
+        let package_name = crate_mapping
+            .get(&result.crate_name)
+            .cloned()
+            .unwrap_or_else(|| result.crate_name.replace('_', "-"));
+
+        // Insert into the package's targets map.
+        let package = packages.entry(package_name).or_default();
+        package.targets.insert(target_key, result.crate_data);
     }
 
-    // Verify we got results for all workspace crates.
+    // Verify we got results for all workspace packages.
     for pkg_name in workspace_crates {
-        let crate_name = pkg_name.replace('-', "_");
-        if !crates.contains_key(&crate_name) {
+        if !packages.contains_key(pkg_name) {
             warn!(
                 pkg_name,
-                crate_name,
                 "no extraction results (may be platform-specific or have no lib/bin targets)"
             );
         }
     }
 
-    info!(crate_count = crates.len(), "aggregated crate results");
+    // Populate target-level dependencies from cargo metadata.
+    populate_dependencies(&mut packages, metadata);
 
-    Ok(SymbolGraph { crates })
+    // Transform symbol paths from crate-name format to package/target format.
+    // Symbol dependencies use paths like "crate_name::module::symbol" which need
+    // to become "[package-name/lib]::module::symbol".
+    transform_symbol_paths(&mut packages, &crate_mapping);
+
+    info!(package_count = packages.len(), "aggregated package results");
+
+    Ok(SymbolGraph { packages })
 }
 
-/// Merge a Crate into the crates map.
+/// Parse target key from output filename.
 ///
-/// If the crate already exists, merge the modules and take max of overhead.
-/// Multiple targets (lib, test, bin) may produce separate Crate results
-/// that need to be combined.
-fn merge_crate(
-    crates: &mut HashMap<String, Crate>,
-    crate_name: String,
-    crate_data: Crate,
-) {
-    use std::collections::hash_map::Entry;
-
-    match crates.entry(crate_name) {
-        Entry::Vacant(e) => {
-            e.insert(crate_data);
+/// Filename format: `{crate_name}_{target_key}.json`
+/// where `target_key` has `/` replaced with `_` (e.g., `bin_foo` for `bin/foo`).
+fn parse_target_key_from_filename(path: &Path, crate_name: &str) -> String {
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+    let prefix = format!("{crate_name}_");
+    if let Some(suffix) = stem.strip_prefix(&prefix) {
+        // Convert bin_foo back to bin/foo
+        if let Some(rest) = suffix.strip_prefix("bin_") {
+            format!("bin/{rest}")
+        } else if let Some(rest) = suffix.strip_prefix("example_") {
+            format!("example/{rest}")
+        } else if let Some(rest) = suffix.strip_prefix("bench_") {
+            format!("bench/{rest}")
+        } else {
+            suffix.to_string()
         }
-        Entry::Occupied(mut e) => {
-            let existing = e.get_mut();
+    } else {
+        "lib".to_string()
+    }
+}
 
-            // Merge root modules.
-            merge_module(&mut existing.root, crate_data.root);
+/// Populate target dependencies from cargo metadata.
+///
+/// For each target in the symbol graph, extract its dependencies from the
+/// corresponding package in cargo metadata. Dependencies are formatted as
+/// `"{package}/{target}"` (e.g., `"serde/lib"`, `"my-package/lib"`).
+fn populate_dependencies(
+    packages: &mut HashMap<String, Package>,
+    metadata: &Metadata,
+) {
+    for cargo_pkg in metadata.workspace_packages() {
+        let Some(pkg) = packages.get_mut(cargo_pkg.name.as_str()) else {
+            // Package exists in metadata but wasn't extracted (platform-specific, etc.)
+            continue;
+        };
 
-            // Take max of overhead (different targets may see different costs).
-            existing.linking_ms = existing.linking_ms.max(crate_data.linking_ms);
-            existing.metadata_ms =
-                existing.metadata_ms.max(crate_data.metadata_ms);
+        // Collect dependencies by kind from cargo metadata.
+        let mut normal_deps: HashSet<String> = HashSet::new();
+        let mut dev_deps: HashSet<String> = HashSet::new();
+
+        for dep in &cargo_pkg.dependencies {
+            // Format as package/lib (assuming lib target for dependencies).
+            let dep_ref = format!("{}/lib", dep.name);
+
+            match dep.kind {
+                DependencyKind::Normal => {
+                    normal_deps.insert(dep_ref);
+                }
+                DependencyKind::Development => {
+                    dev_deps.insert(dep_ref);
+                }
+                DependencyKind::Build | DependencyKind::Unknown => {
+                    // Build dependencies don't affect runtime compilation order.
+                    // Unknown kinds are ignored.
+                }
+            }
+        }
+
+        // Populate dependencies for each target.
+        for (target_key, crate_data) in &mut pkg.targets {
+            if target_key == "lib" {
+                // Lib target: only normal dependencies.
+                crate_data.dependencies.clone_from(&normal_deps);
+            } else if target_key == "test" {
+                // Test target: normal + dev deps + own lib.
+                let mut deps = normal_deps.clone();
+                deps.extend(dev_deps.clone());
+                deps.insert(format!("{}/lib", cargo_pkg.name));
+                crate_data.dependencies = deps;
+            } else if target_key.starts_with("bin/") {
+                // Bin target: normal deps + own lib.
+                let mut deps = normal_deps.clone();
+                deps.insert(format!("{}/lib", cargo_pkg.name));
+                crate_data.dependencies = deps;
+            } else {
+                // Other targets (example, bench): normal deps + own lib.
+                let mut deps = normal_deps.clone();
+                deps.insert(format!("{}/lib", cargo_pkg.name));
+                crate_data.dependencies = deps;
+            }
         }
     }
 }
 
-/// Merge a module's contents into an existing module.
-fn merge_module(existing: &mut Module, module: Module) {
-    use std::collections::hash_map::Entry;
+// Note: The merge_crate/merge_module functions were removed as part of the
+// target separation refactor. With separate lib/test/bin targets, we no longer
+// merge results - each target gets its own entry in Package.targets.
 
-    // Merge symbols. For overlapping symbols (same code compiled in both lib
-    // and test targets), take max costs as a conservative estimate.
-    for (name, symbol) in module.symbols {
-        match existing.symbols.entry(name) {
-            Entry::Vacant(e) => {
-                e.insert(symbol);
-            }
-            Entry::Occupied(mut e) => {
-                // Symbol exists in both - take max of costs and union deps.
-                let existing_sym = e.get_mut();
-                existing_sym.frontend_cost_ms =
-                    existing_sym.frontend_cost_ms.max(symbol.frontend_cost_ms);
-                existing_sym.backend_cost_ms =
-                    existing_sym.backend_cost_ms.max(symbol.backend_cost_ms);
-                // Union dependencies - lib and test targets may see different deps.
-                existing_sym.dependencies.extend(symbol.dependencies);
+/// Write a crate-to-package mapping file for the orchestrator to use later.
+///
+/// This maps crate names (as rustc sees them, with underscores) to package
+/// names (as Cargo defines them, may have hyphens). The mapping is used when
+/// aggregating results to correctly associate driver output with packages.
+///
+/// The mapping file is written to `{output_dir}/crate_mapping.json`.
+fn write_crate_mapping(
+    metadata: &Metadata,
+    output_dir: &Path,
+) -> Result<HashMap<String, String>> {
+    let mut mapping = HashMap::new();
+
+    for pkg in metadata.workspace_packages() {
+        // For each lib target, map the crate name to the package name.
+        // The crate name for a lib target is either explicitly set in
+        // Cargo.toml [lib] name, or defaults to the package name with
+        // hyphens replaced by underscores.
+        for target in &pkg.targets {
+            // Check if this is a lib target by looking for Lib kind.
+            let is_lib = target
+                .kind
+                .iter()
+                .any(|k| matches!(k, cargo_metadata::TargetKind::Lib));
+            if is_lib {
+                // target.name is the crate name (underscores).
+                mapping.insert(target.name.clone(), pkg.name.to_string());
             }
         }
+        // Also add a mapping for the default crate name (package name with
+        // hyphens → underscores). This handles cases where there's no explicit
+        // lib target or it uses the default name.
+        let default_crate_name = pkg.name.replace('-', "_");
+        mapping
+            .entry(default_crate_name)
+            .or_insert_with(|| pkg.name.to_string());
     }
 
-    // Recursively merge submodules.
-    for (name, submodule) in module.submodules {
-        merge_submodule(&mut existing.submodules, name, submodule);
+    let mapping_path = output_dir.join(CRATE_MAPPING_FILENAME);
+    let file = fs::File::create(&mapping_path).with_context(|| {
+        format!("failed to create mapping file {}", mapping_path.display())
+    })?;
+    serde_json::to_writer(file, &mapping).with_context(|| {
+        format!("failed to write mapping file {}", mapping_path.display())
+    })?;
+
+    debug!(
+        path = %mapping_path.display(),
+        entries = mapping.len(),
+        "wrote crate mapping file"
+    );
+
+    Ok(mapping)
+}
+
+/// Load the crate mapping from a file.
+fn load_crate_mapping(output_dir: &Path) -> Result<HashMap<String, String>> {
+    let mapping_path = output_dir.join(CRATE_MAPPING_FILENAME);
+    let content = fs::read_to_string(&mapping_path).with_context(|| {
+        format!("failed to read mapping file {}", mapping_path.display())
+    })?;
+    let mapping: HashMap<String, String> = serde_json::from_str(&content)
+        .with_context(|| {
+            format!("failed to parse mapping file {}", mapping_path.display())
+        })?;
+    Ok(mapping)
+}
+
+/// Transform symbol paths from crate-name format to package/target format.
+///
+/// Symbol dependencies and impl anchors use paths like `crate_name::module::symbol`.
+/// This function transforms them to `[package-name/target]::module::symbol`.
+///
+/// For same-package references, we use the current target (a binary referencing
+/// its own symbols stays within that binary). For cross-package references, we
+/// use `/lib` since that's what rustc resolves for `use other_crate::foo`.
+fn transform_symbol_paths(
+    packages: &mut HashMap<String, Package>,
+    crate_mapping: &HashMap<String, String>,
+) {
+    for (package_name, package) in &mut *packages {
+        for (target_key, crate_data) in &mut package.targets {
+            transform_module_paths(
+                &mut crate_data.root,
+                crate_mapping,
+                package_name,
+                target_key,
+            );
+        }
     }
 }
 
-/// Recursively merge a submodule.
-fn merge_submodule(
-    submodules: &mut HashMap<String, Module>,
-    name: String,
-    module: Module,
+/// Transform paths in a module and its submodules recursively.
+fn transform_module_paths(
+    module: &mut tarjanize_schemas::Module,
+    crate_mapping: &HashMap<String, String>,
+    current_package: &str,
+    current_target: &str,
 ) {
-    use std::collections::hash_map::Entry;
+    use tarjanize_schemas::SymbolKind;
 
-    match submodules.entry(name) {
-        Entry::Vacant(e) => {
-            e.insert(module);
-        }
-        Entry::Occupied(mut e) => {
-            merge_module(e.get_mut(), module);
+    for symbol in module.symbols.values_mut() {
+        // Transform dependencies.
+        symbol.dependencies = symbol
+            .dependencies
+            .iter()
+            .map(|dep| transform_path(dep, crate_mapping, current_package, current_target))
+            .collect();
+
+        // Transform impl anchors if this is an impl block.
+        if let SymbolKind::Impl { anchors, .. } = &mut symbol.kind {
+            *anchors = anchors
+                .iter()
+                .map(|anchor| transform_path(anchor, crate_mapping, current_package, current_target))
+                .collect();
         }
     }
+
+    for submodule in module.submodules.values_mut() {
+        transform_module_paths(submodule, crate_mapping, current_package, current_target);
+    }
+}
+
+/// Transform a single symbol path from crate-name to package/target format.
+///
+/// Input:  `crate_name::module::symbol`
+/// Output: `[package-name/target]::module::symbol`
+///
+/// For same-package references, uses the current target. For cross-package
+/// references, uses `/lib`. If the crate name is not in the mapping (external
+/// crate), the path is returned unchanged.
+fn transform_path(
+    path: &str,
+    crate_mapping: &HashMap<String, String>,
+    current_package: &str,
+    current_target: &str,
+) -> String {
+    // Parse the crate name from the path (everything before the first `::`)
+    let Some((crate_name, rest)) = path.split_once("::") else {
+        // No `::` in path - return unchanged.
+        return path.to_string();
+    };
+
+    // Look up the package name. If not found, this is an external crate.
+    let Some(package_name) = crate_mapping.get(crate_name) else {
+        // External crate - return unchanged.
+        return path.to_string();
+    };
+
+    // Determine the target: same package uses current target, cross-package uses lib.
+    let target = if package_name == current_package {
+        current_target
+    } else {
+        "lib"
+    };
+
+    format!("[{package_name}/{target}]::{rest}")
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-
-    use tarjanize_schemas::{Symbol, SymbolKind, Visibility};
-
     use super::*;
 
-    /// Helper to create a symbol with specified dependencies.
-    fn make_symbol(deps: &[&str]) -> Symbol {
-        Symbol {
-            file: "test.rs".to_string(),
-            frontend_cost_ms: 1.0,
-            backend_cost_ms: 1.0,
-            dependencies: deps.iter().map(|&s| s.to_string()).collect(),
-            kind: SymbolKind::ModuleDef {
-                kind: "Function".to_string(),
-                visibility: Visibility::Public,
-            },
-        }
+    /// Build a crate mapping for tests.
+    fn make_mapping(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
-    /// Regression test: merging lib and test targets must union dependencies.
-    ///
-    /// When `--all-targets` is used, the same symbol may be compiled in both
-    /// lib and test targets. The lib target typically has cross-crate deps
-    /// (it exports APIs used by other crates), while the test target may have
-    /// fewer deps (tests often only use internal APIs).
-    ///
-    /// If test results are processed first and we keep only the first symbol's
-    /// deps, we lose the lib's cross-crate dependencies. This breaks critical
-    /// path analysis because crates appear to have no dependencies.
     #[test]
-    fn test_merge_module_unions_dependencies() {
-        // Simulate test target: symbol with no cross-crate deps.
-        let test_symbol = make_symbol(&["my_crate::internal_fn"]);
+    fn test_transform_path_same_package_uses_current_target() {
+        // When a symbol in a binary references another symbol in the same package,
+        // it should use the current target (bin/foo), not lib.
+        let mapping = make_mapping(&[("my_bin", "my-package")]);
 
-        // Simulate lib target: same symbol but with cross-crate deps.
-        let lib_symbol = make_symbol(&[
-            "my_crate::internal_fn",
-            "other_crate::external_type",
-            "another_crate::another_fn",
+        let result = transform_path(
+            "my_bin::SomeStruct",
+            &mapping,
+            "my-package",    // current package
+            "bin/my_bin",    // current target
+        );
+
+        assert_eq!(result, "[my-package/bin/my_bin]::SomeStruct");
+    }
+
+    #[test]
+    fn test_transform_path_cross_package_uses_lib() {
+        // When a symbol references another package, it should use lib target.
+        let mapping = make_mapping(&[
+            ("my_bin", "my-package"),
+            ("other_crate", "other-package"),
         ]);
 
-        // Create "existing" module (from test target, processed first).
-        let mut existing = Module {
-            symbols: HashMap::from([("foo".to_string(), test_symbol)]),
-            submodules: HashMap::new(),
-        };
-
-        // Create "incoming" module (from lib target, processed second).
-        let incoming = Module {
-            symbols: HashMap::from([("foo".to_string(), lib_symbol)]),
-            submodules: HashMap::new(),
-        };
-
-        // Merge lib into test.
-        merge_module(&mut existing, incoming);
-
-        // Verify the merged symbol has ALL dependencies from both targets.
-        let merged = existing.symbols.get("foo").expect("symbol should exist");
-        let deps: HashSet<&str> =
-            merged.dependencies.iter().map(String::as_str).collect();
-
-        assert!(
-            deps.contains("my_crate::internal_fn"),
-            "should have internal dep"
+        let result = transform_path(
+            "other_crate::SomeStruct",
+            &mapping,
+            "my-package",    // current package
+            "bin/my_bin",    // current target
         );
-        assert!(
-            deps.contains("other_crate::external_type"),
-            "should have cross-crate dep from lib target"
-        );
-        assert!(
-            deps.contains("another_crate::another_fn"),
-            "should have cross-crate dep from lib target"
-        );
+
+        assert_eq!(result, "[other-package/lib]::SomeStruct");
     }
 
-    /// Test that merge takes max of costs from both targets.
     #[test]
-    fn test_merge_module_takes_max_costs() {
-        let mut sym1 = make_symbol(&[]);
-        sym1.frontend_cost_ms = 10.0;
-        sym1.backend_cost_ms = 5.0;
+    fn test_transform_path_external_crate_unchanged() {
+        // External crates (not in mapping) should be returned unchanged.
+        let mapping = make_mapping(&[("my_crate", "my-package")]);
 
-        let mut sym2 = make_symbol(&[]);
-        sym2.frontend_cost_ms = 8.0;
-        sym2.backend_cost_ms = 12.0;
-
-        let mut existing = Module {
-            symbols: HashMap::from([("foo".to_string(), sym1)]),
-            submodules: HashMap::new(),
-        };
-
-        let incoming = Module {
-            symbols: HashMap::from([("foo".to_string(), sym2)]),
-            submodules: HashMap::new(),
-        };
-
-        merge_module(&mut existing, incoming);
-
-        let merged = existing.symbols.get("foo").unwrap();
-        assert!(
-            (merged.frontend_cost_ms - 10.0).abs() < f64::EPSILON,
-            "should take max frontend cost"
+        let result = transform_path(
+            "serde::Serialize",
+            &mapping,
+            "my-package",
+            "lib",
         );
-        assert!(
-            (merged.backend_cost_ms - 12.0).abs() < f64::EPSILON,
-            "should take max backend cost"
+
+        assert_eq!(result, "serde::Serialize");
+    }
+
+    #[test]
+    fn test_transform_path_no_colons_unchanged() {
+        // Paths without `::` (just crate name) should be returned unchanged.
+        let mapping = make_mapping(&[("my_crate", "my-package")]);
+
+        let result = transform_path(
+            "std",
+            &mapping,
+            "my-package",
+            "lib",
         );
+
+        assert_eq!(result, "std");
+    }
+
+    #[test]
+    fn test_transform_path_test_target() {
+        // Test target referencing its own symbols should use test target.
+        let mapping = make_mapping(&[("my_crate", "my-package")]);
+
+        let result = transform_path(
+            "my_crate::tests::helper",
+            &mapping,
+            "my-package",
+            "test",
+        );
+
+        assert_eq!(result, "[my-package/test]::tests::helper");
+    }
+
+    #[test]
+    fn test_transform_path_nested_module() {
+        // Nested module paths should be preserved.
+        let mapping = make_mapping(&[("my_crate", "my-package")]);
+
+        let result = transform_path(
+            "my_crate::foo::bar::Baz",
+            &mapping,
+            "my-package",
+            "lib",
+        );
+
+        assert_eq!(result, "[my-package/lib]::foo::bar::Baz");
+    }
+
+    #[test]
+    fn test_transform_path_hyphenated_package_name() {
+        // Package names with hyphens should be preserved in output.
+        let mapping = make_mapping(&[("my_crate", "my-hyphenated-package")]);
+
+        let result = transform_path(
+            "my_crate::Item",
+            &mapping,
+            "my-hyphenated-package",
+            "lib",
+        );
+
+        assert_eq!(result, "[my-hyphenated-package/lib]::Item");
     }
 }

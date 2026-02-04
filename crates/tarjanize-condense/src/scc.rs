@@ -12,7 +12,9 @@ use indexmap::IndexSet;
 use petgraph::algo::condensation;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::unionfind::UnionFind;
-use tarjanize_schemas::{Module, Symbol, SymbolGraph, SymbolKind};
+use tarjanize_schemas::{
+    Crate, Module, Package, Symbol, SymbolGraph, SymbolKind,
+};
 use tracing::debug;
 
 /// Extracts impl anchors from a symbol kind, if it's an impl.
@@ -21,6 +23,32 @@ fn impl_anchors(kind: &SymbolKind) -> Option<&HashSet<String>> {
         SymbolKind::Impl { anchors, .. } => Some(anchors),
         SymbolKind::ModuleDef { .. } => None,
     }
+}
+
+/// Parse a symbol path in the `[package/target]::module::symbol` format.
+///
+/// Returns `(prefix, rest)` where:
+/// - `prefix` is the bracketed portion like `[package/target]`
+/// - `rest` is the remaining path like `module::symbol`
+///
+/// If the path doesn't start with `[`, returns `None` (old format path).
+fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
+    if !path.starts_with('[') {
+        return None;
+    }
+    // Find the closing bracket.
+    let bracket_end = path.find(']')?;
+    let prefix = &path[..=bracket_end];
+    // The rest should start with `::`
+    let rest = path.get(bracket_end + 1..)?.strip_prefix("::")?;
+    Some((prefix, rest))
+}
+
+/// Extract the package name from a bracketed path prefix like `[package/target]`.
+fn extract_package_from_prefix(prefix: &str) -> Option<&str> {
+    // Prefix is `[package/target]`, extract package by finding `/`.
+    let inner = prefix.strip_prefix('[')?.strip_suffix(']')?;
+    inner.split('/').next()
 }
 
 /// Applies HMR (Habib-Morvan-Rampon) transitive reduction to a set of deps.
@@ -72,10 +100,21 @@ struct SymbolIndex<'a> {
 
 impl<'a> SymbolIndex<'a> {
     /// Builds an index by walking the entire `SymbolGraph`.
+    ///
+    /// Iterates over all packages and their targets, indexing symbols
+    /// with paths like `[package-name/target]::module::symbol`.
+    ///
+    /// The path format uses brackets to delimit the package/target portion,
+    /// which makes parsing unambiguous (brackets don't appear in Rust paths).
     fn build(symbol_graph: &'a SymbolGraph) -> Self {
         let mut index = SymbolIndex::default();
-        for (crate_name, crate_data) in &symbol_graph.crates {
-            index.add_module(crate_name, crate_name, &crate_data.root);
+        for (package_name, package) in &symbol_graph.packages {
+            for (target_key, crate_data) in &package.targets {
+                // Paths use [package/target]::module::symbol format.
+                // This matches the format used by the orchestrator for dependencies.
+                let crate_prefix = format!("[{package_name}/{target_key}]");
+                index.add_module(package_name, &crate_prefix, &crate_data.root);
+            }
         }
         index
     }
@@ -146,9 +185,9 @@ pub(crate) fn condense_and_partition(
     symbol_graph: &SymbolGraph,
 ) -> SymbolGraph {
     // Handle empty graph case.
-    if symbol_graph.crates.is_empty() {
+    if symbol_graph.packages.is_empty() {
         return SymbolGraph {
-            crates: HashMap::new(),
+            packages: HashMap::new(),
         };
     }
 
@@ -158,7 +197,7 @@ pub(crate) fn condense_and_partition(
 
     if index.len() == 0 {
         return SymbolGraph {
-            crates: HashMap::new(),
+            packages: HashMap::new(),
         };
     }
 
@@ -188,10 +227,8 @@ pub(crate) fn condense_and_partition(
     for impl_idx in 0..index.len() {
         if let Some(anchors) = impl_anchors(&index.get_symbol(impl_idx).kind) {
             // Find valid anchors (those that exist in the index).
-            let valid_anchors: Vec<usize> = anchors
-                .iter()
-                .filter_map(|p| index.get_index(p))
-                .collect();
+            let valid_anchors: Vec<usize> =
+                anchors.iter().filter_map(|p| index.get_index(p)).collect();
 
             if valid_anchors.is_empty() {
                 continue;
@@ -220,7 +257,10 @@ pub(crate) fn condense_and_partition(
             back_edge_count += 1;
         }
     }
-    debug!(back_edge_count, "Added synthetic back-edges for anchor constraints");
+    debug!(
+        back_edge_count,
+        "Added synthetic back-edges for anchor constraints"
+    );
 
     // Step 3: Run condensation. Returns DiGraph<Vec<usize>, ()>.
     // make_acyclic=true removes self-loops and deduplicates edges between SCCs.
@@ -499,7 +539,8 @@ fn build_output_graph(
     let mut used_names: HashSet<String> = HashSet::new();
 
     // Compute crate names and overhead for each set.
-    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64, f64)> = Vec::new();
+    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64, f64)> =
+        Vec::new();
     for (set_id, symbol_indices) in sets {
         // Collect unique original crates contributing to this set.
         let original_crates_set: HashSet<&str> = symbol_indices
@@ -513,15 +554,25 @@ fn build_output_graph(
         // Count unique external crates that this synthetic crate depends on.
         // "External" means not one of the original crates that contributed to
         // this synthetic crate.
-        let mut dep_crates: HashSet<&str> = HashSet::new();
+        let mut dep_crates: HashSet<String> = HashSet::new();
         for &sym_idx in &symbol_indices {
             let symbol = index.get_symbol(sym_idx);
             for dep_path in &symbol.dependencies {
-                // Extract crate name from path like "crate_name::module::item"
-                if let Some(dep_crate) = dep_path.split("::").next() {
-                    // Only count external dependencies
-                    if !original_crates_set.contains(dep_crate) {
-                        dep_crates.insert(dep_crate);
+                // Extract package name from path.
+                // New format: "[package/target]::module::item"
+                // Old format: "crate_name::module::item" (fallback)
+                let dep_pkg =
+                    if let Some((prefix, _)) = parse_bracketed_path(dep_path) {
+                        extract_package_from_prefix(prefix).map(str::to_string)
+                    } else {
+                        // Fallback to old format for external crates.
+                        dep_path.split("::").next().map(str::to_string)
+                    };
+
+                if let Some(pkg) = dep_pkg {
+                    // Only count external dependencies.
+                    if !original_crates_set.contains(pkg.as_str()) {
+                        dep_crates.insert(pkg);
                     }
                 }
             }
@@ -542,7 +593,8 @@ fn build_output_graph(
             .iter()
             .map(|&i| index.get_symbol(i).frontend_cost_ms)
             .sum();
-        let metadata_ms = METADATA_SLOPE * total_frontend_ms + METADATA_INTERCEPT;
+        let metadata_ms =
+            METADATA_SLOPE * total_frontend_ms + METADATA_INTERCEPT;
 
         let base_name = original_crates.join("-");
         let crate_name = if used_names.contains(&base_name) {
@@ -551,7 +603,13 @@ fn build_output_graph(
             base_name
         };
         used_names.insert(crate_name.clone());
-        set_crate_data.push((set_id, crate_name, symbol_indices, linking_ms, metadata_ms));
+        set_crate_data.push((
+            set_id,
+            crate_name,
+            symbol_indices,
+            linking_ms,
+            metadata_ms,
+        ));
     }
 
     // Pass 1: Compute old path → new path mapping.
@@ -562,21 +620,30 @@ fn build_output_graph(
     let path_mapping = compute_path_mapping(index, &set_crate_names);
 
     // Pass 2: Build output graph using the mapping.
-    let mut crates = HashMap::new();
-    for (_set_id, crate_name, symbol_indices, linking_ms, metadata_ms) in set_crate_data {
+    // Each partition becomes a separate package. The target type is determined
+    // from the original target type of the symbols (they all share the same type
+    // since symbols from different target types can't form cycles).
+    let mut packages = HashMap::new();
+    for (_set_id, crate_name, symbol_indices, linking_ms, metadata_ms) in
+        set_crate_data
+    {
         let root_module =
             build_module_tree(index, &symbol_indices, &path_mapping);
-        crates.insert(
-            crate_name,
-            tarjanize_schemas::Crate {
-                linking_ms,
-                metadata_ms,
-                root: root_module,
-            },
-        );
+        let crate_data = Crate {
+            linking_ms,
+            metadata_ms,
+            root: root_module,
+            // Dependencies for synthetic crates would need to be computed
+            // from symbol dependencies if needed for downstream analysis.
+            ..Default::default()
+        };
+
+        let mut targets = HashMap::new();
+        targets.insert("synthetic".to_string(), crate_data);
+        packages.insert(crate_name, Package { targets });
     }
 
-    SymbolGraph { crates }
+    SymbolGraph { packages }
 }
 
 /// Computes a mapping from old symbol paths to new symbol paths.
@@ -599,16 +666,26 @@ fn compute_path_mapping(
             let full_path = index.get_path(symbol_idx);
             let original_crate = index.get_original_crate(symbol_idx);
 
-            let parts: Vec<&str> = full_path.split("::").collect();
-            if parts.len() < 2 {
+            // Parse path in new format: [package/target]::module::symbol
+            let rest = if let Some((_, rest)) = parse_bracketed_path(full_path)
+            {
+                rest
+            } else {
+                // Fallback to old format: crate::module::symbol
+                full_path.split_once("::").map_or(full_path, |(_, r)| r)
+            };
+
+            let parts: Vec<&str> = rest.split("::").collect();
+            if parts.is_empty() {
                 continue;
             }
 
-            let module_parts: Vec<String> = parts[1..parts.len() - 1]
+            // Last part is symbol name, everything else is module path.
+            let symbol_name = parts[parts.len() - 1].to_string();
+            let module_parts: Vec<String> = parts[..parts.len() - 1]
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect();
-            let symbol_name = parts[parts.len() - 1].to_string();
 
             path_to_symbols
                 .entry((module_parts, symbol_name))
@@ -617,6 +694,7 @@ fn compute_path_mapping(
         }
 
         // Compute new paths, handling conflicts.
+        // Output paths use the same bracketed format as input: [package/synthetic]::path
         for ((module_path, symbol_name), occurrences) in path_to_symbols {
             if occurrences.len() == 1 {
                 // No conflict - symbol keeps its relative path in the new crate.
@@ -624,10 +702,10 @@ fn compute_path_mapping(
                 let old_path = index.get_path(*symbol_idx).to_string();
 
                 let new_path = if module_path.is_empty() {
-                    format!("{crate_name}::{symbol_name}")
+                    format!("[{crate_name}/synthetic]::{symbol_name}")
                 } else {
                     format!(
-                        "{}::{}::{}",
+                        "[{}/synthetic]::{}::{}",
                         crate_name,
                         module_path.join("::"),
                         symbol_name
@@ -644,11 +722,11 @@ fn compute_path_mapping(
                         format!("conflict_from_{original_crate}");
                     let new_path = if module_path.is_empty() {
                         format!(
-                            "{crate_name}::{conflict_module}::{symbol_name}"
+                            "[{crate_name}/synthetic]::{conflict_module}::{symbol_name}"
                         )
                     } else {
                         format!(
-                            "{}::{}::{conflict_module}::{symbol_name}",
+                            "[{}/synthetic]::{}::{conflict_module}::{symbol_name}",
                             crate_name,
                             module_path.join("::")
                         )
@@ -687,18 +765,25 @@ fn build_module_tree(
         let full_path = index.get_path(symbol_idx);
         let original_crate = index.get_original_crate(symbol_idx);
 
-        // Parse the path: crate::mod1::mod2::symbol_name
-        let parts: Vec<&str> = full_path.split("::").collect();
-        if parts.len() < 2 {
+        // Parse path in new format: [package/target]::module::symbol
+        let rest = if let Some((_, rest)) = parse_bracketed_path(full_path) {
+            rest
+        } else {
+            // Fallback to old format: crate::module::symbol
+            full_path.split_once("::").map_or(full_path, |(_, r)| r)
+        };
+
+        let parts: Vec<&str> = rest.split("::").collect();
+        if parts.is_empty() {
             continue; // Invalid path
         }
 
-        // Skip the original crate name, keep module path and symbol name.
-        let module_parts: Vec<String> = parts[1..parts.len() - 1]
+        // Last part is symbol name, everything else is module path.
+        let symbol_name = parts[parts.len() - 1].to_string();
+        let module_parts: Vec<String> = parts[..parts.len() - 1]
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let symbol_name = parts[parts.len() - 1].to_string();
 
         path_to_symbols
             .entry((module_parts, symbol_name))
@@ -801,6 +886,14 @@ mod tests {
 
     use super::*;
 
+    /// Helper to create a path in the new `[package/target]::symbol` format.
+    ///
+    /// For test crates, we use the package name as both package and crate name,
+    /// with "lib" as the default target.
+    fn path(package: &str, symbol: &str) -> String {
+        format!("[{package}/lib]::{symbol}")
+    }
+
     /// Helper to create a simple symbol for testing.
     fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
@@ -815,30 +908,81 @@ mod tests {
         }
     }
 
+    /// Helper to create a crate with default overhead for testing.
+    fn make_crate(symbols: HashMap<String, Symbol>) -> Crate {
+        Crate {
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Creates a package with a single "lib" target containing the given crate.
+    fn make_package(crate_data: Crate) -> Package {
+        let mut targets = HashMap::new();
+        targets.insert("lib".to_string(), crate_data);
+        Package { targets }
+    }
+
+    /// Creates a `SymbolGraph` from a map of package names to crates.
+    fn make_graph(crates: HashMap<String, Crate>) -> SymbolGraph {
+        let packages = crates
+            .into_iter()
+            .map(|(name, crate_data)| (name, make_package(crate_data)))
+            .collect();
+        SymbolGraph { packages }
+    }
+
+    /// Helper to get all synthetic crates from packages (for test assertions).
+    /// Returns a map from package name to crate data.
+    #[expect(dead_code, reason = "available for future tests")]
+    fn get_synthetic_crates(graph: &SymbolGraph) -> HashMap<&str, &Crate> {
+        graph
+            .packages
+            .iter()
+            .filter_map(|(name, pkg)| {
+                pkg.targets.get("synthetic").map(|c| (name.as_str(), c))
+            })
+            .collect()
+    }
+
+    /// Helper to get the synthetic crate from a package (condense output).
+    fn get_synthetic(pkg: &Package) -> &tarjanize_schemas::Crate {
+        pkg.targets.get("synthetic").expect("expected synthetic target")
+    }
+
+    /// Helper to get the root module from a package (assumes single target).
+    fn get_root(pkg: &Package) -> &Module {
+        &get_synthetic(pkg).root
+    }
+
+    /// Helper to count total symbols across all packages.
+    #[expect(dead_code, reason = "utility function for future tests")]
+    fn count_total_symbols(graph: &SymbolGraph) -> usize {
+        graph
+            .packages
+            .values()
+            .flat_map(|pkg| pkg.targets.values())
+            .map(|c| c.root.symbols.len())
+            .sum()
+    }
+
     #[test]
     fn test_single_symbol_stays_in_crate() {
         let mut symbols = HashMap::new();
         symbols.insert("foo".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Single symbol stays in its original crate.
-        assert_eq!(result.crates.len(), 1);
-        assert!(result.crates.contains_key("my_crate"));
+        assert_eq!(result.packages.len(), 1);
+        assert!(result.packages.contains_key("my_crate"));
     }
 
     #[test]
@@ -846,32 +990,22 @@ mod tests {
         // a → b → c (chain with single dependents)
         // All should merge into one crate.
         let mut symbols = HashMap::new();
-        symbols.insert("a".to_string(), make_symbol(&["my_crate::b"]));
-        symbols.insert("b".to_string(), make_symbol(&["my_crate::c"]));
+        symbols.insert("a".to_string(), make_symbol(&[&path("my_crate", "b")]));
+        symbols.insert("b".to_string(), make_symbol(&[&path("my_crate", "c")]));
         symbols.insert("c".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Chain should merge into one crate.
-        assert_eq!(result.crates.len(), 1);
+        assert_eq!(result.packages.len(), 1);
 
         // All three symbols should be in that crate.
-        let crate_module = result.crates.values().next().unwrap();
-        assert_eq!(crate_module.root.symbols.len(), 3);
+        let crate_module = result.packages.values().next().unwrap();
+        assert_eq!(get_root(crate_module).symbols.len(), 3);
     }
 
     #[test]
@@ -881,33 +1015,26 @@ mod tests {
         // C → D (chain).
         // Result: {A}, {B}, {C, D} - three crates.
         let mut symbols = HashMap::new();
-        symbols.insert("a".to_string(), make_symbol(&["my_crate::c"]));
-        symbols.insert("b".to_string(), make_symbol(&["my_crate::c"]));
-        symbols.insert("c".to_string(), make_symbol(&["my_crate::d"]));
+        symbols.insert("a".to_string(), make_symbol(&[&path("my_crate", "c")]));
+        symbols.insert("b".to_string(), make_symbol(&[&path("my_crate", "c")]));
+        symbols.insert("c".to_string(), make_symbol(&[&path("my_crate", "d")]));
         symbols.insert("d".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Should have 3 crates: {A}, {B}, {C, D}.
-        assert_eq!(result.crates.len(), 3);
+        assert_eq!(result.packages.len(), 3);
 
         // Count total symbols across all crates.
-        let total_symbols: usize =
-            result.crates.values().map(|m| m.root.symbols.len()).sum();
+        let total_symbols: usize = result
+            .packages
+            .values()
+            .map(|m| get_root(m).symbols.len())
+            .sum();
         assert_eq!(total_symbols, 4);
     }
 
@@ -918,33 +1045,23 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             "a".to_string(),
-            make_symbol(&["my_crate::b", "my_crate::c"]),
+            make_symbol(&[&path("my_crate", "b"), &path("my_crate", "c")]),
         );
-        symbols.insert("b".to_string(), make_symbol(&["my_crate::d"]));
-        symbols.insert("c".to_string(), make_symbol(&["my_crate::d"]));
+        symbols.insert("b".to_string(), make_symbol(&[&path("my_crate", "d")]));
+        symbols.insert("c".to_string(), make_symbol(&[&path("my_crate", "d")]));
         symbols.insert("d".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Diamond should merge into one crate.
-        assert_eq!(result.crates.len(), 1);
+        assert_eq!(result.packages.len(), 1);
 
-        let crate_module = result.crates.values().next().unwrap();
-        assert_eq!(crate_module.root.symbols.len(), 4);
+        let crate_module = result.packages.values().next().unwrap();
+        assert_eq!(get_root(crate_module).symbols.len(), 4);
     }
 
     #[test]
@@ -952,41 +1069,37 @@ mod tests {
         // foo and bar form a cycle - they must stay together.
         let mut symbols = HashMap::new();
         // foo depends on bar, bar depends on foo (cycle).
-        symbols.insert("foo".to_string(), make_symbol(&["my_crate::bar"]));
-        symbols.insert("bar".to_string(), make_symbol(&["my_crate::foo"]));
-
-        let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
+        symbols.insert(
+            "foo".to_string(),
+            make_symbol(&[&path("my_crate", "bar")]),
+        );
+        symbols.insert(
+            "bar".to_string(),
+            make_symbol(&[&path("my_crate", "foo")]),
         );
 
-        let symbol_graph = SymbolGraph { crates };
+        let mut crates = HashMap::new();
+        crates.insert("my_crate".to_string(), make_crate(symbols));
+
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Cycle = one SCC = one crate.
-        assert_eq!(result.crates.len(), 1);
+        assert_eq!(result.packages.len(), 1);
 
-        let crate_module = result.crates.values().next().unwrap();
-        assert_eq!(crate_module.root.symbols.len(), 2);
+        let crate_module = result.packages.values().next().unwrap();
+        assert_eq!(get_root(crate_module).symbols.len(), 2);
     }
 
     #[test]
     fn test_empty_graph() {
         let symbol_graph = SymbolGraph {
-            crates: HashMap::new(),
+            packages: HashMap::new(),
         };
 
         let result = condense_and_partition(&symbol_graph);
 
-        assert!(result.crates.is_empty());
+        assert!(result.packages.is_empty());
     }
 
     #[test]
@@ -997,31 +1110,21 @@ mod tests {
         let mut symbols = HashMap::new();
         symbols.insert(
             "a".to_string(),
-            make_symbol(&["my_crate::b", "my_crate::c"]),
+            make_symbol(&[&path("my_crate", "b"), &path("my_crate", "c")]),
         );
-        symbols.insert("b".to_string(), make_symbol(&["my_crate::d"]));
-        symbols.insert("c".to_string(), make_symbol(&["my_crate::d"]));
+        symbols.insert("b".to_string(), make_symbol(&[&path("my_crate", "d")]));
+        symbols.insert("c".to_string(), make_symbol(&[&path("my_crate", "d")]));
         symbols.insert("d".to_string(), make_symbol(&[]));
-        symbols.insert("e".to_string(), make_symbol(&["my_crate::d"]));
+        symbols.insert("e".to_string(), make_symbol(&[&path("my_crate", "d")]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Should have 3 crates: {A, B, C}, {D}, {E}.
-        assert_eq!(result.crates.len(), 3);
+        assert_eq!(result.packages.len(), 3);
     }
 
     #[test]
@@ -1030,39 +1133,29 @@ mod tests {
         // Result: {A}, {B}, {C} - three crates.
         // A's dependency on C should be rewritten to the new crate's path.
         let mut symbols = HashMap::new();
-        symbols.insert("a".to_string(), make_symbol(&["my_crate::c"]));
-        symbols.insert("b".to_string(), make_symbol(&["my_crate::c"]));
+        symbols.insert("a".to_string(), make_symbol(&[&path("my_crate", "c")]));
+        symbols.insert("b".to_string(), make_symbol(&[&path("my_crate", "c")]));
         symbols.insert("c".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Should have 3 crates.
-        assert_eq!(result.crates.len(), 3);
+        assert_eq!(result.packages.len(), 3);
 
         // Find the crate containing 'a' and verify its dependency on 'c'.
         let mut found_a = false;
-        for module in result.crates.values() {
-            if let Some(symbol_a) = module.root.symbols.get("a") {
+        for module in result.packages.values() {
+            if let Some(symbol_a) = get_root(module).symbols.get("a") {
                 found_a = true;
-                // The dependency should be rewritten to my_crate::c (same crate name
-                // since all symbols came from my_crate).
+                // The dependency should be rewritten to [my_crate/synthetic]::c
+                // (same crate name since all symbols came from my_crate).
                 assert!(
-                    symbol_a.dependencies.contains("my_crate::c"),
-                    "Expected dependency on my_crate::c, got {:?}",
+                    symbol_a.dependencies.contains("[my_crate/synthetic]::c"),
+                    "Expected dependency on [my_crate/synthetic]::c, got {:?}",
                     symbol_a.dependencies
                 );
             }
@@ -1074,58 +1167,43 @@ mod tests {
     fn test_cross_crate_dependencies_rewritten() {
         // Two crates: crate_a has 'foo' depending on 'bar' in crate_b.
         // foo → bar (chain), so they merge into one crate named "crate_a-crate_b".
-        // foo's dependency should be rewritten from "crate_b::bar" to
-        // "crate_a-crate_b::bar".
+        // foo's dependency should be rewritten from "[crate_b/lib]::bar" to
+        // "[crate_a-crate_b/synthetic]::bar".
         let mut crates = HashMap::new();
 
         let mut symbols_a = HashMap::new();
-        symbols_a.insert("foo".to_string(), make_symbol(&["crate_b::bar"]));
-        crates.insert(
-            "crate_a".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols: symbols_a,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        symbols_a
+            .insert("foo".to_string(), make_symbol(&[&path("crate_b", "bar")]));
+        crates.insert("crate_a".to_string(), make_crate(symbols_a));
 
         let mut symbols_b = HashMap::new();
         symbols_b.insert("bar".to_string(), make_symbol(&[]));
-        crates.insert(
-            "crate_b".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols: symbols_b,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("crate_b".to_string(), make_crate(symbols_b));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Should merge into one crate since it's a simple chain.
-        assert_eq!(result.crates.len(), 1);
+        assert_eq!(result.packages.len(), 1);
 
         // The merged crate name should combine both original crate names.
-        let (crate_name, module) = result.crates.iter().next().unwrap();
+        let (crate_name, module) = result.packages.iter().next().unwrap();
         assert!(
             crate_name.contains("crate_a") && crate_name.contains("crate_b"),
             "Expected merged crate name, got {crate_name}"
         );
 
-        // foo's dependency should now point to the new path.
-        let foo = module.root.symbols.get("foo").expect("foo should exist");
+        // foo's dependency should now point to the new path with bracketed format.
+        let foo = get_root(module)
+            .symbols
+            .get("foo")
+            .expect("foo should exist");
         assert_eq!(foo.dependencies.len(), 1);
         let dep = foo.dependencies.iter().next().unwrap();
+        // Path format: [package/synthetic]::symbol
         assert!(
-            dep.starts_with(crate_name),
-            "Dependency should start with new crate name {crate_name}, got {dep}"
+            dep.starts_with(&format!("[{crate_name}/synthetic]")),
+            "Dependency should start with [{crate_name}/synthetic], got {dep}"
         );
         assert!(dep.ends_with("::bar"), "Dependency should end with ::bar");
     }
@@ -1153,16 +1231,20 @@ mod tests {
         // crates: {A}, {B}, {C, D}.
         let graph: SymbolGraph = serde_json::from_str(
             r#"{
-            "crates": {
+            "packages": {
                 "c": {
-                    "linking_ms": 0,
-                    "metadata_ms": 0,
-                    "root": {
-                        "symbols": {
-                            "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C", "c::D"] },
-                            "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C"] },
-                            "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::D"] },
-                            "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } }
+                    "targets": {
+                        "lib": {
+                            "linking_ms": 0,
+                            "metadata_ms": 0,
+                            "root": {
+                                "symbols": {
+                                    "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::D"] },
+                                    "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
+                                    "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } }
+                                }
+                            }
                         }
                     }
                 }
@@ -1175,11 +1257,11 @@ mod tests {
 
         // Expected: {A}, {B}, {C, D}
         let mut partitions: Vec<Vec<&str>> = result
-            .crates
+            .packages
             .values()
             .map(|m| {
                 let mut syms: Vec<_> =
-                    m.root.symbols.keys().map(String::as_str).collect();
+                    get_root(m).symbols.keys().map(String::as_str).collect();
                 syms.sort_unstable();
                 syms
             })
@@ -1237,17 +1319,21 @@ mod tests {
         // Expected result: {A, E}, {B}, {C, D} — 3 partitions
         let graph: SymbolGraph = serde_json::from_str(
             r#"{
-            "crates": {
+            "packages": {
                 "c": {
-                    "linking_ms": 0,
-                    "metadata_ms": 0,
-                    "root": {
-                        "symbols": {
-                            "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C", "c::E"] },
-                            "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C"] },
-                            "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::D"] },
-                            "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } },
-                            "E": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::D"] }
+                    "targets": {
+                        "lib": {
+                            "linking_ms": 0,
+                            "metadata_ms": 0,
+                            "root": {
+                                "symbols": {
+                                    "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::E"] },
+                                    "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
+                                    "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } },
+                                    "E": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] }
+                                }
+                            }
                         }
                     }
                 }
@@ -1260,11 +1346,11 @@ mod tests {
 
         // Expected: {A, E}, {B}, {C, D} — 3 partitions
         let mut partitions: Vec<Vec<&str>> = result
-            .crates
+            .packages
             .values()
             .map(|m| {
                 let mut syms: Vec<_> =
-                    m.root.symbols.keys().map(String::as_str).collect();
+                    get_root(m).symbols.keys().map(String::as_str).collect();
                 syms.sort_unstable();
                 syms
             })
@@ -1299,17 +1385,21 @@ mod tests {
         //
         // Final: {A}, {B}, {C, D, impl_D}
         let graph: SymbolGraph = serde_json::from_str(r#"{
-            "crates": {
+            "packages": {
                 "c": {
-                    "linking_ms": 0,
-                    "metadata_ms": 0,
-                    "root": {
-                        "symbols": {
-                            "A":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C", "c::impl_D"] },
-                            "B":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["c::C"] },
-                            "C":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" }, "dependencies": ["c::D"] },
-                            "D":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" } },
-                            "impl_D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "impl": { "name": "impl D", "anchors": ["c::D"] }, "dependencies": ["c::D"] }
+                    "targets": {
+                        "lib": {
+                            "linking_ms": 0,
+                            "metadata_ms": 0,
+                            "root": {
+                                "symbols": {
+                                    "A":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::impl_D"] },
+                                    "B":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" }, "dependencies": ["[c/lib]::D"] },
+                                    "D":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" } },
+                                    "impl_D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "impl": { "name": "impl D", "anchors": ["[c/lib]::D"] }, "dependencies": ["[c/lib]::D"] }
+                                }
+                            }
                         }
                     }
                 }
@@ -1320,20 +1410,20 @@ mod tests {
 
         assert_eq!(
             result
-                .crates
+                .packages
                 .values()
-                .map(|m| m.root.symbols.len())
+                .map(|m| get_root(m).symbols.len())
                 .sum::<usize>(),
             5,
             "Should have all 5 symbols"
         );
         // Expected partitioning: {A}, {B}, {C, D, impl_D}
         let mut partitions: Vec<Vec<&str>> = result
-            .crates
+            .packages
             .values()
             .map(|m| {
                 let mut syms: Vec<_> =
-                    m.root.symbols.keys().map(String::as_str).collect();
+                    get_root(m).symbols.keys().map(String::as_str).collect();
                 syms.sort_unstable();
                 syms
             })
@@ -1373,12 +1463,11 @@ mod tests {
         crates.insert(
             "crate_a".to_string(),
             tarjanize_schemas::Crate {
-                linking_ms: 0.0, // Original value; ignored
-                metadata_ms: 0.0,
                 root: Module {
                     symbols: symbols_a,
                     submodules: HashMap::new(),
                 },
+                ..Default::default()
             },
         );
 
@@ -1402,47 +1491,46 @@ mod tests {
         crates.insert(
             "crate_b".to_string(),
             tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
                 root: Module {
                     symbols: symbols_b,
                     submodules: HashMap::new(),
                 },
+                ..Default::default()
             },
         );
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Two independent symbols → two crates.
-        assert_eq!(result.crates.len(), 2);
+        assert_eq!(result.packages.len(), 2);
 
         // Find crates by their symbol content.
         let crate_a = result
-            .crates
+            .packages
             .values()
-            .find(|c| c.root.symbols.contains_key("a"))
+            .find(|c| get_root(c).symbols.contains_key("a"))
             .expect("crate with symbol a");
         let crate_b = result
-            .crates
+            .packages
             .values()
-            .find(|c| c.root.symbols.contains_key("b"))
+            .find(|c| get_root(c).symbols.contains_key("b"))
             .expect("crate with symbol b");
 
         // Crate A: 0 external deps → linking = 160 * 0 + 678 = 678
         let expected_a = LINKING_SLOPE * 0.0 + LINKING_INTERCEPT;
+        let linking_a = get_synthetic(crate_a).linking_ms;
         assert!(
-            (crate_a.linking_ms - expected_a).abs() < 0.01,
-            "Expected linking_ms ~{expected_a}, got {}",
-            crate_a.linking_ms
+            (linking_a - expected_a).abs() < 0.01,
+            "Expected linking_ms ~{expected_a}, got {linking_a}"
         );
 
         // Crate B: 1 external dep (ext) → linking = 160 * 1 + 678 = 838
         let expected_b = LINKING_SLOPE * 1.0 + LINKING_INTERCEPT;
+        let linking_b = get_synthetic(crate_b).linking_ms;
         assert!(
-            (crate_b.linking_ms - expected_b).abs() < 0.01,
-            "Expected linking_ms ~{expected_b}, got {}",
-            crate_b.linking_ms
+            (linking_b - expected_b).abs() < 0.01,
+            "Expected linking_ms ~{expected_b}, got {linking_b}"
         );
     }
 
@@ -1485,47 +1573,46 @@ mod tests {
         crates.insert(
             "my_crate".to_string(),
             tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0, // Original value; ignored for split crates
                 root: Module {
                     symbols,
                     submodules: HashMap::new(),
                 },
+                ..Default::default()
             },
         );
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
         // Two independent symbols → two crates.
-        assert_eq!(result.crates.len(), 2);
+        assert_eq!(result.packages.len(), 2);
 
         // Find crates by their symbol content.
         let crate_a = result
-            .crates
+            .packages
             .values()
-            .find(|c| c.root.symbols.contains_key("a"))
+            .find(|c| get_root(c).symbols.contains_key("a"))
             .expect("crate with symbol a");
         let crate_b = result
-            .crates
+            .packages
             .values()
-            .find(|c| c.root.symbols.contains_key("b"))
+            .find(|c| get_root(c).symbols.contains_key("b"))
             .expect("crate with symbol b");
 
         // Verify metadata estimated from formula: 0.26 * frontend + 1662
         let expected_a = METADATA_SLOPE * 1000.0 + METADATA_INTERCEPT; // 1922
         let expected_b = METADATA_SLOPE * 5000.0 + METADATA_INTERCEPT; // 2962
 
+        let metadata_a = get_synthetic(crate_a).metadata_ms;
+        let metadata_b = get_synthetic(crate_b).metadata_ms;
+
         assert!(
-            (crate_a.metadata_ms - expected_a).abs() < 0.01,
-            "Expected metadata_ms ~{expected_a}, got {}",
-            crate_a.metadata_ms
+            (metadata_a - expected_a).abs() < 0.01,
+            "Expected metadata_ms ~{expected_a}, got {metadata_a}"
         );
         assert!(
-            (crate_b.metadata_ms - expected_b).abs() < 0.01,
-            "Expected metadata_ms ~{expected_b}, got {}",
-            crate_b.metadata_ms
+            (metadata_b - expected_b).abs() < 0.01,
+            "Expected metadata_ms ~{expected_b}, got {metadata_b}"
         );
     }
-
 }

@@ -4,6 +4,15 @@
 //! blocks, etc.) in a workspace along with their dependency relationships.
 //! This is the output of the extraction phase and an input to subsequent
 //! analysis phases.
+//!
+//! ## Terminology
+//!
+//! We use Cargo and rustc terminology precisely:
+//! - **Package**: A Cargo.toml and its contents. Has a unique name (may have hyphens).
+//! - **Target**: A compilation unit within a package (lib, bin, test, etc.). Cargo's term.
+//! - **Crate**: What rustc compiles. Each target compiles to a crate.
+//!
+//! A Package contains multiple Targets, and each Target compiles to a Crate.
 
 use std::collections::{HashMap, HashSet};
 
@@ -24,31 +33,65 @@ fn is_zero(value: &f64) -> bool {
 /// Root structure representing the entire symbol graph of a workspace.
 ///
 /// The symbol graph captures all symbols and their dependencies within a
-/// Rust workspace. Each crate contains its root module (with symbols and
-/// submodules) plus crate-level overhead costs. Dependencies are stored
-/// directly on each symbol rather than as a separate edge list.
+/// Rust workspace. Each package contains targets (lib, bin, test, etc.),
+/// and each target compiles to a crate with its own module tree.
+/// Dependencies are stored directly on each symbol rather than as a
+/// separate edge list.
 #[derive(
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
 pub struct SymbolGraph {
-    /// All crates in the workspace, keyed by crate name.
-    pub crates: HashMap<String, Crate>,
+    /// All packages in the workspace, keyed by package name (hyphens preserved).
+    pub packages: HashMap<String, Package>,
 }
 
-/// A crate in the workspace with its module tree and overhead costs.
+/// A package in the workspace containing one or more compilation targets.
 ///
-/// Each crate has:
-/// - A root module containing all symbols and submodules
-/// - Fixed overhead costs (linking, metadata generation) that apply
-///   regardless of which symbols are included
+/// Each package corresponds to a Cargo.toml and contains multiple targets:
+/// - `lib`: The library target (if present)
+/// - `test`: Unit tests (`#[cfg(test)]` code in lib)
+/// - `bin/{name}`: Binary targets
+/// - `example/{name}`: Example targets
+/// - `bench/{name}`: Benchmark targets
+///
+/// Integration tests (files in `tests/`) are separate packages from Cargo's
+/// perspective and get their own entry in the top-level `packages` map.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
+pub struct Package {
+    /// Compilation targets for this package, keyed by target identifier.
+    /// Each target compiles to a separate crate (rustc compilation unit).
+    ///
+    /// Target keys use the format:
+    /// - `"lib"` for library targets
+    /// - `"test"` for unit tests
+    /// - `"bin/{name}"` for binary targets
+    /// - `"example/{name}"` for example targets
+    /// - `"bench/{name}"` for benchmark targets
+    pub targets: HashMap<String, Crate>,
+}
+
+/// A crate (rustc compilation unit) within a package.
+///
+/// Each crate represents a separate compilation unit with its own:
+/// - Module tree containing symbols
+/// - Overhead costs (linking, metadata generation)
+/// - Dependencies on other crates
+///
+/// This separation allows accurate modeling of:
+/// - Dev-dependency relationships (tests depend on libs, not vice versa)
+/// - Per-target compilation costs
+/// - Critical path through the actual build graph
 #[derive(
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
 pub struct Crate {
     /// Linking time in milliseconds.
     ///
-    /// Fixed cost for linking the crate's artifacts. This includes `link_crate`,
-    /// `link_binary`, and `link_rlib` events from self-profile. Not parallelizable.
+    /// Fixed cost for linking this crate's artifacts. This includes
+    /// `link_crate`, `link_binary`, and `link_rlib` events from self-profile.
+    /// Not parallelizable.
     #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(min = 0.0))]
     pub linking_ms: f64,
@@ -57,11 +100,24 @@ pub struct Crate {
     ///
     /// Fixed cost for generating crate metadata (`generate_crate_metadata`).
     /// This is required for downstream crates to depend on this one.
+    /// Only meaningful for lib targets.
     #[serde(default, skip_serializing_if = "is_zero")]
     #[schemars(range(min = 0.0))]
     pub metadata_ms: f64,
 
-    /// The root module containing all symbols and submodules.
+    /// Dependencies on other crates.
+    ///
+    /// Each entry is a crate reference in the format `"{package}/{target}"`:
+    /// - `"other-package/lib"` - depends on another package's library
+    /// - `"my-package/lib"` - test/bin crate depends on own library
+    ///
+    /// For lib crates: contains normal dependencies (`{dep-package}/lib`)
+    /// For test crates: normal + dev deps + own lib (`{self-package}/lib`)
+    /// For bin crates: normal deps + own lib (`{self-package}/lib`)
+    #[serde(default, skip_serializing_if = "HashSet::is_empty")]
+    pub dependencies: HashSet<String>,
+
+    /// The root module containing all symbols and submodules for this crate.
     pub root: Module,
 }
 
@@ -318,26 +374,48 @@ mod tests {
         )
     }
 
-    /// Strategy for generating arbitrary Crate values.
+    /// Strategy for generating arbitrary Crate values (compilation units).
     fn arb_crate() -> impl Strategy<Value = Crate> {
         (
             (0..1_000_000).prop_map(f64::from),
             (0..1_000_000).prop_map(f64::from),
+            // Dependencies are crate references like "package/lib" or "package/bin/name"
+            hash_set(arb_path(), 0..5),
             arb_module(),
         )
-            .prop_map(|(linking_ms, metadata_ms, root)| Crate {
-                linking_ms,
-                metadata_ms,
-                root,
-            })
+            .prop_map(
+                |(linking_ms, metadata_ms, dependencies, root)| Crate {
+                    linking_ms,
+                    metadata_ms,
+                    dependencies,
+                    root,
+                },
+            )
+    }
+
+    /// Strategy for generating target keys (lib, test, bin/name, etc.).
+    fn arb_target_key() -> impl Strategy<Value = String> {
+        prop_oneof![
+            Just("lib".to_string()),
+            Just("test".to_string()),
+            arb_name().prop_map(|n| format!("bin/{n}")),
+            arb_name().prop_map(|n| format!("example/{n}")),
+        ]
+    }
+
+    /// Strategy for generating arbitrary Package values.
+    fn arb_package() -> impl Strategy<Value = Package> {
+        // Generate 1-4 targets per package
+        hash_map(arb_target_key(), arb_crate(), 1..5)
+            .prop_map(|targets| Package { targets })
     }
 
     prop_compose! {
         /// Strategy for generating arbitrary SymbolGraph values.
         fn arb_symbol_graph()
-            (crates in hash_map(arb_name(), arb_crate(), 1..10))
+            (packages in hash_map(arb_name(), arb_package(), 1..10))
         -> SymbolGraph {
-            SymbolGraph { crates }
+            SymbolGraph { packages }
         }
     }
 

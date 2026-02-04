@@ -17,6 +17,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rustc_hir::Attribute;
+use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
 use rustc_middle::thir::{self, ExprKind, PatKind};
@@ -39,13 +41,21 @@ pub struct ExtractionResult {
 /// Dependencies on these crates will be captured; dependencies on external crates
 /// (like std) are filtered out.
 ///
+/// `test_only` controls filtering for test targets:
+/// - `false` (lib/bin targets): Include all items (cfg(test) items already excluded by compiler)
+/// - `true` (test targets): Only include items inside `#[cfg(test)]` blocks
+///
+/// This separation ensures no symbol duplication between lib and test targets.
+///
 /// Returns the module tree and a map from profile keys to symbol paths.
 pub fn extract_crate(
     tcx: TyCtxt<'_>,
     crate_name: &str,
     workspace_crates: &[String],
+    test_only: bool,
 ) -> ExtractionResult {
-    let mut extractor = Extractor::new(tcx, crate_name, workspace_crates);
+    let mut extractor =
+        Extractor::new(tcx, crate_name, workspace_crates, test_only);
     extractor.extract_all_items();
     extractor.into_result()
 }
@@ -57,6 +67,9 @@ struct Extractor<'tcx> {
     /// Workspace crate names for dependency filtering.
     /// Dependencies on these crates are captured; external deps are filtered out.
     workspace_crates: HashSet<String>,
+    /// When true, only extract items inside `#[cfg(test)]` blocks.
+    /// Used for test targets to avoid duplicating symbols from the lib target.
+    test_only: bool,
     /// Flat map of all extracted symbols, keyed by their `DefPath`.
     /// We build the module tree from this at the end.
     ///
@@ -70,6 +83,7 @@ impl<'tcx> Extractor<'tcx> {
         tcx: TyCtxt<'tcx>,
         crate_name: &str,
         workspace_crates: &[String],
+        test_only: bool,
     ) -> Self {
         // Normalize package names (hyphens) to crate names (underscores).
         // Cargo uses hyphens in package names but rustc uses underscores.
@@ -82,6 +96,7 @@ impl<'tcx> Extractor<'tcx> {
             tcx,
             crate_name: crate_name.to_string(),
             workspace_crates,
+            test_only,
             symbols: HashMap::new(),
         }
     }
@@ -113,6 +128,13 @@ impl<'tcx> Extractor<'tcx> {
         // - Nested functions inside functions
         // - Statics created by macro expansion (e.g., tracing's __CALLSITE)
         if self.is_nested_in_body(def_id) {
+            return;
+        }
+
+        // For test targets, only include items inside #[cfg(test)] blocks.
+        // This prevents duplication of symbols between lib and test targets.
+        let is_test_item = self.is_cfg_test(def_id);
+        if self.test_only && !is_test_item {
             return;
         }
 
@@ -1543,9 +1565,17 @@ impl<'tcx> Extractor<'tcx> {
     // Helper methods
     // -------------------------------------------------------------------------
 
-    /// Add a dependency if the `def_id` belongs to a workspace crate.
+    /// Add a dependency on `def_id`.
+    ///
+    /// For workspace crates: adds the full symbol path (e.g., `crate::module::Item`)
+    /// For external crates: adds just the crate name (e.g., `serde_json`)
+    ///
+    /// External crate deps are needed for accurate linking cost estimation in the
+    /// condense phase. The number of external crates a symbol depends on strongly
+    /// predicts that symbol's contribution to linking time.
     fn maybe_add_dep(&self, def_id: DefId, deps: &mut HashSet<String>) {
         if self.is_workspace_crate(def_id) {
+            // Workspace crate: add full symbol path.
             // Normalize the def_id (variants → enum, assoc items → container).
             let normalized = self.normalize_def_id(def_id);
 
@@ -1553,6 +1583,12 @@ impl<'tcx> Extractor<'tcx> {
             let path = self.raw_def_path(normalized);
 
             deps.insert(path);
+        } else if def_id.krate != LOCAL_CRATE {
+            // External crate: add just the crate name for linking cost estimation.
+            // We don't need the full path since we only care about which external
+            // crates are used, not which specific items within them.
+            let crate_name = self.tcx.crate_name(def_id.krate).to_string();
+            deps.insert(crate_name);
         }
     }
 
@@ -1621,6 +1657,77 @@ impl<'tcx> Extractor<'tcx> {
                 _ => current = parent,
             }
         }
+    }
+
+    /// Check if an item or any of its ancestors has a `#[cfg(test)]` attribute.
+    ///
+    /// This is used to detect test-only items when compiling with `--test`.
+    /// Items inside `#[cfg(test)]` modules should only be included in the test
+    /// target, not the lib target.
+    ///
+    /// Returns true if the item itself or any parent module has `cfg(test)`.
+    fn is_cfg_test(&self, def_id: DefId) -> bool {
+        // Check if this item or any ancestor has cfg(test).
+        let mut current = def_id;
+        loop {
+            // Check attributes on this item.
+            if self.has_cfg_test_attr(current) {
+                return true;
+            }
+
+            // Walk up to parent.
+            let parent = self.tcx.parent(current);
+            if parent == current || parent.is_crate_root() {
+                return false;
+            }
+            current = parent;
+        }
+    }
+
+    /// Check if a single `def_id` has a `cfg(test)` attribute.
+    ///
+    /// This examines the attributes on the item and looks for:
+    /// - `#[cfg(test)]` directly on the item
+    /// - `#[cfg_attr(..., test)]` that evaluated to include test
+    ///
+    /// Uses the `CfgTrace` attribute kind to detect cfg conditions.
+    fn has_cfg_test_attr(&self, def_id: DefId) -> bool {
+        use rustc_hir::OwnerId;
+        use rustc_hir::attrs::CfgEntry;
+
+        // Get attributes for this DefId.
+        // For local items, we can access via tcx.hir_attrs().
+        let Some(local_id) = def_id.as_local() else {
+            return false;
+        };
+
+        // Convert LocalDefId to OwnerId then to HirId.
+        let owner_id = OwnerId { def_id: local_id };
+
+        // Get all attributes on this item.
+        let attrs = self.tcx.hir_attrs(owner_id.into());
+
+        for attr in attrs {
+            // Check if this is a CfgTrace attribute with "test" condition.
+            // CfgTrace contains a list of (CfgEntry, Span) pairs.
+            // CfgEntry::NameValue { name, value, span } represents cfg(name) or cfg(name = "value").
+            // For #[cfg(test)], name == "test" and value is None.
+            if let Attribute::Parsed(AttributeKind::CfgTrace(entries)) = attr {
+                for (entry, _span) in entries {
+                    // CfgEntry is an enum with NameValue variant.
+                    // Match on it to extract the name and check if it's "test".
+                    if let CfgEntry::NameValue { name, .. } = entry
+                        && name.as_str() == "test"
+                    {
+                        let path = self.def_path_str(def_id);
+                        tracing::debug!(path, "item has cfg(test) attribute");
+                        return true;
+                    }
+                }
+            }
+        }
+
+        false
     }
 
     /// Normalize a `def_id`: collapse variants to their enum, assoc items to container,

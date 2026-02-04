@@ -71,21 +71,20 @@ pub fn run(args: &[String]) -> ExitCode {
         return run_via_rustc_driver(args, &mut NoOpCallbacks);
     }
 
-    // Determine if this is a test target.
+    // Determine target kind from rustc args.
+    let target_key = determine_target_key(args, &crate_name);
     let is_test = args.iter().any(|a| a == "--test");
 
     debug!(
         crate_name,
-        is_test, "extracting symbols from workspace crate"
+        target_key, is_test, "extracting symbols from workspace crate"
     );
-
-    // Determine target suffix for unique file naming.
-    let target_suffix = if is_test { "test" } else { "lib" };
 
     // This is a workspace crate - run with our extraction callbacks.
     let mut callbacks = TarjanizeCallbacks {
         config,
         crate_name,
+        is_test,
         extracted_module: Mutex::new(None),
     };
 
@@ -100,18 +99,18 @@ pub fn run(args: &[String]) -> ExitCode {
     // We need `default` for core events, `llvm` for backend costs per CGU,
     // and `args` for DefPath associations.
     //
-    // Each target (lib, test) gets its own profile subdirectory so they can
+    // Each target (lib, test, bin) gets its own profile subdirectory so they can
     // clean up independently without interfering with concurrent targets.
-    let target_profile_dir = callbacks
-        .config
-        .profile_dir
-        .join(format!("{}_{}", callbacks.crate_name, target_suffix));
+    // Use underscore-separated key for filesystem safety (bin/foo → bin_foo).
+    let target_profile_dir = callbacks.config.profile_dir.join(format!(
+        "{}_{}",
+        callbacks.crate_name,
+        target_key.replace('/', "_")
+    ));
     fs::create_dir_all(&target_profile_dir)
         .expect("failed to create profile subdirectory");
-    compiler_args.push(format!(
-        "-Zself-profile={}",
-        target_profile_dir.display()
-    ));
+    compiler_args
+        .push(format!("-Zself-profile={}", target_profile_dir.display()));
     compiler_args.push("-Zself-profile-events=default,llvm,args".to_string());
 
     // Print mono-items for backend cost distribution.
@@ -149,7 +148,7 @@ pub fn run(args: &[String]) -> ExitCode {
             &callbacks.config,
             &callbacks.crate_name,
             module,
-            target_suffix,
+            &target_key,
             &target_profile_dir,
         );
     }
@@ -227,6 +226,27 @@ fn find_crate_name(args: &[String]) -> Option<String> {
     None
 }
 
+/// Determine the target key from rustc arguments.
+///
+/// Returns a target key like "lib", "test", "bin/{name}".
+/// This is a simplified version - the full implementation will use the
+/// mapping file from the orchestrator.
+fn determine_target_key(args: &[String], crate_name: &str) -> String {
+    let is_test = args.iter().any(|a| a == "--test");
+    let is_bin = args.iter().any(|a| a == "--crate-type=bin")
+        || args
+            .windows(2)
+            .any(|w| w[0] == "--crate-type" && w[1] == "bin");
+
+    if is_test {
+        "test".to_string()
+    } else if is_bin {
+        format!("bin/{crate_name}")
+    } else {
+        "lib".to_string()
+    }
+}
+
 /// Callbacks implementation for symbol extraction.
 ///
 /// The extracted module is stored in `extracted_module` for post-compilation
@@ -234,6 +254,10 @@ fn find_crate_name(args: &[String]) -> Option<String> {
 struct TarjanizeCallbacks {
     config: DriverConfig,
     crate_name: String,
+    /// Whether this is a test target (compiled with `--test`).
+    /// When true, only `#[cfg(test)]` items are extracted to avoid
+    /// duplicating symbols from the lib target.
+    is_test: bool,
     /// The extracted module, populated by `after_analysis`.
     /// Stored here so we can apply costs after rustc completes.
     extracted_module: Mutex<Option<Module>>,
@@ -251,11 +275,14 @@ impl Callbacks for TarjanizeCallbacks {
         tcx: TyCtxt<'_>,
     ) -> Compilation {
         // Extract symbols from this crate.
-        info!(crate_name = %self.crate_name, "extracting symbols");
+        // For test targets (is_test=true), only extract #[cfg(test)] items
+        // to avoid duplicating symbols from the lib target.
+        info!(crate_name = %self.crate_name, is_test = self.is_test, "extracting symbols");
         let extraction = extract::extract_crate(
             tcx,
             &self.crate_name,
             &self.config.workspace_crates,
+            self.is_test,
         );
 
         let symbol_count = count_symbols(&extraction.module);
@@ -290,12 +317,13 @@ fn process_and_write_crate(
     config: &DriverConfig,
     crate_name: &str,
     mut module: Module,
-    target_suffix: &str,
+    target_key: &str,
     profile_dir: &Path,
 ) {
     // Load mono-items for backend cost distribution.
-    let mono_items_path =
-        config.output_dir.join(format!("{crate_name}_mono_items.txt"));
+    let mono_items_path = config
+        .output_dir
+        .join(format!("{crate_name}_mono_items.txt"));
     let mono_items = if mono_items_path.exists() {
         match fs::read_to_string(&mono_items_path) {
             Ok(content) => {
@@ -338,14 +366,18 @@ fn process_and_write_crate(
         .unwrap_or_default();
 
     // Build the complete Crate.
+    // Dependencies are populated later by the orchestrator from cargo metadata.
     let crate_data = Crate {
         linking_ms: overhead.linking_ms,
         metadata_ms: overhead.metadata_ms,
         root: module,
+        ..Default::default()
     };
 
     // Write to JSON file.
-    let filename = format!("{crate_name}_{target_suffix}.json");
+    // Replace / with _ for filesystem safety (bin/foo → bin_foo).
+    let safe_target_key = target_key.replace('/', "_");
+    let filename = format!("{crate_name}_{safe_target_key}.json");
     let output_path = config.output_dir.join(filename);
 
     let result = CrateResult {

@@ -95,7 +95,7 @@ pub fn run(
 mod tests {
     use std::collections::HashMap;
 
-    use tarjanize_schemas::{Module, Symbol, SymbolKind, Visibility};
+    use tarjanize_schemas::{Module, Package, Symbol, SymbolKind, Visibility};
 
     use super::*;
 
@@ -113,25 +113,46 @@ mod tests {
         }
     }
 
+    /// Helper to create a crate with default overhead for testing.
+    fn make_crate(
+        symbols: HashMap<String, Symbol>,
+    ) -> tarjanize_schemas::Crate {
+        tarjanize_schemas::Crate {
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// Helper to wrap a Crate into a Package with a "lib" target.
+    fn make_package(crate_data: tarjanize_schemas::Crate) -> Package {
+        let mut targets = HashMap::new();
+        targets.insert("lib".to_string(), crate_data);
+        Package { targets }
+    }
+
+    /// Helper to create a `SymbolGraph` from a map of crate names to Crates.
+    fn make_graph(
+        crates: HashMap<String, tarjanize_schemas::Crate>,
+    ) -> SymbolGraph {
+        let packages = crates
+            .into_iter()
+            .map(|(name, c)| (name, make_package(c)))
+            .collect();
+        SymbolGraph { packages }
+    }
+
     #[test]
     fn test_run_roundtrip() {
         let mut symbols = HashMap::new();
         symbols.insert("foo".to_string(), make_symbol(&[]));
 
         let mut crates = HashMap::new();
-        crates.insert(
-            "my_crate".to_string(),
-            tarjanize_schemas::Crate {
-                linking_ms: 0.0,
-                metadata_ms: 0.0,
-                root: Module {
-                    symbols,
-                    submodules: HashMap::new(),
-                },
-            },
-        );
+        crates.insert("my_crate".to_string(), make_crate(symbols));
 
-        let symbol_graph = SymbolGraph { crates };
+        let symbol_graph = make_graph(crates);
         let input_json = serde_json::to_string(&symbol_graph).unwrap();
 
         let mut output = Vec::new();
@@ -142,7 +163,7 @@ mod tests {
             .expect("output should be valid SymbolGraph JSON");
 
         // For a single symbol with no dependencies, it stays in its own crate.
-        assert_eq!(optimized.crates.len(), 1);
+        assert_eq!(optimized.packages.len(), 1);
     }
 
     #[test]

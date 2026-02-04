@@ -376,9 +376,13 @@ Where `dep_crate_count` is the number of unique external crates that symbols in 
 
 ### B.1 Improve Linking Cost Estimation
 
-The current linking model (R² = 0.555) only counts workspace crate dependencies captured in the symbol graph. However, linking also involves external crates (from crates.io, git dependencies, etc.) which are not currently tracked.
+~~The current linking model (R² = 0.555) only counts workspace crate dependencies captured in the symbol graph. However, linking also involves external crates (from crates.io, git dependencies, etc.) which are not currently tracked.~~
 
-**TODO:** Add a complete list of crate dependencies (including external crates) at the crate level in the symbol graph. This would allow the linking cost model to count all dependencies, not just workspace-internal ones. This may significantly improve the R² for linking estimation.
+~~**TODO:** Add a complete list of crate dependencies (including external crates) at the crate level in the symbol graph.~~
+
+**DONE:** Added `dependencies` and `dev_dependencies` fields to the `Crate` struct, populated from `cargo metadata`. This captures all dependencies (workspace and external) at the crate level. The linking cost model can now count all dependencies, potentially improving R² for linking estimation.
+
+**Next step:** Re-run the validation analysis to measure whether including external crates improves the linking cost model's R².
 
 ### B.2 Fix Critical Path Computation for Dev-Dependency Cycles
 

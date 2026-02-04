@@ -18,7 +18,53 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use tarjanize_schemas::{Module, SymbolGraph, SymbolKind};
+use tarjanize_schemas::{Crate, Module, SymbolGraph, SymbolKind};
+
+// =============================================================================
+// HELPER FUNCTIONS
+// =============================================================================
+
+/// Iterate over all crates (compilation units) in the symbol graph.
+///
+/// With the Package/Target/Crate structure, crates are nested under
+/// `packages[pkg].targets[target]`. This helper flattens that for tests
+/// that need to iterate over all crates.
+fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
+    graph.packages.values().flat_map(|pkg| pkg.targets.values())
+}
+
+/// Get a crate by name (looks for lib target in package with matching name).
+///
+/// Handles the name normalization: package names use hyphens, crate names use
+/// underscores. First tries exact match, then tries with hyphen/underscore
+/// conversion.
+fn get_crate_by_name<'a>(
+    graph: &'a SymbolGraph,
+    crate_name: &str,
+) -> Option<&'a Crate> {
+    // Try package name with hyphens (e.g., "my-crate")
+    if let Some(pkg) = graph.packages.get(crate_name) {
+        return pkg.targets.get("lib");
+    }
+    // Try package name with underscores converted to hyphens
+    let hyphenated = crate_name.replace('_', "-");
+    if let Some(pkg) = graph.packages.get(&hyphenated) {
+        return pkg.targets.get("lib");
+    }
+    // Try underscored name (crate name format)
+    let underscored = crate_name.replace('-', "_");
+    for (pkg_name, pkg) in &graph.packages {
+        if pkg_name.replace('-', "_") == underscored {
+            return pkg.targets.get("lib");
+        }
+    }
+    None
+}
+
+/// Check if a crate exists in the graph (by package/crate name).
+fn has_crate(graph: &SymbolGraph, name: &str) -> bool {
+    get_crate_by_name(graph, name).is_some()
+}
 
 /// Path to the cargo-tarjanize binary.
 fn cargo_tarjanize_bin() -> &'static str {
@@ -140,7 +186,7 @@ fn find_symbol<'a>(
         None
     }
 
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         if let Some(result) = find_in_module(&crate_data.root, key_suffix) {
             return Some(result);
         }
@@ -174,7 +220,7 @@ fn collect_all_keys(graph: &SymbolGraph) -> HashSet<String> {
     }
 
     let mut keys = HashSet::new();
-    for crate_data in graph.crates.values() {
+    for crate_data in iter_all_crates(graph) {
         collect_from_module(&crate_data.root, &mut keys);
     }
     keys
@@ -384,7 +430,7 @@ fn test_profile_key_nested_module_impl() {
 
     // Verify the impl is in a submodule by checking the crate structure.
     let crate_data =
-        graph.crates.get("profile_key_nested_module_impl").unwrap();
+        get_crate_by_name(&graph, "profile_key_nested_module_impl").unwrap();
     assert!(
         crate_data.root.submodules.contains_key("submod"),
         "Should have submod submodule"
@@ -792,7 +838,7 @@ fn test_cost_cross_crate_match() {
     let graph = extract_fixture("cross_crate_local_deps");
     // Uses existing fixture - verify both crates are extracted
     assert!(
-        !graph.crates.is_empty(),
+        !graph.packages.is_empty(),
         "Should extract at least one crate"
     );
 }
@@ -884,13 +930,19 @@ fn test_cost_thread_local_raw() {
 fn test_cost_virtual_workspace() {
     let graph = extract_fixture("cost_virtual_workspace");
     // Both crates should be extracted.
-    assert!(graph.crates.contains_key("crate_a"), "Should have crate_a");
-    assert!(graph.crates.contains_key("crate_b"), "Should have crate_b");
+    assert!(has_crate(&graph, "crate_a"), "Should have crate_a");
+    assert!(has_crate(&graph, "crate_b"), "Should have crate_b");
     // Each crate's root module should have symbols.
-    let crate_a = graph.crates.get("crate_a").unwrap();
-    assert!(!crate_a.root.symbols.is_empty(), "crate_a should have symbols");
-    let crate_b = graph.crates.get("crate_b").unwrap();
-    assert!(!crate_b.root.symbols.is_empty(), "crate_b should have symbols");
+    let crate_a = get_crate_by_name(&graph, "crate_a").unwrap();
+    assert!(
+        !crate_a.root.symbols.is_empty(),
+        "crate_a should have symbols"
+    );
+    let crate_b = get_crate_by_name(&graph, "crate_b").unwrap();
+    assert!(
+        !crate_b.root.symbols.is_empty(),
+        "crate_b should have symbols"
+    );
 }
 
 #[test]
@@ -910,13 +962,26 @@ fn test_cost_range_pattern_const() {
     assert_symbol_exists(&graph, "classify");
 }
 
-/// Collects all dependency crate names from a module tree.
+/// Collects all dependency package/target identifiers from a module tree.
+///
+/// Dependencies are in the format `[package/target]::module::symbol`.
+/// This function extracts the `[package/target]` prefix for each dependency.
 fn collect_dep_crates(module: &Module) -> HashSet<String> {
     let mut crates = HashSet::new();
     for symbol in module.symbols.values() {
         for dep in &symbol.dependencies {
-            if let Some(crate_name) = dep.split("::").next() {
-                crates.insert(crate_name.to_string());
+            // New format: [package/target]::module::symbol
+            // Extract the bracketed prefix.
+            if dep.starts_with('[') {
+                if let Some(end) = dep.find(']') {
+                    let prefix = &dep[..=end];
+                    crates.insert(prefix.to_string());
+                }
+            } else {
+                // Fallback to old format: crate::module::symbol
+                if let Some(crate_name) = dep.split("::").next() {
+                    crates.insert(crate_name.to_string());
+                }
             }
         }
     }
@@ -935,28 +1000,26 @@ fn collect_dep_crates(module: &Module) -> HashSet<String> {
 ///
 /// Without the fix, dependencies to workspace crates with hyphenated package
 /// names would be silently dropped, breaking critical path analysis.
+///
+/// With the new path format, dependencies are in `[package/target]::path` format,
+/// so we check for `[crate-b/lib]` (package name with hyphens, target is lib).
 #[test]
 #[expect(clippy::uninlined_format_args, reason = "can't inline HashSet debug")]
 fn test_cross_crate_hyphen_names() {
     let graph = extract_fixture("cross_crate_hyphen_names");
 
-    // Both crates should be extracted (with underscored names).
-    assert!(
-        graph.crates.contains_key("crate_a"),
-        "Should have crate_a"
-    );
-    assert!(
-        graph.crates.contains_key("crate_b"),
-        "Should have crate_b"
-    );
+    // Both packages should be extracted (with hyphenated names).
+    assert!(has_crate(&graph, "crate-a"), "Should have crate-a");
+    assert!(has_crate(&graph, "crate-b"), "Should have crate-b");
 
-    // crate_a depends on crate_b - verify the cross-crate dependency is captured.
-    let crate_a = graph.crates.get("crate_a").unwrap();
+    // crate-a depends on crate-b - verify the cross-crate dependency is captured.
+    let crate_a = get_crate_by_name(&graph, "crate-a").unwrap();
     let dep_crates = collect_dep_crates(&crate_a.root);
 
+    // Dependencies use [package/target] format now.
     assert!(
-        dep_crates.contains("crate_b"),
-        "crate_a should have dependency on crate_b, but found deps: {:?}",
+        dep_crates.contains("[crate-b/lib]"),
+        "crate-a should have dependency on [crate-b/lib], but found deps: {:?}",
         dep_crates
     );
 }
