@@ -950,7 +950,9 @@ mod tests {
 
     /// Helper to get the synthetic crate from a package (condense output).
     fn get_synthetic(pkg: &Package) -> &tarjanize_schemas::Crate {
-        pkg.targets.get("synthetic").expect("expected synthetic target")
+        pkg.targets
+            .get("synthetic")
+            .expect("expected synthetic target")
     }
 
     /// Helper to get the root module from a package (assumes single target).

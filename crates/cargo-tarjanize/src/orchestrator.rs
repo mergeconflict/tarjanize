@@ -483,20 +483,39 @@ fn transform_module_paths(
         symbol.dependencies = symbol
             .dependencies
             .iter()
-            .map(|dep| transform_path(dep, crate_mapping, current_package, current_target))
+            .map(|dep| {
+                transform_path(
+                    dep,
+                    crate_mapping,
+                    current_package,
+                    current_target,
+                )
+            })
             .collect();
 
         // Transform impl anchors if this is an impl block.
         if let SymbolKind::Impl { anchors, .. } = &mut symbol.kind {
             *anchors = anchors
                 .iter()
-                .map(|anchor| transform_path(anchor, crate_mapping, current_package, current_target))
+                .map(|anchor| {
+                    transform_path(
+                        anchor,
+                        crate_mapping,
+                        current_package,
+                        current_target,
+                    )
+                })
                 .collect();
         }
     }
 
     for submodule in module.submodules.values_mut() {
-        transform_module_paths(submodule, crate_mapping, current_package, current_target);
+        transform_module_paths(
+            submodule,
+            crate_mapping,
+            current_package,
+            current_target,
+        );
     }
 }
 
@@ -557,8 +576,8 @@ mod tests {
         let result = transform_path(
             "my_bin::SomeStruct",
             &mapping,
-            "my-package",    // current package
-            "bin/my_bin",    // current target
+            "my-package", // current package
+            "bin/my_bin", // current target
         );
 
         assert_eq!(result, "[my-package/bin/my_bin]::SomeStruct");
@@ -575,8 +594,8 @@ mod tests {
         let result = transform_path(
             "other_crate::SomeStruct",
             &mapping,
-            "my-package",    // current package
-            "bin/my_bin",    // current target
+            "my-package", // current package
+            "bin/my_bin", // current target
         );
 
         assert_eq!(result, "[other-package/lib]::SomeStruct");
@@ -587,12 +606,8 @@ mod tests {
         // External crates (not in mapping) should be returned unchanged.
         let mapping = make_mapping(&[("my_crate", "my-package")]);
 
-        let result = transform_path(
-            "serde::Serialize",
-            &mapping,
-            "my-package",
-            "lib",
-        );
+        let result =
+            transform_path("serde::Serialize", &mapping, "my-package", "lib");
 
         assert_eq!(result, "serde::Serialize");
     }
@@ -602,12 +617,7 @@ mod tests {
         // Paths without `::` (just crate name) should be returned unchanged.
         let mapping = make_mapping(&[("my_crate", "my-package")]);
 
-        let result = transform_path(
-            "std",
-            &mapping,
-            "my-package",
-            "lib",
-        );
+        let result = transform_path("std", &mapping, "my-package", "lib");
 
         assert_eq!(result, "std");
     }
