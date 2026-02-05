@@ -44,13 +44,6 @@ fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
     Some((prefix, rest))
 }
 
-/// Extract the package name from a bracketed path prefix like `[package/target]`.
-fn extract_package_from_prefix(prefix: &str) -> Option<&str> {
-    // Prefix is `[package/target]`, extract package by finding `/`.
-    let inner = prefix.strip_prefix('[')?.strip_suffix(']')?;
-    inner.split('/').next()
-}
-
 /// Applies HMR (Habib-Morvan-Rampon) transitive reduction to a set of deps.
 ///
 /// Given a starting reachable set and a list of dependencies, returns the
@@ -497,35 +490,14 @@ const METADATA_SLOPE: f64 = 0.26;
 /// independent of its symbol count or complexity.
 const METADATA_INTERCEPT: f64 = 1662.0;
 
-/// Coefficient for estimating linking time from dependency crate count.
-///
-/// Based on linear regression against real build data (R² = 0.555):
-/// `linking_ms = LINKING_SLOPE * dep_crate_count + LINKING_INTERCEPT`
-///
-/// The number of crates depended on is the best predictor of linking time,
-/// better than frontend cost (R² = 0.40) or symbol count (R² ≈ 0).
-///
-/// See `docs/cost-model-validation.md` Appendix A.8 for derivation.
-const LINKING_SLOPE: f64 = 160.0;
-
-/// Fixed per-crate overhead for linking in milliseconds.
-///
-/// This represents the baseline linking cost for any crate, independent of
-/// its dependency count.
-const LINKING_INTERCEPT: f64 = 678.0;
-
 /// Builds the output `SymbolGraph` from grouped symbols.
 ///
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
 ///
-/// Crate-level overhead is computed as follows:
-/// - `linking_ms`: Estimated from the number of unique external crates that
-///   symbols in this crate depend on (R² = 0.555). This is much better than
-///   symbol-count-based distribution (R² ≈ 0).
-/// - `metadata_ms`: Estimated from total frontend cost using a linear model
-///   (R² = 0.705).
+/// Crate-level overhead (`metadata_ms`) is estimated from total frontend cost
+/// using a linear model (R² = 0.705). See `docs/cost-model-validation.md`.
 fn build_output_graph(
     index: &SymbolIndex<'_>,
     set_to_symbols: HashMap<u32, Vec<usize>>,
@@ -539,8 +511,7 @@ fn build_output_graph(
     let mut used_names: HashSet<String> = HashSet::new();
 
     // Compute crate names and overhead for each set.
-    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64, f64)> =
-        Vec::new();
+    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64)> = Vec::new();
     for (set_id, symbol_indices) in sets {
         // Collect unique original crates contributing to this set.
         let original_crates_set: HashSet<&str> = symbol_indices
@@ -550,42 +521,6 @@ fn build_output_graph(
         let mut original_crates: Vec<&str> =
             original_crates_set.iter().copied().collect();
         original_crates.sort_unstable();
-
-        // Count unique external crates that this synthetic crate depends on.
-        // "External" means not one of the original crates that contributed to
-        // this synthetic crate.
-        let mut dep_crates: HashSet<String> = HashSet::new();
-        for &sym_idx in &symbol_indices {
-            let symbol = index.get_symbol(sym_idx);
-            for dep_path in &symbol.dependencies {
-                // Extract package name from path.
-                // New format: "[package/target]::module::item"
-                // Old format: "crate_name::module::item" (fallback)
-                let dep_pkg =
-                    if let Some((prefix, _)) = parse_bracketed_path(dep_path) {
-                        extract_package_from_prefix(prefix).map(str::to_string)
-                    } else {
-                        // Fallback to old format for external crates.
-                        dep_path.split("::").next().map(str::to_string)
-                    };
-
-                if let Some(pkg) = dep_pkg {
-                    // Only count external dependencies.
-                    if !original_crates_set.contains(pkg.as_str()) {
-                        dep_crates.insert(pkg);
-                    }
-                }
-            }
-        }
-
-        // Estimate linking time from external dependency count.
-        // The number of crates depended on is the best predictor (R² = 0.555).
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "dependency counts are small enough that f64 is precise"
-        )]
-        let linking_ms =
-            LINKING_SLOPE * dep_crates.len() as f64 + LINKING_INTERCEPT;
 
         // Estimate metadata time from total frontend cost of symbols in this crate.
         // Frontend cost is the best single predictor of metadata time (R² = 0.705).
@@ -603,19 +538,13 @@ fn build_output_graph(
             base_name
         };
         used_names.insert(crate_name.clone());
-        set_crate_data.push((
-            set_id,
-            crate_name,
-            symbol_indices,
-            linking_ms,
-            metadata_ms,
-        ));
+        set_crate_data.push((set_id, crate_name, symbol_indices, metadata_ms));
     }
 
     // Pass 1: Compute old path → new path mapping.
     let set_crate_names: Vec<_> = set_crate_data
         .iter()
-        .map(|(id, name, indices, _, _)| (*id, name.clone(), indices.clone()))
+        .map(|(id, name, indices, _)| (*id, name.clone(), indices.clone()))
         .collect();
     let path_mapping = compute_path_mapping(index, &set_crate_names);
 
@@ -624,13 +553,10 @@ fn build_output_graph(
     // from the original target type of the symbols (they all share the same type
     // since symbols from different target types can't form cycles).
     let mut packages = HashMap::new();
-    for (_set_id, crate_name, symbol_indices, linking_ms, metadata_ms) in
-        set_crate_data
-    {
+    for (_set_id, crate_name, symbol_indices, metadata_ms) in set_crate_data {
         let root_module =
             build_module_tree(index, &symbol_indices, &path_mapping);
         let crate_data = Crate {
-            linking_ms,
             metadata_ms,
             root: root_module,
             // Dependencies for synthetic crates would need to be computed
@@ -1237,7 +1163,6 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "linking_ms": 0,
                             "metadata_ms": 0,
                             "root": {
                                 "symbols": {
@@ -1325,7 +1250,6 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "linking_ms": 0,
                             "metadata_ms": 0,
                             "root": {
                                 "symbols": {
@@ -1391,7 +1315,6 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "linking_ms": 0,
                             "metadata_ms": 0,
                             "root": {
                                 "symbols": {
@@ -1434,105 +1357,6 @@ mod tests {
         assert_eq!(
             partitions,
             vec![vec!["A"], vec!["B"], vec!["C", "D", "impl_D"]]
-        );
-    }
-
-    #[test]
-    fn test_linking_estimated_from_dep_count() {
-        // Test that linking time is estimated from the number of external crate
-        // dependencies using the formula: linking_ms = 160 * dep_count + 678
-        //
-        // Setup:
-        // - crate_a has symbol A with no external deps → linking = 678
-        // - crate_b has symbol B depending on external crate "ext" → linking = 160 + 678 = 838
-        let mut crates = HashMap::new();
-
-        // Crate A: no external dependencies
-        let mut symbols_a = HashMap::new();
-        symbols_a.insert(
-            "a".to_string(),
-            Symbol {
-                file: "test.rs".to_string(),
-                frontend_cost_ms: 100.0,
-                backend_cost_ms: 0.0,
-                dependencies: HashSet::new(), // No deps
-                kind: SymbolKind::ModuleDef {
-                    kind: "Function".to_string(),
-                    visibility: Visibility::Public,
-                },
-            },
-        );
-        crates.insert(
-            "crate_a".to_string(),
-            tarjanize_schemas::Crate {
-                root: Module {
-                    symbols: symbols_a,
-                    submodules: HashMap::new(),
-                },
-                ..Default::default()
-            },
-        );
-
-        // Crate B: depends on external crate "ext"
-        let mut symbols_b = HashMap::new();
-        let mut deps_b = HashSet::new();
-        deps_b.insert("ext::some_fn".to_string());
-        symbols_b.insert(
-            "b".to_string(),
-            Symbol {
-                file: "test.rs".to_string(),
-                frontend_cost_ms: 100.0,
-                backend_cost_ms: 0.0,
-                dependencies: deps_b,
-                kind: SymbolKind::ModuleDef {
-                    kind: "Function".to_string(),
-                    visibility: Visibility::Public,
-                },
-            },
-        );
-        crates.insert(
-            "crate_b".to_string(),
-            tarjanize_schemas::Crate {
-                root: Module {
-                    symbols: symbols_b,
-                    submodules: HashMap::new(),
-                },
-                ..Default::default()
-            },
-        );
-
-        let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
-
-        // Two independent symbols → two crates.
-        assert_eq!(result.packages.len(), 2);
-
-        // Find crates by their symbol content.
-        let crate_a = result
-            .packages
-            .values()
-            .find(|c| get_root(c).symbols.contains_key("a"))
-            .expect("crate with symbol a");
-        let crate_b = result
-            .packages
-            .values()
-            .find(|c| get_root(c).symbols.contains_key("b"))
-            .expect("crate with symbol b");
-
-        // Crate A: 0 external deps → linking = 160 * 0 + 678 = 678
-        let expected_a = LINKING_SLOPE * 0.0 + LINKING_INTERCEPT;
-        let linking_a = get_synthetic(crate_a).linking_ms;
-        assert!(
-            (linking_a - expected_a).abs() < 0.01,
-            "Expected linking_ms ~{expected_a}, got {linking_a}"
-        );
-
-        // Crate B: 1 external dep (ext) → linking = 160 * 1 + 678 = 838
-        let expected_b = LINKING_SLOPE * 1.0 + LINKING_INTERCEPT;
-        let linking_b = get_synthetic(crate_b).linking_ms;
-        assert!(
-            (linking_b - expected_b).abs() < 0.01,
-            "Expected linking_ms ~{expected_b}, got {linking_b}"
         );
     }
 

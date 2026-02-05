@@ -87,15 +87,6 @@ pub struct Package {
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
 pub struct Crate {
-    /// Linking time in milliseconds.
-    ///
-    /// Fixed cost for linking this crate's artifacts. This includes
-    /// `link_crate`, `link_binary`, and `link_rlib` events from self-profile.
-    /// Not parallelizable.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    #[schemars(range(min = 0.0))]
-    pub linking_ms: f64,
-
     /// Metadata generation time in milliseconds.
     ///
     /// Fixed cost for generating crate metadata (`generate_crate_metadata`).
@@ -378,19 +369,15 @@ mod tests {
     fn arb_crate() -> impl Strategy<Value = Crate> {
         (
             (0..1_000_000).prop_map(f64::from),
-            (0..1_000_000).prop_map(f64::from),
             // Dependencies are crate references like "package/lib" or "package/bin/name"
             hash_set(arb_path(), 0..5),
             arb_module(),
         )
-            .prop_map(
-                |(linking_ms, metadata_ms, dependencies, root)| Crate {
-                    linking_ms,
-                    metadata_ms,
-                    dependencies,
-                    root,
-                },
-            )
+            .prop_map(|(metadata_ms, dependencies, root)| Crate {
+                metadata_ms,
+                dependencies,
+                root,
+            })
     }
 
     /// Strategy for generating target keys (lib, test, bin/name, etc.).

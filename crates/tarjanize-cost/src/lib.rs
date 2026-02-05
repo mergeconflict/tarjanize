@@ -20,7 +20,7 @@
 //! where:
 //!   frontend_time = Σ symbol.frontend_cost_ms           (serial - sum all)
 //!   backend_time  = max(module.backend_cost_ms())       (parallel - max across modules)
-//!   overhead      = crate.linking_ms + crate.metadata_ms
+//!   overhead      = crate.metadata_ms
 //! ```
 //!
 //! The key insight: backend work is parallelized via CGUs, roughly 2 per module.
@@ -320,7 +320,7 @@ fn build_target_graph(
             // cost = frontend_time + backend_time + overhead
             let frontend_time = collect_frontend_cost(&crate_data.root);
             let backend_time = max_module_backend_cost(&crate_data.root);
-            let overhead = crate_data.linking_ms + crate_data.metadata_ms;
+            let overhead = crate_data.metadata_ms;
 
             target_costs
                 .insert(target_id, frontend_time + backend_time + overhead);
@@ -508,11 +508,9 @@ mod tests {
     /// Creates a crate with the given root module and specified overhead.
     fn make_crate_with_overhead(
         root: Module,
-        linking_ms: f64,
         metadata_ms: f64,
     ) -> tarjanize_schemas::Crate {
         tarjanize_schemas::Crate {
-            linking_ms,
             metadata_ms,
             root,
             ..Default::default()
@@ -668,7 +666,7 @@ mod tests {
 
     #[test]
     fn test_target_overhead_included() {
-        // Target with linking and metadata overhead.
+        // Target with metadata overhead.
         let mut symbols = HashMap::new();
         symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
 
@@ -680,7 +678,6 @@ mod tests {
                     symbols,
                     submodules: HashMap::new(),
                 },
-                5.0,
                 3.0,
             ),
         );
@@ -688,8 +685,8 @@ mod tests {
         let graph = make_graph(crates);
         let result = critical_path(&graph);
 
-        // frontend(10) + backend(0) + linking(5) + metadata(3) = 18
-        assert!((result.cost - 18.0).abs() < f64::EPSILON);
+        // frontend(10) + backend(0) + metadata(3) = 13
+        assert!((result.cost - 13.0).abs() < f64::EPSILON);
     }
 
     #[test]

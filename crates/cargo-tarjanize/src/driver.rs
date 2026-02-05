@@ -368,7 +368,6 @@ fn process_and_write_crate(
     // Build the complete Crate.
     // Dependencies are populated later by the orchestrator from cargo metadata.
     let crate_data = Crate {
-        linking_ms: overhead.linking_ms,
         metadata_ms: overhead.metadata_ms,
         root: module,
         ..Default::default()

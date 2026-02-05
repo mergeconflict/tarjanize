@@ -39,8 +39,6 @@ enum EventCategory {
 /// Overhead costs for a single crate.
 #[derive(Debug, Default, Clone)]
 pub struct CrateOverhead {
-    /// Total linking time in milliseconds.
-    pub linking_ms: f64,
     /// Metadata generation time in milliseconds.
     pub metadata_ms: f64,
 }
@@ -185,14 +183,13 @@ impl ProfileData {
                 }
                 EventCategory::Overhead => {
                     // Overhead events are per-crate fixed costs.
-                    let overhead = self
-                        .crate_overhead
-                        .entry(crate_name.to_string())
-                        .or_default();
-
-                    if is_linking_event(label) {
-                        overhead.linking_ms += dur.as_millis_f64();
-                    } else if is_metadata_event(label) {
+                    // We only track metadata generation; linking is too small
+                    // to matter (< 1% of lib build time) and unpredictable.
+                    if is_metadata_event(label) {
+                        let overhead = self
+                            .crate_overhead
+                            .entry(crate_name.to_string())
+                            .or_default();
                         overhead.metadata_ms += dur.as_millis_f64();
                     }
                     count += 1;
@@ -270,13 +267,15 @@ fn categorize_event(label: &str) -> EventCategory {
     }
 
     // Overhead events (per-crate fixed costs).
-    if is_linking_event(label) || is_metadata_event(label) {
+    // Only metadata matters; linking is < 1% of lib build time.
+    if is_metadata_event(label) {
         return EventCategory::Overhead;
     }
 
-    // Skip internal/bookkeeping events.
+    // Skip internal/bookkeeping events and linking (too small to matter).
     if label.starts_with("incr_comp_")
         || label.starts_with("self_profile")
+        || label.starts_with("link_")
         || label == "serialize_dep_graph"
         || label == "serialize_work_products"
         || label == "copy_all_cgu_workproducts_to_incr_comp_cache"
@@ -286,14 +285,6 @@ fn categorize_event(label: &str) -> EventCategory {
 
     // Everything else is frontend work (parsing, type checking, etc.).
     EventCategory::Frontend
-}
-
-/// Check if an event label is a linking event.
-fn is_linking_event(label: &str) -> bool {
-    label == "link_crate"
-        || label == "link_binary"
-        || label == "link_rlib"
-        || label.starts_with("link_")
 }
 
 /// Check if an event label is a metadata generation event.
@@ -471,10 +462,13 @@ mod tests {
 
     #[test]
     fn test_categorize_event_overhead() {
-        assert_eq!(categorize_event("link_crate"), EventCategory::Overhead);
-        assert_eq!(categorize_event("link_binary"), EventCategory::Overhead);
+        // Only metadata events are tracked as overhead; linking is skipped.
         assert_eq!(
             categorize_event("generate_crate_metadata"),
+            EventCategory::Overhead
+        );
+        assert_eq!(
+            categorize_event("metadata_decode_entry"),
             EventCategory::Overhead
         );
     }
@@ -489,6 +483,9 @@ mod tests {
             categorize_event("self_profile_alloc_query_strings"),
             EventCategory::Skip
         );
+        // Linking events are skipped (< 1% of lib build time).
+        assert_eq!(categorize_event("link_crate"), EventCategory::Skip);
+        assert_eq!(categorize_event("link_binary"), EventCategory::Skip);
     }
 
     #[test]
