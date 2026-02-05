@@ -15,6 +15,7 @@
 //! - **Overhead**: Per-crate fixed costs (linking, metadata generation)
 
 use std::collections::HashMap;
+use std::panic;
 use std::path::Path;
 use std::time::Duration;
 
@@ -93,8 +94,15 @@ impl ProfileData {
                     let stem_str = stem.to_string_lossy();
                     let stem_path = dir.join(stem);
 
-                    match ProfilingData::new(&stem_path) {
-                        Ok(profile) => {
+                    // Use catch_unwind because decodeme can panic on corrupted
+                    // profile data (e.g., truncated string tables).
+                    let stem_path_clone = stem_path.clone();
+                    let result = panic::catch_unwind(|| {
+                        ProfilingData::new(&stem_path_clone)
+                    });
+
+                    match result {
+                        Ok(Ok(profile)) => {
                             // Extract crate name from profile filename.
                             // Format: "crate_name-XXXXXXX" where X is hex digits.
                             let crate_name = extract_crate_name(&stem_str);
@@ -103,11 +111,17 @@ impl ProfileData {
                             event_count +=
                                 data.aggregate_profile(&profile, &crate_name);
                         }
-                        Err(e) => {
+                        Ok(Err(e)) => {
                             debug!(
                                 "failed to load profile {}: {}",
                                 stem_path.display(),
                                 e
+                            );
+                        }
+                        Err(_) => {
+                            warn!(
+                                "profile data corrupted (parser panic): {}",
+                                stem_path.display()
                             );
                         }
                     }
