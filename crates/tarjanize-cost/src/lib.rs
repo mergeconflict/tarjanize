@@ -549,6 +549,24 @@ fn build_target_graph(
         }
     }
 
+    // Test targets recompile the lib code (cargo builds with --test flag), so add
+    // the lib's frontend/backend costs to test targets. This models the fact that
+    // `cargo test` doesn't reuse the lib compilation - it's a fresh build.
+    for (package_name, package) in &symbol_graph.packages {
+        if !package.targets.contains_key("test") {
+            continue;
+        }
+        let test_id = format!("{package_name}/test");
+        let lib_id = format!("{package_name}/lib");
+
+        if let Some(lib_costs) = target_costs_map.get(&lib_id).copied()
+            && let Some(test_costs) = target_costs_map.get_mut(&test_id)
+        {
+            test_costs.frontend += lib_costs.frontend;
+            test_costs.backend = test_costs.backend.max(lib_costs.backend);
+        }
+    }
+
     let costs: Vec<TargetCosts> = target_names
         .iter()
         .map(|name| target_costs_map.get(name).copied().unwrap_or_default())
@@ -1113,7 +1131,10 @@ mod tests {
         // Test that lib and test targets are handled separately.
         // pkg-a has both lib (100ms frontend) and test (50ms frontend) targets.
         // The test target depends on the lib target.
-        // With frontend-only costs: lib(100) → test(50) = 150
+        //
+        // Test targets include lib costs because `cargo test` recompiles the lib
+        // with --test flag. So test's effective cost = 50 + 100 = 150.
+        // Critical path: lib(100) → test(150) = 250
 
         let mut lib_symbols = HashMap::new();
         lib_symbols.insert("lib_fn".to_string(), make_symbol(100.0, &[]));
@@ -1146,8 +1167,9 @@ mod tests {
         let graph = SymbolGraph { packages };
         let result = critical_path(&graph);
 
-        // Critical path: lib(100) → test(50) = 150
-        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
+        // Critical path: lib(100) → test(150) = 250
+        // (test includes lib's 100ms frontend cost)
+        assert!((result.critical_path_ms - 250.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![target_id("pkg-a", "lib"), target_id("pkg-a", "test")]
@@ -1166,7 +1188,7 @@ mod tests {
         //
         // Setup:
         // - pkg-a/lib (100ms)
-        // - pkg-a/test (50ms) depends on pkg-a/lib and pkg-b/lib
+        // - pkg-a/test (50ms + 100ms lib cost = 150ms) depends on pkg-a/lib and pkg-b/lib
         // - pkg-b/lib (30ms) depends on pkg-a/lib
         //
         // At the package level, this would look like a cycle:
@@ -1176,8 +1198,8 @@ mod tests {
         //   pkg-a/lib → pkg-b/lib → pkg-a/test
         //   pkg-a/lib → pkg-a/test
         //
-        // Critical path: pkg-a/lib(100) → pkg-b/lib(30) → pkg-a/test(50) = 180
-        // (or pkg-a/lib → pkg-a/test = 150, but the longer path through pkg-b wins)
+        // Critical path: pkg-a/lib(100) → pkg-b/lib(30) → pkg-a/test(150) = 280
+        // (test includes lib's 100ms frontend cost)
 
         // pkg-a/lib
         let mut lib_a_symbols = HashMap::new();
@@ -1248,9 +1270,9 @@ mod tests {
         // Should compute successfully (no cycle)
         assert!(!result.path.is_empty(), "path should not be empty");
 
-        // With frontend-only costs:
-        // Critical path: pkg-a/lib(100) → pkg-b/lib(30) → pkg-a/test(50) = 180
-        assert!((result.critical_path_ms - 180.0).abs() < f64::EPSILON);
+        // With frontend-only costs (test includes lib cost):
+        // Critical path: pkg-a/lib(100) → pkg-b/lib(30) → pkg-a/test(150) = 280
+        assert!((result.critical_path_ms - 280.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![
@@ -1260,8 +1282,8 @@ mod tests {
             ]
         );
 
-        // Total cost = 100 + 30 + 50 = 180
-        assert!((result.total_cost - 180.0).abs() < f64::EPSILON);
+        // Total cost = 100 + 30 + 150 = 280
+        assert!((result.total_cost - 280.0).abs() < f64::EPSILON);
         assert_eq!(result.target_count, 3);
     }
 

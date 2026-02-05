@@ -104,7 +104,9 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Condense { io } => io.run(|r, w| Ok(tarjanize_condense::run(r, w)?)),
+        Commands::Condense { io } => {
+            io.run(|r, w| Ok(tarjanize_condense::run(r, w)?))
+        }
         Commands::Cost { io } => io.run(|r, w| Ok(tarjanize_cost::run(r, w)?)),
     }
 }
