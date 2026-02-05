@@ -6,13 +6,14 @@ This document validates tarjanize's cost model against actual build times from a
 
 **Question**: Does our profiling-based cost model predict real build times?
 
-**Answer**: Yes. The model explains **90% of variance** in actual build times (R² = 0.900) with a correlation of **0.949**. It correctly identifies the most expensive crates and captures their relative costs.
+**Answer**: Yes. The model explains **86% of variance** for library targets (R² = 0.856) and **92% of variance** when lib+test targets are merged (R² = 0.917). It correctly identifies the most expensive crates and captures their relative costs.
 
 **Key findings**:
 - Top 3 bottlenecks correctly identified
 - 4/5 top crates ranked correctly
 - Relative costs accurate within 2× for 7/10 top crates
-- Model overestimates by ~3× (consistent, correctable)
+- LIB targets well-predicted; TEST/BIN targets less so (different scaling)
+- **Metadata is essential** (+10% R² contribution); **linking is negligible** (+0.4%)
 
 **Recommendation**: Use the model for **relative comparisons** (which crates are bottlenecks, how do they compare). Don't rely on absolute time predictions.
 
@@ -48,8 +49,10 @@ crate_cost = frontend_time + backend_time + overhead
 where:
   frontend_time = Σ symbol.frontend_cost_ms    (serial work)
   backend_time  = max(module.backend_cost_ms)  (parallel via CGUs)
-  overhead      = linking_ms + metadata_ms
+  overhead      = metadata_ms
 ```
+
+**Note:** Linking time was originally included but removed after target-level analysis showed it contributes negligibly to model accuracy (see Section A.6 and A.8).
 
 ### 2.3 Comparison Approach
 
@@ -90,6 +93,8 @@ We used linear regression to find the best-fit scaling factor, then evaluated co
 - **R²** is the correlation squared (0.949² = 0.900). It tells us what fraction of the variation in actual build times is "explained" by the model. An R² of 0.90 means 90% of the variation in build times can be predicted from the model; the remaining 10% is noise or factors we don't capture.
 
 The model explains 90% of variance in actual build times with a strong linear relationship.
+
+*Note: These are crate-level results (summing all targets per crate). See Section A.6 for target-level breakdown showing LIB R² = 0.856, TEST R² = 0.724.*
 
 ### 3.2 Statistical Significance
 
@@ -247,7 +252,9 @@ During validation, we tested several hypotheses about model accuracy.
 
 ### A.6 Component Contribution Analysis
 
-We tested how much each cost component contributes to model accuracy:
+#### Initial Crate-Level Analysis
+
+We first tested how much each cost component contributes to model accuracy at the crate level (merging all targets per crate):
 
 | Model | r | R² |
 |-------|-----|------|
@@ -269,6 +276,39 @@ We tested how much each cost component contributes to model accuracy:
 The last finding is surprising: linking and metadata times alone predict build times better than our full model. This suggests they're excellent proxies for overall crate complexity.
 
 **However, this is not actionable.** When tarjanize runs the condense phase, it creates synthetic crates (SCCs merged into single nodes). These synthetic crates don't have real linking/metadata times — we must estimate them from the constituent symbols. Therefore, we cannot rely on linking + metadata as the sole predictor; we need the frontend/backend costs to estimate synthetic crate costs.
+
+#### Target-Level Analysis (LIB vs TEST vs BIN)
+
+The crate-level analysis (R² = 0.90) masked important differences between target types. We re-ran the analysis at the **target level**, comparing each individual lib, test, and bin target against its actual build time:
+
+| Target Type | Count | R² | Pearson r | Slope | Interpretation |
+|-------------|-------|-----|-----------|-------|----------------|
+| LIB only | 149 | **0.856** | 0.925 | 0.15 | Good fit |
+| TEST only | 161 | 0.724 | 0.851 | 1.59 | Systematic underprediction |
+| LIB + TEST merged | 160 | **0.917** | 0.958 | 0.31 | Best fit |
+| BIN only | 6 | 0.677 | 0.823 | — | Small sample, moderate fit |
+
+**Key findings:**
+
+1. **LIB targets are well-predicted** (R² = 0.856) — the model captures library compilation accurately
+2. **TEST targets have different scaling** — slope of 1.59 vs 0.15 for libs means test builds take ~10× more time per unit of modeled cost
+3. **Merging LIB + TEST improves fit** — this is why the crate-level analysis showed R² = 0.90
+4. **BIN targets have small sample size** — only 6 binaries, so R² = 0.677 is less reliable
+
+The slope difference between LIB (0.15) and TEST (1.59) explains why merging them helps: the regression finds an average slope that works reasonably for both.
+
+#### Component Contribution by Target Type
+
+We isolated the contribution of linking and metadata to LIB-only predictions:
+
+| Component | LIB R² | Δ R² from baseline |
+|-----------|--------|-------------------|
+| Frontend + Backend only | 0.752 | baseline |
+| + Metadata | 0.856 | **+0.104** |
+| + Linking | 0.756 | +0.004 |
+| + Both (full model) | 0.858 | +0.106 |
+
+**Conclusion:** Metadata contributes ~10% improvement to R²; linking contributes almost nothing (~0.4% from baseline, ~0.2% when metadata already included).
 
 ### A.7 Metadata Estimation for Synthetic Crates
 
@@ -330,76 +370,286 @@ Individual crate errors can be large (up to +314% for `nexus_db_queries`), but f
 
 **Note on the intercept:** The 1662ms intercept represents a per-crate fixed overhead. When splitting one crate into N crates, the total estimated metadata cost will increase. This is realistic — creating more crates does increase total compilation overhead due to per-crate fixed costs (file I/O, metadata headers, etc.).
 
-### A.8 Linking Time Estimation for Synthetic Crates
+### A.8 Linking Time Analysis and Decision to Remove
 
-Since synthetic crates don't have measured linking times, we need to estimate them.
+Initially, we attempted to model linking time for synthetic crates. However, deeper analysis revealed that linking time:
+1. Contributes negligibly to model accuracy
+2. Has weak predictors (best R² = 0.42 for workspace deps)
+3. Varies dramatically by target type
+
+**Final decision: Linking removed from the cost model.**
+
+#### Why Linking Was Originally Considered
+
+Linking (loading rlibs, resolving symbols, etc.) is a real compilation cost. We hypothesized it might be significant for crates with many dependencies.
+
+#### Predictor Analysis
 
 **Single-variable predictors tested:**
 
 | Predictor | R² |
 |-----------|-----|
-| dep_crate_count | **0.555** |
-| frontend | 0.399 |
-| unique_external_deps | 0.358 |
-| external_dep_edges | 0.341 |
-| unique_deps | 0.246 |
-| symbols | 0.000 |
+| workspace_deps | 0.42 |
+| dep_count (total) | 0.27 |
+| external_deps | 0.16 |
+| symbols | ~0.00 |
 
-**Key finding:** The number of crates depended on (`dep_crate_count`) is the best predictor of linking time, explaining 56% of variance. This makes sense because linking involves loading each dependency's rlib, resolving symbols across crate boundaries, and performing symbol table lookups — all of which scale with the number of crates, not the number of individual symbols.
+The best predictor (`workspace_deps` — dependencies on other workspace crates) explains only 42% of variance — far weaker than metadata's 71% (from frontend cost). External deps actually *decrease* predictive power because they're pre-compiled and don't require much linking work. This suggests linking time is influenced by factors we don't capture (LTO settings, codegen units, binary size, etc.).
 
-**Best model for synthetic crates:**
+#### Linking Time Distribution by Target Type
 
-```
-linking_ms = 160 × dep_crate_count + 678
-```
+| Target Type | Linking % of Build Time | Range |
+|-------------|------------------------|-------|
+| LIB | <1% | 0-2% |
+| TEST | 10-36% | varies |
+| BIN | 10-63% | varies |
 
-Where `dep_crate_count` is the number of unique external crates that symbols in the synthetic crate depend on (excluding self-references).
+**Key insight:** Linking is negligible for library targets (our primary modeling concern) but significant for test and binary targets. However, test/bin linking time is highly variable and poorly predicted by available features.
 
-**Error characteristics:**
+#### Impact on Model Accuracy
 
-| Metric | Value |
-|--------|-------|
-| R² | 0.555 |
-| Mean absolute % error | 93% |
-| Median absolute % error | 58% |
-| 90th percentile error | 219% |
+Comparing the full model with and without linking:
 
-**Why this works for synthetic crates:** When we create a synthetic crate by merging symbols, we know each symbol's dependencies. We can compute `dep_crate_count` by collecting all dependency paths, extracting their crate names (the first component of the path), and counting unique external crates.
+| Model | LIB R² |
+|-------|--------|
+| Without linking (frontend + backend + metadata) | 0.856 |
+| With linking (full model) | 0.858 |
+| **Δ R²** | **+0.002** |
 
-**Note on outliers:** Some crates with 0 recorded dependencies still have significant linking times (e.g., `reconfigurator_cli`: 2760ms). These are typically binaries with external dependencies not captured in the symbol graph. The model's intercept (678ms) provides a baseline for such cases.
+Adding linking improves R² by only 0.2% — not worth the complexity of estimating it.
 
-**Comparison with previous approach:** The old approach distributed linking time proportionally by symbol count, but symbol count has essentially zero correlation with linking time (R² ≈ 0). The new dependency-based model is a significant improvement.
+#### Comparison: Linking vs Metadata
+
+| Aspect | Linking | Metadata |
+|--------|---------|----------|
+| Contribution to LIB R² | +0.002 | +0.104 |
+| Best predictor R² | 0.42 | 0.71 |
+| % of LIB build time | <1% | ~5-15% |
+| Predictable? | Weakly | Yes |
+
+**Conclusion:** Metadata contributes ~50× more to model accuracy than linking. Linking is too small for libs and too unpredictable for tests/bins to be worth modeling.
 
 ---
 
 ## Appendix B: TODOs
 
-### B.1 Improve Linking Cost Estimation
+### B.1 ~~Improve Linking Cost Estimation~~ CLOSED
 
 ~~The current linking model (R² = 0.555) only counts workspace crate dependencies captured in the symbol graph. However, linking also involves external crates (from crates.io, git dependencies, etc.) which are not currently tracked.~~
 
 ~~**TODO:** Add a complete list of crate dependencies (including external crates) at the crate level in the symbol graph.~~
 
-**DONE:** Added `dependencies` and `dev_dependencies` fields to the `Crate` struct, populated from `cargo metadata`. This captures all dependencies (workspace and external) at the crate level. The linking cost model can now count all dependencies, potentially improving R² for linking estimation.
+~~**DONE:** Added `dependencies` and `dev_dependencies` fields to the `Crate` struct, populated from `cargo metadata`. This captures all dependencies (workspace and external) at the crate level. The linking cost model can now count all dependencies, potentially improving R² for linking estimation.~~
 
-**Next step:** Re-run the validation analysis to measure whether including external crates improves the linking cost model's R².
+~~**Next step:** Re-run the validation analysis to measure whether including external crates improves the linking cost model's R².~~
 
-### B.2 Fix Critical Path Computation for Dev-Dependency Cycles
+**CLOSED (2026-02):** After comprehensive target-level analysis, linking was **removed from the cost model entirely**. Key findings:
+- Best predictor (workspace_deps) only achieves R² = 0.42 — too weak
+- Linking contributes <1% of build time for LIB targets
+- Adding linking to the model improves R² by only 0.002
+- See Section A.8 for full analysis
 
-The critical path code currently fails when the crate dependency graph contains cycles. These cycles can occur when dev-dependencies create apparent circular dependencies (e.g., crate A's tests depend on crate B, which depends on crate A).
+### B.2 ~~Fix Critical Path Computation for Dev-Dependency Cycles~~ CLOSED
 
-**Current behavior:** Prints a warning and skips critical path computation, only reporting per-crate costs.
+~~The critical path code currently fails when the crate dependency graph contains cycles. These cycles can occur when dev-dependencies create apparent circular dependencies (e.g., crate A's tests depend on crate B, which depends on crate A).~~
 
-**TODO:** Properly handle dev-dependency cycles by either:
-1. Separating lib and test targets in the dependency graph
-2. Detecting and breaking cycles at dev-dependency edges
-3. Computing critical path on the lib-only subgraph
+~~**Current behavior:** Prints a warning and skips critical path computation, only reporting per-crate costs.~~
+
+~~**TODO:** Properly handle dev-dependency cycles by either:~~
+1. ~~Separating lib and test targets in the dependency graph~~
+2. ~~Detecting and breaking cycles at dev-dependency edges~~
+3. ~~Computing critical path on the lib-only subgraph~~
+
+**CLOSED (2026-02):** Fixed by separating lib/test/bin targets in the symbol graph schema (commit ab35032). Each target is now a separate node in the dependency graph, so dev-dependencies no longer create artificial cycles. Test targets depend on their package's lib target explicitly, making the graph acyclic.
 
 ### B.3 Validate Critical Path Cost Model
 
-The per-crate cost model has been validated (R² = 0.900), but the **critical path cost** (sum of costs along the longest dependency chain) has not been validated against real build times with parallelism.
+The per-crate cost model has been validated (R² = 0.856 for lib targets), but the **critical path cost** (sum of costs along the longest dependency chain) has not been validated against real build times with parallelism.
 
-**TODO:** Validate that our critical path cost correlates with actual wall-clock build times when using `cargo build -j N`. This requires:
-1. Capturing actual parallel build times (not just per-crate times)
-2. Computing critical path from our model
-3. Comparing model predictions against actual parallel build duration
+**INVESTIGATED (2026-02):** We simulated parallel execution of our dependency graph and compared to actual `cargo build --timings` data. Key findings:
+
+| Metric | Actual | Model | Ratio |
+|--------|--------|-------|-------|
+| Critical path | 331s | 2045s | 6.2x |
+| Peak parallelism | 64 | 31 | 0.5x |
+| Avg parallelism | 4.8 | 2.8 | 0.6x |
+
+The model correctly identifies the same three bottleneck targets (nexus-db-model → nexus-db-queries → omicron-nexus) and the same 71% critical path fraction. However, **the model dramatically overestimates build time and underestimates parallelism**.
+
+**Root cause: rmeta pipelining** (see Section B.4 below).
+
+### B.4 CRITICAL FINDING: Cargo Uses Rmeta Pipelining
+
+**This finding fundamentally changes how we must model Rust builds.**
+
+#### Discovery
+
+When comparing simulated vs actual build parallelism, we found that test targets start almost immediately after their lib target starts — not when the lib finishes:
+
+| Package | Lib Duration | Test Starts After Lib | Test Starts Before Lib Ends |
+|---------|--------------|----------------------|----------------------------|
+| oxide-client | 27.1s | 2.2s | 24.9s |
+| omicron-nexus | 166.5s | 3.7s | 162.8s |
+
+The `cargo --timings` data shows `oxide-client/lib` has:
+- Frontend: 24.25s
+- Codegen: 2.89s
+- Test starts at 2.2s — **before frontend even finishes**
+
+#### Explanation: Rmeta vs Rlib
+
+Cargo uses **pipelined compilation**:
+
+1. **Rmeta (metadata)**: Contains type signatures, trait impls, and everything needed for type checking downstream crates. Available after frontend compilation.
+
+2. **Rlib (library)**: Contains actual compiled code. Required for linking but NOT for compiling downstream crates.
+
+Downstream crates only need **rmeta** to start compiling. They don't wait for the full rlib.
+
+#### Impact on Our Model
+
+Our current model assumes:
+```
+downstream.start_time = max(dep.finish_time for dep in dependencies)
+```
+
+But Cargo actually uses:
+```
+downstream.start_time = max(dep.rmeta_ready_time for dep in dependencies)
+```
+
+Where `rmeta_ready_time ≈ start_time + frontend_cost` (much earlier than finish_time).
+
+This explains the parallelism gap:
+- **Model**: Treats all deps as "wait for full completion" → low parallelism
+- **Actual**: Uses rmeta pipelining → high parallelism
+
+#### Implications for Tarjanize
+
+This finding has major implications for the tarjanize algorithm:
+
+1. **Critical path calculation is wrong**: The critical path should be based on rmeta availability, not rlib completion. Frontend costs are on the critical path; codegen costs are not (they run in parallel).
+
+2. **Cost model needs restructuring**: We need to track frontend and codegen costs separately, not just total cost.
+
+3. **Optimization target changes**: Reducing frontend cost reduces critical path. Reducing codegen cost only helps if codegen is longer than downstream frontend work.
+
+4. **Symbol-level analysis may be less valuable**: If critical path is dominated by frontend (type checking, borrow checking), and frontend is largely serial within a crate, then splitting crates may not help as much as expected.
+
+#### Next Steps
+
+**TODO:** Restructure the cost model to account for rmeta pipelining:
+
+1. **Separate frontend vs codegen costs** in the symbol graph schema
+2. **Model rmeta availability** as `start_time + frontend_cost`
+3. **Recalculate critical path** using rmeta-based dependencies
+4. **Re-validate** against actual build times
+5. **Assess impact** on tarjanize's crate-splitting recommendations
+
+### B.5 Implications of Rmeta Pipelining for Tarjanize Algorithm
+
+#### Current Tarjanize Approach
+
+1. Extract symbol dependency graph
+2. Find strongly connected components (SCCs) that could be split
+3. Estimate cost savings from splitting based on total compilation time
+4. Recommend crate splits that reduce critical path
+
+#### The Problem
+
+We assumed that splitting a crate reduces the critical path because downstream crates can start sooner. But with rmeta pipelining, downstream crates already start as soon as the upstream crate's **frontend** is done — not when codegen finishes.
+
+Example from omicron-nexus:
+- Frontend: ~90% of compilation time (type checking the massive crate)
+- Codegen: ~10% of compilation time
+- Downstream test starts 3.7s after lib starts (basically immediate)
+
+If we split omicron-nexus into smaller crates:
+- Each smaller crate has less frontend work
+- But downstream crates already weren't waiting for codegen
+- The benefit is faster **rmeta availability**, not faster rlib availability
+
+#### Key Insight
+
+**The critical path is determined by frontend costs (serial within crate), not total costs.**
+
+Codegen runs in parallel with downstream compilation, so it's largely "free" unless it's longer than the downstream frontend work.
+
+#### What This Means for Tarjanize
+
+1. **Cost model needs restructuring**
+   - Must track `frontend_cost` vs `codegen_cost` separately
+   - Critical path = sum of frontend costs along dependency chain
+   - Codegen costs only matter if they exceed downstream frontend work
+
+2. **Splitting still helps, but for different reasons**
+   - Splitting reduces frontend work per crate (smaller type checking scope)
+   - This makes rmeta available sooner
+   - Benefit is proportional to **frontend cost reduction**, not total cost
+
+3. **Symbol-level granularity may be overkill**
+   - Frontend cost is dominated by type checking the whole crate
+   - Individual symbol costs may not be meaningful for frontend
+   - Might need crate-level frontend estimates instead
+
+4. **CGU (codegen unit) analysis is less important**
+   - We spent effort modeling CGU costs and backend parallelism
+   - But codegen is mostly "free" (runs during downstream frontend)
+   - Only matters for leaf crates with no downstream dependencies
+
+#### Possible New Approach
+
+1. **Focus on frontend costs for critical path**
+   - `frontend_cost ≈ type_checking + borrow_checking + macro_expansion`
+   - These are largely serial within a crate
+
+2. **Model rmeta availability**
+   - `rmeta_ready = start_time + frontend_cost`
+   - `downstream.start = max(dep.rmeta_ready for dep in deps)`
+
+3. **Estimate frontend cost for synthetic crates**
+   - May need different predictors than total cost
+   - Symbol count? Type complexity? Trait impl count?
+
+4. **Re-evaluate whether tarjanize's SCC splitting helps**
+   - If splitting reduces frontend cost proportionally, it helps
+   - If frontend cost has high fixed overhead per crate, splitting may hurt
+
+#### Frontend vs Codegen Breakdown (Answered)
+
+Analysis of cargo timing data for 151 lib targets in Omicron:
+
+| Package | Total | Frontend | Codegen | FE % |
+|---------|-------|----------|---------|------|
+| omicron-nexus | 166.5s | 114.7s | 51.8s | 69% |
+| nexus-db-queries | 33.9s | 29.8s | 4.1s | 88% |
+| nexus-db-model | 33.5s | 31.1s | 2.4s | 93% |
+| nexus-db-schema | 20.2s | 19.8s | 0.4s | 98% |
+| oxide-client | 27.1s | 24.2s | 2.9s | 89% |
+| **TOTAL (151 libs)** | **596.0s** | **418.9s** | **177.0s** | **70%** |
+
+**Key finding: Frontend is 70% of lib compilation time** (weighted by time).
+
+The critical path bottlenecks are especially frontend-heavy:
+- nexus-db-schema: 98% frontend
+- nexus-db-model: 93% frontend
+- nexus-db-queries: 88% frontend
+
+This confirms the rmeta pipelining effect is massive. The 30% codegen time largely runs in parallel with downstream compilation and is effectively "free" for critical path purposes.
+
+#### Remaining Open Questions
+
+1. ~~**What fraction of lib compilation is frontend vs codegen?**~~ **ANSWERED: 70% frontend**
+
+2. **Does splitting a crate reduce total frontend cost?**
+   - Or does it increase due to cross-crate type checking overhead?
+
+3. ~~**Can we estimate frontend cost from profile data?**~~ **ANSWERED: Yes**
+   - We already capture `symbol.frontend_cost_ms` from self-profile
+   - The model uses `Σ frontend_cost_ms` for cost estimation
+   - Section A.7 shows frontend cost predicts metadata with R² = 0.705
+   - This is the data we need for rmeta-based critical path calculation
+
+4. **What's the overhead of adding a new crate?**
+   - More crates = more rmeta files to read
+   - May increase frontend cost for downstream crates
