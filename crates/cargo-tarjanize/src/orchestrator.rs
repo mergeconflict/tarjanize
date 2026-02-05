@@ -1,29 +1,46 @@
 //! Orchestrator mode: Runs cargo and aggregates extraction results.
 //!
-//! The orchestrator:
-//! 1. Reads workspace metadata to get the list of workspace crates
-//! 2. Creates temp directories for intermediate JSON files and profiling
-//! 3. Runs `cargo build --all-targets` with `RUSTC_WRAPPER` pointing to this binary
-//! 4. Reads the per-crate JSON files written by the driver (already include costs)
-//! 5. Merges them into a single `SymbolGraph` and outputs JSON
+//! The build process has two steps:
 //!
-//! Cost application (frontend, backend, overhead) happens in the driver
-//! immediately after each crate compiles. This allows the driver to delete
-//! raw profile files early, avoiding disk space exhaustion on large workspaces.
+//! 1. **Profile build** (optional, skipped with `--no-profile`):
+//!    Run `cargo +nightly build` with `-Zself-profile` but NO `RUSTC_WRAPPER`.
+//!    Produces clean profile data without extraction overhead.
+//!
+//! 2. **Extraction build**:
+//!    Run `cargo build` with `RUSTC_WRAPPER` to extract symbols and mono-items.
+//!    Profile data (if collected) is merged with extracted symbols.
+//!
+//! Separating profiling from extraction ensures profile data only contains
+//! real compilation work, not overhead from our extraction callbacks.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::{env, fs};
 
 use anyhow::{Context, Result};
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
-use tarjanize_schemas::{Package, SymbolGraph};
+use tarjanize_schemas::{Package, SymbolGraph, SymbolKind};
 use tempfile::TempDir;
 use tracing::{debug, info, warn};
 
 use crate::driver::CrateResult;
 use crate::{Cli, ENV_VERBOSITY};
+
+/// Configuration for running cargo builds.
+/// Bundles all the parameters needed by `run_profile_build` and `run_extraction_build`.
+struct BuildConfig<'a> {
+    manifest_path: &'a Path,
+    manifest_dir: &'a Path,
+    workspace_crates: &'a [String],
+    /// Maps package name to its manifest directory path.
+    /// Used to identify which package integration tests belong to.
+    workspace_paths: &'a HashMap<String, PathBuf>,
+    self_exe: &'a Path,
+    verbosity_level: &'a str,
+    target_dir: &'a Path,
+    packages: &'a [String],
+}
 
 /// Environment variable that tells the driver where to write output files.
 pub const ENV_OUTPUT_DIR: &str = "TARJANIZE_OUTPUT_DIR";
@@ -36,6 +53,20 @@ pub const ENV_WORKSPACE_CRATES: &str = "TARJANIZE_WORKSPACE_CRATES";
 /// Environment variable that tells the driver where to write self-profile data.
 /// When set, the driver adds `-Zself-profile` flags to rustc invocations.
 pub const ENV_PROFILE_DIR: &str = "TARJANIZE_PROFILE_DIR";
+
+/// Environment variable that tells the driver to skip profiling.
+/// When set to "1", the driver does not add `-Zself-profile` flags
+/// and does not apply costs. Used with --no-profile flag.
+pub const ENV_SKIP_PROFILE: &str = "TARJANIZE_SKIP_PROFILE";
+
+/// Environment variable containing workspace member paths.
+/// Format: `pkg1=/path/to/pkg1,pkg2=/path/to/pkg2`
+///
+/// Used to identify which package an integration test belongs to.
+/// Integration tests have crate names like `sync_mpsc` that don't match
+/// package names like `tokio`, but their source files are within the
+/// package directory, so we can match by path.
+pub const ENV_WORKSPACE_PATHS: &str = "TARJANIZE_WORKSPACE_PATHS";
 
 /// Filename for the crate mapping file within the output directory.
 /// Maps crate names (underscores) to package names (may have hyphens).
@@ -65,14 +96,21 @@ fn run_inner(cli: &Cli) -> Result<()> {
         .exec()
         .context("failed to run cargo metadata")?;
 
-    // Collect workspace member crate names.
+    // Collect workspace member crate names and their paths.
     // If -p/--package is specified, only analyze those packages.
     // Otherwise, analyze all workspace members.
-    let all_workspace_crates: Vec<String> = metadata
-        .workspace_packages()
-        .iter()
-        .map(|pkg| pkg.name.to_string())
-        .collect();
+    //
+    // The paths are used to identify which package integration tests belong to,
+    // since integration tests have crate names (e.g., `sync_mpsc`) that differ
+    // from their package name (e.g., `tokio`).
+    let mut all_workspace_crates: Vec<String> = Vec::new();
+    let mut workspace_paths: HashMap<String, PathBuf> = HashMap::new();
+    for pkg in metadata.workspace_packages() {
+        all_workspace_crates.push(pkg.name.to_string());
+        if let Some(manifest_dir) = pkg.manifest_path.parent() {
+            workspace_paths.insert(pkg.name.to_string(), manifest_dir.into());
+        }
+    }
 
     let workspace_crates: Vec<String> = if cli.package.is_empty() {
         all_workspace_crates
@@ -100,11 +138,6 @@ fn run_inner(cli: &Cli) -> Result<()> {
         workspace_crates.join(", ")
     );
 
-    // Create temp directory for intermediate output files.
-    // Each crate/target combination writes a separate JSON file here.
-    let output_dir =
-        TempDir::new().context("failed to create temp directory")?;
-
     // Get path to this binary for RUSTC_WRAPPER.
     let self_exe =
         env::current_exe().context("failed to get current executable path")?;
@@ -113,61 +146,43 @@ fn run_inner(cli: &Cli) -> Result<()> {
     let verbosity_level = cli.verbose.tracing_level_filter().to_string();
     debug!(verbosity = %verbosity_level, "passing verbosity to driver");
 
-    // Create a separate target directory for tarjanize.
-    // This ensures cargo always invokes rustc (our wrapper) rather than using
-    // cached artifacts from the normal target directory. This is the same
-    // approach clippy uses.
+    // Create temp directories. The target directory is shared between builds
+    // so external dependencies compiled in the profile build are reused.
     let target_dir =
         TempDir::new().context("failed to create target directory")?;
+    let output_dir =
+        TempDir::new().context("failed to create output directory")?;
+
+    // Write crate mapping file for use during result aggregation.
+    write_crate_mapping(&metadata, output_dir.path())?;
 
     // Create a directory for self-profile data.
-    // The driver adds `-Zself-profile` flags to collect compilation timing.
+    // Each target gets its own subdirectory to enable cleanup after processing.
     let profile_dir =
         TempDir::new().context("failed to create profile directory")?;
 
-    // Write crate mapping file for use during result aggregation.
-    // This maps crate names (underscores) to package names (hyphens).
-    write_crate_mapping(&metadata, output_dir.path())?;
+    let config = BuildConfig {
+        manifest_path: &manifest_path,
+        manifest_dir,
+        workspace_crates: &workspace_crates,
+        workspace_paths: &workspace_paths,
+        self_exe: &self_exe,
+        verbosity_level: &verbosity_level,
+        target_dir: target_dir.path(),
+        packages: &cli.package,
+    };
 
-    // Run cargo build with our wrapper.
-    // We use `cargo build` instead of `cargo check` because:
-    // 1. Backend (LLVM) timing requires actual codegen, not just type checking
-    // 2. Mono-items are only printed during codegen, not during check
-    // 3. Without codegen, we can't measure backend costs at all
-    debug!(manifest = %manifest_path.display(), "running cargo build");
-    let mut cmd = Command::new("cargo");
-    cmd.arg("build")
-        .arg("--all-targets")
-        .arg("--manifest-path")
-        .arg(&manifest_path);
+    // Single cargo build pass: driver does profiling, extraction, cost
+    // application, and cleanup for each crate as it compiles.
+    run_build(
+        &config,
+        output_dir.path(),
+        profile_dir.path(),
+        cli.no_profile,
+    )?;
 
-    // Add -p flags for each specified package.
-    // If no packages specified, cargo checks all workspace members.
-    for pkg in &cli.package {
-        cmd.arg("-p").arg(pkg);
-    }
-
-    // Disable incremental compilation to get consistent CGU naming.
-    // Incremental builds use hash-based CGU names that don't match between
-    // mono-items output and self-profile data.
-    cmd.env(ENV_OUTPUT_DIR, output_dir.path())
-        .env(ENV_WORKSPACE_CRATES, workspace_crates.join(","))
-        .env(ENV_VERBOSITY, &verbosity_level)
-        .env("RUSTC_WRAPPER", &self_exe)
-        .env("CARGO_TARGET_DIR", target_dir.path())
-        .env(ENV_PROFILE_DIR, profile_dir.path())
-        .env("CARGO_INCREMENTAL", "0")
-        .current_dir(manifest_dir);
-
-    let status = cmd.status().context("failed to run cargo build")?;
-
-    if !status.success() {
-        anyhow::bail!("cargo build failed with status: {status}");
-    }
-
-    // Aggregate results from all JSON files in the output directory.
-    // The driver has already applied costs and deleted profile files,
-    // so we just need to merge the Crate structures and add dependencies.
+    // Aggregate results from all JSON files.
+    // Costs are already applied by the driver.
     let graph =
         aggregate_results(output_dir.path(), &workspace_crates, &metadata)?;
 
@@ -178,6 +193,67 @@ fn run_inner(cli: &Cli) -> Result<()> {
     serde_json::to_writer_pretty(file, &graph).with_context(|| {
         format!("failed to write output to {}", cli.output.display())
     })?;
+
+    Ok(())
+}
+
+/// Run a single cargo build that does profiling, extraction, and cleanup.
+///
+/// Uses `RUSTC_WRAPPER` to run our custom driver. For workspace crates, the
+/// driver:
+/// 1. Adds `-Zself-profile` flags (unless `no_profile` is true)
+/// 2. Extracts symbols via `after_analysis` callback
+/// 3. Applies costs from profile data
+/// 4. Deletes profile files immediately to avoid filling /tmp
+///
+/// External dependencies compile normally without profiling or extraction.
+fn run_build(
+    config: &BuildConfig<'_>,
+    output_dir: &Path,
+    profile_dir: &Path,
+    no_profile: bool,
+) -> Result<()> {
+    info!("running build");
+
+    let mut cmd = Command::new("cargo");
+    cmd.arg("build")
+        .arg("--all-targets")
+        .arg("--manifest-path")
+        .arg(config.manifest_path);
+
+    for pkg in config.packages {
+        cmd.arg("-p").arg(pkg);
+    }
+
+    // Format workspace paths as "pkg1=/path1,pkg2=/path2" for the driver.
+    let workspace_paths_str: String = config
+        .workspace_paths
+        .iter()
+        .map(|(name, path)| format!("{}={}", name, path.display()))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    cmd.env(ENV_OUTPUT_DIR, output_dir)
+        .env(ENV_WORKSPACE_CRATES, config.workspace_crates.join(","))
+        .env(ENV_WORKSPACE_PATHS, &workspace_paths_str)
+        .env(ENV_PROFILE_DIR, profile_dir)
+        .env(ENV_VERBOSITY, config.verbosity_level)
+        .env("RUSTC_WRAPPER", config.self_exe)
+        .env("CARGO_TARGET_DIR", config.target_dir)
+        .env("CARGO_INCREMENTAL", "0")
+        .current_dir(config.manifest_dir);
+
+    // Skip profiling if requested.
+    if no_profile {
+        cmd.env(ENV_SKIP_PROFILE, "1");
+    }
+
+    debug!(manifest = %config.manifest_path.display(), no_profile, "running cargo build");
+    let status = cmd.status().context("failed to run cargo build")?;
+
+    if !status.success() {
+        anyhow::bail!("cargo build failed with status: {status}");
+    }
 
     Ok(())
 }
@@ -210,9 +286,7 @@ fn find_manifest_path(cli: &Cli) -> Result<std::path::PathBuf> {
 
 /// Read all JSON files from the output directory and build a `SymbolGraph`.
 ///
-/// The driver has already applied costs to each crate. We build the Package/Target
-/// structure, populate dependencies from cargo metadata, and transform symbol paths
-/// from crate-name format to package/target format.
+/// Costs are already applied by the driver during compilation.
 fn aggregate_results(
     output_dir: &Path,
     workspace_crates: &[String],
@@ -246,14 +320,10 @@ fn aggregate_results(
             .with_context(|| format!("failed to parse {}", path.display()))?;
 
         // Parse filename to extract target key.
-        // Filename format: {crate_name}_{target_key}.json
-        // where target_key has / replaced with _ (e.g., bin_foo for bin/foo)
         let target_key =
             parse_target_key_from_filename(&path, &result.crate_name);
 
         // Look up the package name from the crate mapping.
-        // Fall back to the heuristic if not found (shouldn't happen for
-        // workspace crates, but handles edge cases).
         let package_name = crate_mapping
             .get(&result.crate_name)
             .cloned()
@@ -278,8 +348,6 @@ fn aggregate_results(
     populate_dependencies(&mut packages, metadata);
 
     // Transform symbol paths from crate-name format to package/target format.
-    // Symbol dependencies use paths like "crate_name::module::symbol" which need
-    // to become "[package-name/lib]::module::symbol".
     transform_symbol_paths(&mut packages, &crate_mapping);
 
     info!(package_count = packages.len(), "aggregated package results");
@@ -295,9 +363,15 @@ fn parse_target_key_from_filename(path: &Path, crate_name: &str) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let prefix = format!("{crate_name}_");
     if let Some(suffix) = stem.strip_prefix(&prefix) {
-        // Convert bin_foo back to bin/foo
+        // Convert target_name back to target/name for composite targets.
+        // Filenames use underscore (e.g., `bin_foo.json`) because `/` isn't
+        // valid in filenames, but target keys use slash (e.g., `bin/foo`).
         if let Some(rest) = suffix.strip_prefix("bin_") {
             format!("bin/{rest}")
+        } else if let Some(rest) = suffix.strip_prefix("test_") {
+            // Integration tests: test_foo → test/foo
+            // Unit tests remain as just "test" (no underscore suffix).
+            format!("test/{rest}")
         } else if let Some(rest) = suffix.strip_prefix("example_") {
             format!("example/{rest}")
         } else if let Some(rest) = suffix.strip_prefix("bench_") {
@@ -352,8 +426,10 @@ fn populate_dependencies(
             if target_key == "lib" {
                 // Lib target: only normal dependencies.
                 crate_data.dependencies.clone_from(&normal_deps);
-            } else if target_key == "test" {
-                // Test target: normal + dev deps + own lib.
+            } else if target_key == "test" || target_key.starts_with("test/") {
+                // Test targets: normal + dev deps + own lib.
+                // "test" = unit tests (lib compiled with --test)
+                // "test/{name}" = integration tests (tests/*.rs files)
                 let mut deps = normal_deps.clone();
                 deps.extend(dev_deps.clone());
                 deps.insert(format!("{}/lib", cargo_pkg.name));
@@ -476,8 +552,6 @@ fn transform_module_paths(
     current_package: &str,
     current_target: &str,
 ) {
-    use tarjanize_schemas::SymbolKind;
-
     for symbol in module.symbols.values_mut() {
         // Transform dependencies.
         symbol.dependencies = symbol

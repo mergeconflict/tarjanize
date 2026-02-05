@@ -72,6 +72,10 @@ pub struct Cli {
     /// If not specified, analyzes all workspace members.
     #[arg(short, long, value_name = "SPEC")]
     pub package: Vec<String>,
+
+    /// Skip profiling entirely (faster extraction, but all costs will be zero).
+    #[arg(long)]
+    pub no_profile: bool,
 }
 
 fn main() -> ExitCode {

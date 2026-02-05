@@ -30,6 +30,7 @@ To do this effectively, we need a cost model that accurately predicts which crat
 - Frontend is 70% of lib compilation time; codegen runs in parallel with downstream work
 - Metadata overhead matters (+10% R²); linking is negligible (<1% of lib time)
 - **Only lib targets matter for critical path** — test/bin targets depend on libs and never block other work
+- **Per-symbol costs are extremely skewed** — top 1% of symbols = 75% of frontend cost; per-symbol attribution is essential for accurate crate splitting
 
 **Recommendation**: Use the model for **relative comparisons** and **critical path analysis**. The model identifies which crates are bottlenecks and how splitting them could improve parallelism.
 
@@ -143,13 +144,56 @@ Analysis of 151 lib targets in Omicron:
 
 ### 3.2 Metadata Estimation
 
-For synthetic crates (from SCC merging), metadata is estimated from frontend cost:
+For synthetic crates (from SCC merging), metadata is estimated from frontend cost.
 
-```
-metadata_ms = 0.26 × frontend_ms + 1662
-```
+**Finding: Metadata scales with the cube root of frontend cost.**
 
-This achieves R² = 0.705 for metadata prediction.
+The ratio `metadata/frontend` is not constant—smaller crates have disproportionately
+higher metadata costs. Testing different curve fits on tokio data:
+
+| Model | Formula | R² |
+|-------|---------|-----|
+| Linear | `0.12*fe + 460` | 0.916 |
+| **Power law** | `69 * fe^0.33` | **0.956** |
+| Square root | `13*√fe + 230` | 0.961 |
+
+The power law model `metadata = k * frontend^0.33` fits well with **no intercept**,
+which is important because fixed overhead varies across build environments.
+
+**TODO**: Validate this relationship across more codebases before updating the
+estimation formula in `scc.rs`.
+
+### 3.3 Per-Symbol Cost Distribution
+
+Per-symbol cost attribution is **essential** because costs are extremely skewed. A small fraction of symbols dominate total compilation time.
+
+**Omicron (127k symbols):**
+
+| Metric | Frontend | Backend |
+|--------|----------|---------|
+| Max/min ratio | **1,116,715×** | 8,816× |
+| Top 1% share | **75.3%** | 21.6% |
+| Top 10% share | 92.8% | 47.7% |
+| Most expensive | 225.6 seconds | 2.9 seconds |
+
+**Tokio (2.7k symbols):**
+
+| Metric | Frontend | Backend |
+|--------|----------|---------|
+| Max/min ratio | 5,091× | 687× |
+| Top 1% share | 34.4% | 16.8% |
+| Top 10% share | 68.8% | 50.7% |
+
+The most expensive symbols are `{{impl}}` blocks for complex types:
+- HTTP entrypoint handlers (Dropshot macros) — 225s each in Omicron
+- I/O types (TcpStream, UdpSocket, File) — 2s each in Tokio
+
+**Why this matters for crate splitting**: If we used average cost per symbol, we'd have massive errors. In Omicron:
+- Median symbol: 1.3ms
+- P99 symbol: 407ms (300× higher)
+- Max symbol: 225,563ms (170,000× higher than median)
+
+A synthetic crate receiving `http_entrypoints::{{impl}}` would be underestimated by **225 seconds** if we used averages. Per-symbol attribution ensures accurate cost prediction for any crate split.
 
 ---
 
@@ -349,7 +393,8 @@ Surprisingly, public symbols predict metadata *worse* than all symbols. Rustc me
 - **Workspace**: Omicron (Oxide Computer Company)
 - **Packages**: 161 workspace packages
 - **Targets**: 336 (149 lib, 161 test, 26 bin)
-- **Symbols**: 127,810
+- **Symbols**: 127,810 (127,200 with frontend costs, 63,094 with backend costs)
+- **Cost distribution**: Top 1% of symbols account for 75% of frontend cost
 
 ### Statistical Validation
 

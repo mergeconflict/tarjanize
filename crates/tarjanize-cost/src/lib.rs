@@ -74,7 +74,7 @@
 //!    - `finish[t] = start[t] + total_cost[t]`
 //! 4. The critical path length is the maximum `finish[t]` across all targets
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
 
@@ -578,7 +578,9 @@ fn build_target_graph(
         graph.add_node(i);
     }
 
-    // For each target, find which other targets it depends on.
+    // For each target, add edges from its dependencies.
+    // Dependencies come from cargo metadata (crate_data.dependencies) in
+    // "package/target" format (e.g., "tokio/lib", "serde/lib").
     for (package_name, package) in &symbol_graph.packages {
         for (target_key, crate_data) in &package.targets {
             let target_id = format!("{package_name}/{target_key}");
@@ -586,16 +588,12 @@ fn build_target_graph(
                 continue;
             };
 
-            // Collect dependencies from symbol paths.
-            let deps =
-                collect_target_dependencies(&crate_data.root, &target_names);
-
-            for dep_target in deps {
-                // Skip self-dependencies.
-                if dep_target == target_id {
+            for dep_target in &crate_data.dependencies {
+                // Skip self-dependencies and unknown targets.
+                if dep_target == &target_id {
                     continue;
                 }
-                if let Some(dep_idx) = target_names.get_index_of(&dep_target) {
+                if let Some(dep_idx) = target_names.get_index_of(dep_target) {
                     // Edge from dependency → dependent.
                     graph.add_edge(
                         NodeIndex::new(dep_idx),
@@ -657,61 +655,6 @@ fn count_symbols_in_module(module: &Module) -> usize {
     count
 }
 
-/// Collects all targets that symbols in this module depend on.
-///
-/// Parses the `[package/target]::path` format from symbol dependencies.
-/// Returns target identifiers like `my-package/lib`.
-fn collect_target_dependencies(
-    module: &Module,
-    known_targets: &IndexSet<String>,
-) -> HashSet<String> {
-    let mut deps = HashSet::new();
-
-    for symbol in module.symbols.values() {
-        for dep_path in &symbol.dependencies {
-            // Parse the [package/target]::path format.
-            if let Some(target_id) = parse_target_from_path(dep_path) {
-                // Only include if it's a known target in our graph.
-                if known_targets.contains(&target_id) {
-                    deps.insert(target_id);
-                }
-            }
-        }
-    }
-
-    for submodule in module.submodules.values() {
-        deps.extend(collect_target_dependencies(submodule, known_targets));
-    }
-
-    deps
-}
-
-/// Parses a target identifier from a symbol path.
-///
-/// Symbol paths use the format `[package/target]::module::symbol`.
-/// This function extracts the `package/target` portion.
-///
-/// Returns `None` if the path doesn't match the expected format.
-fn parse_target_from_path(path: &str) -> Option<String> {
-    // Check for bracketed prefix: [package/target]::...
-    if !path.starts_with('[') {
-        return None;
-    }
-
-    // Find the closing bracket.
-    let bracket_end = path.find(']')?;
-
-    // Extract the content inside brackets (package/target).
-    let inner = &path[1..bracket_end];
-
-    // Validate it contains a slash (package/target format).
-    if !inner.contains('/') {
-        return None;
-    }
-
-    Some(inner.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use tarjanize_schemas::{Package, Symbol, SymbolKind, Visibility};
@@ -719,17 +662,17 @@ mod tests {
     use super::*;
 
     /// Creates a symbol with only frontend cost (backend = 0).
-    fn make_symbol(frontend_cost: f64, deps: &[&str]) -> Symbol {
-        make_symbol_split(frontend_cost, 0.0, deps)
+    fn make_symbol(frontend_cost: f64) -> Symbol {
+        make_symbol_split(frontend_cost, 0.0)
     }
 
     /// Creates a symbol with separate frontend and backend costs.
-    fn make_symbol_split(frontend: f64, backend: f64, deps: &[&str]) -> Symbol {
+    fn make_symbol_split(frontend: f64, backend: f64) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
             frontend_cost_ms: frontend,
             backend_cost_ms: backend,
-            dependencies: deps.iter().map(|&s| s.to_string()).collect(),
+            dependencies: std::collections::HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
                 visibility: Visibility::Public,
@@ -737,12 +680,21 @@ mod tests {
         }
     }
 
-    /// Creates a crate with the given root module and default overhead.
-    fn make_crate(root: Module) -> tarjanize_schemas::Crate {
+    /// Creates a crate with the given root module and target-level dependencies.
+    fn make_crate_with_deps(
+        root: Module,
+        deps: &[&str],
+    ) -> tarjanize_schemas::Crate {
         tarjanize_schemas::Crate {
             root,
+            dependencies: deps.iter().map(|&s| s.to_string()).collect(),
             ..Default::default()
         }
+    }
+
+    /// Creates a crate with the given root module (no dependencies).
+    fn make_crate(root: Module) -> tarjanize_schemas::Crate {
+        make_crate_with_deps(root, &[])
     }
 
     /// Creates a crate with the given root module and specified overhead.
@@ -776,12 +728,6 @@ mod tests {
         SymbolGraph { packages }
     }
 
-    /// Helper to create a dependency path in the new format.
-    /// `dep("pkg", "lib", "foo")` returns `"[pkg/lib]::foo"`.
-    fn dep(package: &str, target: &str, path: &str) -> String {
-        format!("[{package}/{target}]::{path}")
-    }
-
     /// Helper to create a target identifier.
     /// `target_id("pkg", "lib")` returns `"pkg/lib"`.
     fn target_id(package: &str, target: &str) -> String {
@@ -792,11 +738,8 @@ mod tests {
     fn test_single_target_frontend_only() {
         // One target with two symbols, frontend-only: cost = 30
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
-        symbols.insert(
-            "bar".to_string(),
-            make_symbol(20.0, &[&dep("my-pkg", "lib", "foo")]),
-        );
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+        symbols.insert("bar".to_string(), make_symbol(20.0));
 
         let mut crates = HashMap::new();
         crates.insert(
@@ -827,8 +770,8 @@ mod tests {
         // - backend: 100 + 50 = 150 (summed within module)
         // - total: 20 + 150 = 170
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol_split(10.0, 100.0, &[]));
-        symbols.insert("bar".to_string(), make_symbol_split(10.0, 50.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol_split(10.0, 100.0));
+        symbols.insert("bar".to_string(), make_symbol_split(10.0, 50.0));
 
         let mut crates = HashMap::new();
         crates.insert(
@@ -862,15 +805,13 @@ mod tests {
         // total = 115
         let mut root_symbols = HashMap::new();
         root_symbols
-            .insert("root_fn".to_string(), make_symbol_split(5.0, 10.0, &[]));
+            .insert("root_fn".to_string(), make_symbol_split(5.0, 10.0));
 
         let mut mod_a_symbols = HashMap::new();
-        mod_a_symbols
-            .insert("a_fn".to_string(), make_symbol_split(5.0, 100.0, &[]));
+        mod_a_symbols.insert("a_fn".to_string(), make_symbol_split(5.0, 100.0));
 
         let mut mod_b_symbols = HashMap::new();
-        mod_b_symbols
-            .insert("b_fn".to_string(), make_symbol_split(5.0, 50.0, &[]));
+        mod_b_symbols.insert("b_fn".to_string(), make_symbol_split(5.0, 50.0));
 
         let mut submodules = HashMap::new();
         submodules.insert(
@@ -908,7 +849,7 @@ mod tests {
     fn test_target_overhead_included() {
         // Target with metadata overhead.
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
+        symbols.insert("foo".to_string(), make_symbol(10.0));
 
         let mut crates = HashMap::new();
         crates.insert(
@@ -933,11 +874,8 @@ mod tests {
     fn test_single_target() {
         // One target with two symbols: total cost = 30
         let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol(10.0, &[]));
-        symbols.insert(
-            "bar".to_string(),
-            make_symbol(20.0, &[&dep("my-pkg", "lib", "foo")]),
-        );
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+        symbols.insert("bar".to_string(), make_symbol(20.0));
 
         let mut crates = HashMap::new();
         crates.insert(
@@ -964,7 +902,7 @@ mod tests {
         let mut crates = HashMap::new();
 
         let mut symbols_a = HashMap::new();
-        symbols_a.insert("foo".to_string(), make_symbol(100.0, &[]));
+        symbols_a.insert("foo".to_string(), make_symbol(100.0));
         crates.insert(
             "pkg-a".to_string(),
             make_crate(Module {
@@ -974,7 +912,7 @@ mod tests {
         );
 
         let mut symbols_b = HashMap::new();
-        symbols_b.insert("bar".to_string(), make_symbol(50.0, &[]));
+        symbols_b.insert("bar".to_string(), make_symbol(50.0));
         crates.insert(
             "pkg-b".to_string(),
             make_crate(Module {
@@ -1001,20 +939,20 @@ mod tests {
         let mut crates = HashMap::new();
 
         let mut symbols_a = HashMap::new();
-        symbols_a.insert(
-            "foo".to_string(),
-            make_symbol(100.0, &[&dep("pkg-b", "lib", "bar")]),
-        );
+        symbols_a.insert("foo".to_string(), make_symbol(100.0));
         crates.insert(
             "pkg-a".to_string(),
-            make_crate(Module {
-                symbols: symbols_a,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: symbols_a,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-b/lib"],
+            ),
         );
 
         let mut symbols_b = HashMap::new();
-        symbols_b.insert("bar".to_string(), make_symbol(50.0, &[]));
+        symbols_b.insert("bar".to_string(), make_symbol(50.0));
         crates.insert(
             "pkg-b".to_string(),
             make_crate(Module {
@@ -1045,49 +983,46 @@ mod tests {
         let mut crates = HashMap::new();
 
         let mut symbols_a = HashMap::new();
-        symbols_a.insert(
-            "a".to_string(),
-            make_symbol(
-                10.0,
-                &[&dep("pkg-b", "lib", "b"), &dep("pkg-c", "lib", "c")],
-            ),
-        );
+        symbols_a.insert("a".to_string(), make_symbol(10.0));
         crates.insert(
             "pkg-a".to_string(),
-            make_crate(Module {
-                symbols: symbols_a,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: symbols_a,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-b/lib", "pkg-c/lib"],
+            ),
         );
 
         let mut symbols_b = HashMap::new();
-        symbols_b.insert(
-            "b".to_string(),
-            make_symbol(100.0, &[&dep("pkg-d", "lib", "d")]),
-        );
+        symbols_b.insert("b".to_string(), make_symbol(100.0));
         crates.insert(
             "pkg-b".to_string(),
-            make_crate(Module {
-                symbols: symbols_b,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: symbols_b,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-d/lib"],
+            ),
         );
 
         let mut symbols_c = HashMap::new();
-        symbols_c.insert(
-            "c".to_string(),
-            make_symbol(50.0, &[&dep("pkg-d", "lib", "d")]),
-        );
+        symbols_c.insert("c".to_string(), make_symbol(50.0));
         crates.insert(
             "pkg-c".to_string(),
-            make_crate(Module {
-                symbols: symbols_c,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: symbols_c,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-d/lib"],
+            ),
         );
 
         let mut symbols_d = HashMap::new();
-        symbols_d.insert("d".to_string(), make_symbol(30.0, &[]));
+        symbols_d.insert("d".to_string(), make_symbol(30.0));
         crates.insert(
             "pkg-d".to_string(),
             make_crate(Module {
@@ -1137,13 +1072,10 @@ mod tests {
         // Critical path: lib(100) → test(150) = 250
 
         let mut lib_symbols = HashMap::new();
-        lib_symbols.insert("lib_fn".to_string(), make_symbol(100.0, &[]));
+        lib_symbols.insert("lib_fn".to_string(), make_symbol(100.0));
 
         let mut test_symbols = HashMap::new();
-        test_symbols.insert(
-            "test_fn".to_string(),
-            make_symbol(50.0, &[&dep("pkg-a", "lib", "lib_fn")]),
-        );
+        test_symbols.insert("test_fn".to_string(), make_symbol(50.0));
 
         let mut targets = HashMap::new();
         targets.insert(
@@ -1155,10 +1087,13 @@ mod tests {
         );
         targets.insert(
             "test".to_string(),
-            make_crate(Module {
-                symbols: test_symbols,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: test_symbols,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-a/lib"],
+            ),
         );
 
         let mut packages = HashMap::new();
@@ -1203,27 +1138,15 @@ mod tests {
 
         // pkg-a/lib
         let mut lib_a_symbols = HashMap::new();
-        lib_a_symbols.insert("lib_a_fn".to_string(), make_symbol(100.0, &[]));
+        lib_a_symbols.insert("lib_a_fn".to_string(), make_symbol(100.0));
 
         // pkg-a/test (depends on pkg-a/lib and pkg-b/lib)
         let mut test_a_symbols = HashMap::new();
-        test_a_symbols.insert(
-            "test_a_fn".to_string(),
-            make_symbol(
-                50.0,
-                &[
-                    &dep("pkg-a", "lib", "lib_a_fn"),
-                    &dep("pkg-b", "lib", "lib_b_fn"),
-                ],
-            ),
-        );
+        test_a_symbols.insert("test_a_fn".to_string(), make_symbol(50.0));
 
         // pkg-b/lib (depends on pkg-a/lib)
         let mut lib_b_symbols = HashMap::new();
-        lib_b_symbols.insert(
-            "lib_b_fn".to_string(),
-            make_symbol(30.0, &[&dep("pkg-a", "lib", "lib_a_fn")]),
-        );
+        lib_b_symbols.insert("lib_b_fn".to_string(), make_symbol(30.0));
 
         let mut pkg_a_targets = HashMap::new();
         pkg_a_targets.insert(
@@ -1235,19 +1158,25 @@ mod tests {
         );
         pkg_a_targets.insert(
             "test".to_string(),
-            make_crate(Module {
-                symbols: test_a_symbols,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: test_a_symbols,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-a/lib", "pkg-b/lib"],
+            ),
         );
 
         let mut pkg_b_targets = HashMap::new();
         pkg_b_targets.insert(
             "lib".to_string(),
-            make_crate(Module {
-                symbols: lib_b_symbols,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: lib_b_symbols,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-a/lib"],
+            ),
         );
 
         let mut packages = HashMap::new();
@@ -1309,13 +1238,13 @@ mod tests {
         let mut symbols_a = HashMap::new();
         symbols_a.insert(
             "a".to_string(),
-            make_symbol_split(100.0, 50.0, &[]), // frontend=100, backend=50
+            make_symbol_split(100.0, 50.0), // frontend=100, backend=50
         );
 
         let mut symbols_b = HashMap::new();
         symbols_b.insert(
             "b".to_string(),
-            make_symbol(30.0, &[&dep("pkg-a", "lib", "a")]), // frontend=30, backend=0
+            make_symbol(30.0), // frontend=30, backend=0
         );
 
         let mut crates = HashMap::new();
@@ -1328,10 +1257,13 @@ mod tests {
         );
         crates.insert(
             "pkg-b".to_string(),
-            make_crate(Module {
-                symbols: symbols_b,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_deps(
+                Module {
+                    symbols: symbols_b,
+                    submodules: HashMap::new(),
+                },
+                &["pkg-a/lib"],
+            ),
         );
 
         let graph = make_graph(crates);
@@ -1363,28 +1295,5 @@ mod tests {
             .unwrap();
         assert!((pkg_b.start_time - 100.0).abs() < f64::EPSILON); // starts when pkg-a rmeta ready
         assert!((pkg_b.finish_time - 130.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_parse_target_from_path() {
-        // Valid paths
-        assert_eq!(
-            parse_target_from_path("[my-pkg/lib]::foo::bar"),
-            Some("my-pkg/lib".to_string())
-        );
-        assert_eq!(
-            parse_target_from_path("[pkg/test]::tests::test_fn"),
-            Some("pkg/test".to_string())
-        );
-        assert_eq!(
-            parse_target_from_path("[pkg/bin/cli]::main"),
-            Some("pkg/bin/cli".to_string())
-        );
-
-        // Invalid paths
-        assert_eq!(parse_target_from_path("old_crate::foo"), None);
-        assert_eq!(parse_target_from_path("[no_slash]::foo"), None);
-        assert_eq!(parse_target_from_path("not_bracketed/lib::foo"), None);
-        assert_eq!(parse_target_from_path(""), None);
     }
 }

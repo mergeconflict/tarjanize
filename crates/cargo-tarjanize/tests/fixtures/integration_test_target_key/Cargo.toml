@@ -1,0 +1,6 @@
+[package]
+name = "integration_test_target_key"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]

@@ -1023,3 +1023,61 @@ fn test_cross_crate_hyphen_names() {
         dep_crates
     );
 }
+
+/// Regression test: Integration tests must have unique target keys.
+///
+/// Cargo compiles each integration test (`tests/*.rs`) as a separate crate
+/// with its own `--crate-name` (e.g., `first_integration`). However, these
+/// crate names don't match the package name (e.g., `integration_test_target_key`).
+///
+/// Without the fix:
+/// - Integration tests were either not extracted (crate name didn't match any
+///   workspace package) or all got the same target key "test", overwriting each
+///   other.
+///
+/// With the fix:
+/// - Integration tests are identified by checking if their source file is
+///   within a workspace package directory.
+/// - Each integration test gets a unique target key like `test/first_integration`.
+/// - They are correctly associated with the parent package.
+#[test]
+fn test_integration_test_unique_target_keys() {
+    let graph = extract_fixture("integration_test_target_key");
+
+    // The package should exist.
+    let pkg = graph
+        .packages
+        .get("integration_test_target_key")
+        .expect("package should exist");
+
+    // Should have the lib target.
+    assert!(pkg.targets.contains_key("lib"), "Should have lib target");
+
+    // Should have distinct integration test targets.
+    // Integration tests get keys like "test/first_integration".
+    assert!(
+        pkg.targets.contains_key("test/first_integration"),
+        "Should have test/first_integration target, found targets: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        pkg.targets.contains_key("test/second_integration"),
+        "Should have test/second_integration target, found targets: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+
+    // Unit tests (lib compiled with --test) get key "test".
+    assert!(
+        pkg.targets.contains_key("test"),
+        "Should have test target for unit tests, found targets: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+
+    // Should have exactly 4 targets: lib, test, test/first_integration, test/second_integration.
+    assert_eq!(
+        pkg.targets.len(),
+        4,
+        "Should have 4 targets (lib, test, test/first_integration, test/second_integration), found: {:?}",
+        pkg.targets.keys().collect::<Vec<_>>()
+    );
+}

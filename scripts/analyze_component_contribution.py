@@ -42,19 +42,28 @@ def load_actual_times(html_path):
     actual_times = {}
     for rank, name_info, time_str in matches:
         time_s = float(time_str)
-        parts = name_info.split(' v0.1.0')
-        if len(parts) < 1:
+        # Split on version pattern like " v1.49.0" or " v0.1.0"
+        version_match = re.search(r' v\d+\.\d+\.\d+', name_info)
+        if not version_match:
             continue
-        package = parts[0].strip()
-        rest = parts[1] if len(parts) > 1 else ""
+        package = name_info[:version_match.start()].strip()
+        rest = name_info[version_match.end():]
 
-        if "(test)" in rest:
+        if "build-script" in rest:
+            continue
+
+        # Parse target type from the rest of the name
+        if "bench" in rest:
+            bench_match = re.search(r'bench "([^"]+)"', rest)
+            target = f"bench/{bench_match.group(1)}" if bench_match else "bench"
+        elif 'test "' in rest:
+            test_match = re.search(r'test "([^"]+)"', rest)
+            target = f"test/{test_match.group(1)}" if test_match else "test"
+        elif "(test)" in rest:
             target = "test"
         elif '"bin"' in rest:
             bin_match = re.search(r'(\w+) "bin"', rest)
             target = f"bin/{bin_match.group(1)}" if bin_match else "bin"
-        elif "build-script" in rest:
-            continue
         else:
             target = "lib"
 
@@ -149,6 +158,9 @@ def analyze_config(actual_times, graph, include_metadata, include_linking):
             entry = (key, actual_times[key], modeled_times[key])
             if "/test" in key:
                 test_data.append(entry)
+            elif "/bench/" in key:
+                # Bench targets excluded - harness overhead not modeled
+                pass
             elif "/bin/" not in key:
                 lib_data.append(entry)
 

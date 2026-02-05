@@ -1,5 +1,7 @@
 # Plan: Separate Lib/Test/Bin Targets
 
+> **Status: Fully implemented.** This plan is historical — all phases below have been completed. Kept for reference on design decisions.
+
 This document describes the refactor to separate compilation targets (lib, test, bin, etc.) in the symbol graph, rather than merging them into a single entry.
 
 ## Motivation

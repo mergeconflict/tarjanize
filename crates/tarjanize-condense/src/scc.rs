@@ -478,16 +478,15 @@ pub(crate) fn condense_and_partition(
 
 /// Coefficient for estimating metadata time from frontend cost.
 ///
-/// Based on linear regression against real build data (R² = 0.705):
+/// For synthetic crates (from SCC merging), metadata is estimated as:
 /// `metadata_ms = METADATA_SLOPE * frontend_ms + METADATA_INTERCEPT`
 ///
-/// See `docs/cost-model-validation.md` Appendix A.7 for derivation.
+/// TODO: Validate power law model `metadata = k * frontend^0.33` across
+/// multiple codebases before switching to that formula.
 const METADATA_SLOPE: f64 = 0.26;
 
 /// Fixed per-crate overhead for metadata generation in milliseconds.
-///
-/// This represents the baseline cost of generating metadata for any crate,
-/// independent of its symbol count or complexity.
+/// TODO: Remove once power law model is validated.
 const METADATA_INTERCEPT: f64 = 1662.0;
 
 /// Builds the output `SymbolGraph` from grouped symbols.

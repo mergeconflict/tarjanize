@@ -59,8 +59,7 @@ def analyze_breakdown(actual_data, model_packages):
     results = []
 
     for u in actual_data:
-        if u.get('version') != '0.1.0':
-            continue
+        # Filter to workspace packages (by name, not version)
         if u['name'] not in model_packages:
             continue
 

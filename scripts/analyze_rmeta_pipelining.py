@@ -114,11 +114,9 @@ def find_best_examples(actual_data):
     """Find packages with the most dramatic pipelining evidence."""
     examples = []
 
-    # Group by package
+    # Group by package (all packages, not just workspace)
     packages = {}
     for u in actual_data:
-        if u.get('version') != '0.1.0':
-            continue
         name = u['name']
         target = u.get('target', '').strip()
 

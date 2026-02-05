@@ -1,5 +1,7 @@
 # Implementation Plan: Compilation Cost Tracking
 
+> **Status: Fully implemented.** This plan is historical — all phases below have been completed. Kept for reference on design decisions.
+
 Implement detailed compilation cost tracking as specified in COMPILATION_COSTS.md, separating frontend and backend costs for accurate wall-clock time prediction.
 
 ## Summary

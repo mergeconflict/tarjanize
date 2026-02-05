@@ -6,7 +6,19 @@
 //! 1. Run a profiled build with `-Zself-profile` and `-Zself-profile-events=default,llvm,args`
 //! 2. Parse the `.mm_profdata` files using the `analyzeme` crate
 //! 3. Categorize events into frontend, backend (CGU), and overhead costs
-//! 4. Use this timing data for the cost fields in `Symbol` and `Crate`
+//! 4. Compute **self-time** (excluding nested queries) to avoid double-counting
+//! 5. Use this timing data for the cost fields in `Symbol` and `Crate`
+//!
+//! ## Self-Time Computation
+//!
+//! Profile events can nest: `typeck(foo)` may trigger `typeck(bar)`. Naively
+//! summing durations would double-count `bar`'s time (once for bar, once inside
+//! foo). We compute self-time = duration - sum(children) to get the time each
+//! symbol directly consumes.
+//!
+//! The algorithm walks events in reverse order (events are emitted at their end
+//! time, so parents come after children). For each event, we subtract its
+//! duration from its parent's self-time.
 //!
 //! ## Event Categories
 //!
@@ -19,8 +31,8 @@ use std::panic;
 use std::path::Path;
 use std::time::Duration;
 
-use analyzeme::ProfilingData;
-use tracing::{debug, info, warn};
+use analyzeme::{Event, EventPayload, ProfilingData, Timestamp};
+use tracing::{debug, info, info_span, warn};
 
 /// Category of a self-profile event for cost allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,6 +76,8 @@ impl ProfileData {
     /// Returns an empty `ProfileData` if the directory doesn't exist
     /// or contains no profile files.
     pub fn load_from_dir(dir: &Path) -> Self {
+        let _span = info_span!("load_from_dir", dir = %dir.display()).entered();
+
         let mut data = ProfileData::default();
 
         let entries = match std::fs::read_dir(dir) {
@@ -78,8 +92,41 @@ impl ProfileData {
             }
         };
 
+        // Collect all profile files first for logging.
+        let profile_files: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if path.extension().is_some_and(|ext| ext == "mm_profdata") {
+                    path.file_name().map(|n| n.to_string_lossy().into_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        info!(
+            dir = %dir.display(),
+            file_count = profile_files.len(),
+            files = ?profile_files,
+            "found profile files"
+        );
+
         let mut file_count = 0;
         let mut event_count = 0;
+
+        // Re-read directory to process files (iterator was consumed).
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    "failed to re-read profile directory {}: {}",
+                    dir.display(),
+                    e
+                );
+                return data;
+            }
+        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -104,6 +151,14 @@ impl ProfileData {
                             // Extract crate name from profile filename.
                             // Format: "crate_name-XXXXXXX" where X is hex digits.
                             let crate_name = extract_crate_name(&stem_str);
+
+                            let _span = info_span!(
+                                "aggregate_profile",
+                                file = %stem_str,
+                                crate_name = %crate_name,
+                                num_events = profile.num_events()
+                            )
+                            .entered();
 
                             file_count += 1;
                             event_count +=
@@ -139,7 +194,15 @@ impl ProfileData {
         data
     }
 
-    /// Aggregate timing data from a single profile file.
+    /// Aggregate timing data from a single profile file using self-time.
+    ///
+    /// Self-time is the time spent in an event excluding time spent in nested
+    /// child events. This avoids double-counting when summing costs, since
+    /// query events can nest (e.g., `typeck(foo)` triggers `typeck(bar)`).
+    ///
+    /// The algorithm walks events in reverse order (events are emitted at their
+    /// end time, so parents come after children in the stream). For each event,
+    /// we subtract its duration from the parent's accumulated self-time.
     ///
     /// Returns the number of events processed.
     fn aggregate_profile(
@@ -147,65 +210,164 @@ impl ProfileData {
         profile: &ProfilingData,
         crate_name: &str,
     ) -> usize {
-        let mut count = 0;
+        // Per-thread state: stack of currently open events and their
+        // accumulated self-times. We need to track self-time separately because
+        // we modify it as we encounter children.
+        struct PerThreadState<'a> {
+            /// Stack of open events paired with their accumulated self-time.
+            /// Self-time starts at full duration and decreases for children.
+            stack: Vec<(Event<'a>, Duration)>,
+        }
 
-        for event in profile.iter_full() {
-            let Some(dur) = event.duration() else {
+        let mut threads: HashMap<u32, PerThreadState<'_>> = HashMap::new();
+        let mut count = 0;
+        let mut raw_duration_sum = Duration::ZERO;
+        let mut recorded_self_time_sum = Duration::ZERO;
+
+        // Walk events in reverse order. Events are emitted at their end time,
+        // so a parent event appears after all its children in the stream.
+        // Walking backwards means we see parents before children.
+        for event in profile.iter_full().rev() {
+            // Skip non-interval events (instants, integers).
+            let EventPayload::Timestamp(Timestamp::Interval { .. }) =
+                event.payload
+            else {
                 continue;
             };
 
-            let label = &event.label;
-            let category = categorize_event(label);
+            let Some(duration) = event.duration() else {
+                continue;
+            };
 
-            match category {
-                EventCategory::Frontend => {
-                    // Frontend events have DefPath in additional_data[0].
-                    if let Some(raw_path) = event.additional_data.first() {
-                        let normalized = normalize_frontend_path(raw_path);
-                        if !normalized.is_empty() {
-                            *self
-                                .frontend_costs
-                                .entry(normalized)
-                                .or_default() += dur;
-                            count += 1;
-                        }
-                    }
+            // Track raw duration for debugging
+            if &*event.event_kind == QUERY_EVENT_KIND
+                || &*event.event_kind == GENERIC_ACTIVITY_EVENT_KIND
+            {
+                raw_duration_sum += duration;
+            }
+
+            let thread = threads
+                .entry(event.thread_id)
+                .or_insert_with(|| PerThreadState { stack: Vec::new() });
+
+            // Pop events from the stack that don't contain the current event.
+            // After this loop, the top of the stack (if any) is the parent of
+            // the current event.
+            while let Some((top_event, top_self_time)) =
+                thread.stack.last().cloned()
+            {
+                if top_event.contains(&event) {
+                    // Top event is parent of current event - keep it.
+                    break;
                 }
-                EventCategory::Backend => {
-                    // Backend events (LLVM) have CGU name in additional_data[0].
-                    if let Some(cgu_name) = event.additional_data.first() {
-                        *self
-                            .cgu_costs
-                            .entry(cgu_name.to_string())
-                            .or_default() += dur;
-                        count += 1;
-                    }
+
+                // Top event ended before current event started - finalize it.
+                thread.stack.pop();
+                if let Some(recorded) =
+                    self.record_event(&top_event, top_self_time, crate_name)
+                {
+                    recorded_self_time_sum += recorded;
                 }
-                EventCategory::Overhead => {
-                    // Overhead events are per-crate fixed costs.
-                    // We only track metadata generation; linking is too small
-                    // to matter (< 1% of lib build time) and unpredictable.
-                    if is_metadata_event(label) {
-                        let overhead = self
-                            .crate_overhead
-                            .entry(crate_name.to_string())
-                            .or_default();
-                        overhead.metadata_ms += dur.as_millis_f64();
-                    }
-                    count += 1;
+                count += 1;
+            }
+
+            // Subtract current event's duration from parent's self-time.
+            if let Some((_, parent_self_time)) = thread.stack.last_mut() {
+                *parent_self_time = parent_self_time.saturating_sub(duration);
+            }
+
+            // Push current event with initial self-time = full duration.
+            // This will be reduced as we encounter its children.
+            thread.stack.push((event, duration));
+        }
+
+        // Finalize any remaining events on the stacks.
+        for (_, thread) in threads {
+            for (event, self_time) in thread.stack {
+                if let Some(recorded) =
+                    self.record_event(&event, self_time, crate_name)
+                {
+                    recorded_self_time_sum += recorded;
                 }
-                EventCategory::Skip => {}
+                count += 1;
             }
         }
 
+        // Log the inflation ratio for debugging
+        info!(
+            raw_ms = raw_duration_sum.as_millis(),
+            self_time_ms = recorded_self_time_sum.as_millis(),
+            "self-time sums"
+        );
+
         count
+    }
+
+    /// Record an event's self-time into the appropriate cost map.
+    ///
+    /// Returns the recorded self-time if the event was recorded as Frontend,
+    /// otherwise None.
+    fn record_event(
+        &mut self,
+        event: &Event<'_>,
+        self_time: Duration,
+        crate_name: &str,
+    ) -> Option<Duration> {
+        let label = &event.label;
+        let event_kind = &event.event_kind;
+        let category = categorize_event(label, event_kind);
+
+        match category {
+            EventCategory::Frontend => {
+                // Frontend events have DefPath in additional_data[0].
+                if let Some(raw_path) = event.additional_data.first() {
+                    let normalized = normalize_frontend_path(raw_path);
+                    if !normalized.is_empty() {
+                        *self.frontend_costs.entry(normalized).or_default() +=
+                            self_time;
+                        return Some(self_time);
+                    }
+                }
+                None
+            }
+            EventCategory::Backend => {
+                // Backend events (LLVM) have CGU name in additional_data[0].
+                if let Some(cgu_name) = event.additional_data.first() {
+                    *self.cgu_costs.entry(cgu_name.to_string()).or_default() +=
+                        self_time;
+                }
+                None
+            }
+            EventCategory::Overhead => {
+                // Overhead events are per-crate fixed costs.
+                // We only track metadata generation; linking is too small
+                // to matter (< 1% of lib build time) and unpredictable.
+                if is_metadata_event(label) {
+                    let overhead = self
+                        .crate_overhead
+                        .entry(crate_name.to_string())
+                        .or_default();
+                    overhead.metadata_ms += self_time.as_millis_f64();
+                }
+                None
+            }
+            EventCategory::Skip => None,
+        }
     }
 
     /// Get the frontend compilation cost for a symbol path.
     ///
     /// Returns the total time in milliseconds, or None if no timing data exists.
+    /// Normalizes the path by replacing hyphens with underscores in the crate
+    /// name prefix, since Rust crate names use underscores but cargo package
+    /// names use hyphens.
     pub fn get_frontend_cost_ms(&self, path: &str) -> Option<f64> {
-        self.frontend_costs.get(path).map(Duration::as_millis_f64)
+        // Profile paths use underscores (Rust convention), but our paths use
+        // cargo package names with hyphens. Normalize the crate name prefix.
+        let normalized = path.replace('-', "_");
+        self.frontend_costs
+            .get(&normalized)
+            .map(Duration::as_millis_f64)
     }
 
     /// Get all CGU costs for backend cost distribution.
@@ -218,11 +380,16 @@ impl ProfileData {
     /// Get crate overhead costs.
     ///
     /// Returns None if no overhead was recorded for this crate.
+    /// Normalizes the crate name by replacing hyphens with underscores,
+    /// since Rust crate names use underscores but cargo package names use hyphens.
     pub fn get_crate_overhead(
         &self,
         crate_name: &str,
     ) -> Option<&CrateOverhead> {
-        self.crate_overhead.get(crate_name)
+        // Profile filenames use underscores (Rust convention), but cargo
+        // package names use hyphens. Normalize to match.
+        let normalized = crate_name.replace('-', "_");
+        self.crate_overhead.get(&normalized)
     }
 
     /// Get the number of unique frontend paths with timing data.
@@ -255,9 +422,22 @@ fn extract_crate_name(stem: &str) -> String {
     stem.to_string()
 }
 
-/// Categorize a self-profile event label into frontend, backend, or overhead.
-fn categorize_event(label: &str) -> EventCategory {
+/// Event kinds from rustc's self-profile that we care about.
+const QUERY_EVENT_KIND: &str = "Query";
+const GENERIC_ACTIVITY_EVENT_KIND: &str = "GenericActivity";
+
+/// Categorize a self-profile event into frontend, backend, or overhead.
+///
+/// We filter by both `event_kind` and `label`:
+/// - `event_kind` tells us the category (Query, etc.)
+/// - `label` tells us the specific operation (typeck, etc.)
+///
+/// We only count Query and generic activity events as frontend work.
+/// Other event kinds (incremental hashing, load result) happen INSIDE queries
+/// and are already accounted for in the query's time.
+fn categorize_event(label: &str, event_kind: &str) -> EventCategory {
     // Backend events (LLVM codegen, parallel across CGUs).
+    // These are GenericActivity events with LLVM-related labels.
     if label.starts_with("LLVM_")
         || label.starts_with("codegen_module")
         || label == "LLVM_lto_optimize"
@@ -279,6 +459,15 @@ fn categorize_event(label: &str) -> EventCategory {
         || label == "serialize_dep_graph"
         || label == "serialize_work_products"
         || label == "copy_all_cgu_workproducts_to_incr_comp_cache"
+    {
+        return EventCategory::Skip;
+    }
+
+    // Only count Query and GenericActivity events as frontend work.
+    // Other event kinds (IncrementalResultHashing, IncrementalLoadResult, etc.)
+    // happen inside queries and are already accounted for in the parent's time.
+    if event_kind != QUERY_EVENT_KIND
+        && event_kind != GENERIC_ACTIVITY_EVENT_KIND
     {
         return EventCategory::Skip;
     }
@@ -446,46 +635,95 @@ mod tests {
 
     #[test]
     fn test_categorize_event_frontend() {
-        assert_eq!(categorize_event("typeck"), EventCategory::Frontend);
-        assert_eq!(categorize_event("borrowck"), EventCategory::Frontend);
-        assert_eq!(categorize_event("optimized_mir"), EventCategory::Frontend);
+        // Query events with typeck/borrowck labels are frontend.
+        assert_eq!(
+            categorize_event("typeck", QUERY_EVENT_KIND),
+            EventCategory::Frontend
+        );
+        assert_eq!(
+            categorize_event("borrowck", QUERY_EVENT_KIND),
+            EventCategory::Frontend
+        );
+        assert_eq!(
+            categorize_event("optimized_mir", QUERY_EVENT_KIND),
+            EventCategory::Frontend
+        );
+        // GenericActivity events are also frontend.
+        assert_eq!(
+            categorize_event("some_activity", GENERIC_ACTIVITY_EVENT_KIND),
+            EventCategory::Frontend
+        );
     }
 
     #[test]
     fn test_categorize_event_backend() {
         assert_eq!(
-            categorize_event("LLVM_module_codegen"),
+            categorize_event(
+                "LLVM_module_codegen",
+                GENERIC_ACTIVITY_EVENT_KIND
+            ),
             EventCategory::Backend
         );
-        assert_eq!(categorize_event("codegen_module"), EventCategory::Backend);
+        assert_eq!(
+            categorize_event("codegen_module", GENERIC_ACTIVITY_EVENT_KIND),
+            EventCategory::Backend
+        );
     }
 
     #[test]
     fn test_categorize_event_overhead() {
         // Only metadata events are tracked as overhead; linking is skipped.
         assert_eq!(
-            categorize_event("generate_crate_metadata"),
+            categorize_event(
+                "generate_crate_metadata",
+                GENERIC_ACTIVITY_EVENT_KIND
+            ),
             EventCategory::Overhead
         );
         assert_eq!(
-            categorize_event("metadata_decode_entry"),
+            categorize_event(
+                "metadata_decode_entry",
+                GENERIC_ACTIVITY_EVENT_KIND
+            ),
             EventCategory::Overhead
         );
     }
 
     #[test]
     fn test_categorize_event_skip() {
+        // Incremental compilation events are skipped.
         assert_eq!(
-            categorize_event("incr_comp_persist_result"),
+            categorize_event(
+                "incr_comp_persist_result",
+                GENERIC_ACTIVITY_EVENT_KIND
+            ),
             EventCategory::Skip
         );
         assert_eq!(
-            categorize_event("self_profile_alloc_query_strings"),
+            categorize_event(
+                "self_profile_alloc_query_strings",
+                GENERIC_ACTIVITY_EVENT_KIND
+            ),
             EventCategory::Skip
         );
         // Linking events are skipped (< 1% of lib build time).
-        assert_eq!(categorize_event("link_crate"), EventCategory::Skip);
-        assert_eq!(categorize_event("link_binary"), EventCategory::Skip);
+        assert_eq!(
+            categorize_event("link_crate", GENERIC_ACTIVITY_EVENT_KIND),
+            EventCategory::Skip
+        );
+        assert_eq!(
+            categorize_event("link_binary", GENERIC_ACTIVITY_EVENT_KIND),
+            EventCategory::Skip
+        );
+        // Non-Query/GenericActivity event kinds are skipped.
+        assert_eq!(
+            categorize_event("typeck", "IncrementalResultHashing"),
+            EventCategory::Skip
+        );
+        assert_eq!(
+            categorize_event("typeck", "IncrementalLoadResult"),
+            EventCategory::Skip
+        );
     }
 
     #[test]

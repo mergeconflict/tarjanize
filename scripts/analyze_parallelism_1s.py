@@ -45,10 +45,9 @@ def load_model_packages(path):
 
 def analyze_parallelism(actual_data, model_packages):
     """Analyze instantaneous parallelism at 1-second resolution."""
-    # Filter to workspace units
+    # Filter to workspace units (by package name, not version)
     workspace = [u for u in actual_data
-                 if u.get('version') == '0.1.0'
-                 and u['name'] in model_packages
+                 if u['name'] in model_packages
                  and 'build-script' not in u.get('target', '')]
 
     if not workspace:
