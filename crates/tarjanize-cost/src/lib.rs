@@ -10,7 +10,7 @@
 //!
 //! - **Frontend** (parsing, type checking, borrow checking) — serial within a crate
 //! - **Backend** (LLVM optimization, codegen) — parallel across Codegen Units (CGUs)
-//! - **Overhead** (linking, metadata) — per-crate fixed costs
+//! - **Overhead** (metadata generation) — per-crate fixed costs
 //!
 //! We model crate compile time using the wall-clock prediction formula:
 //!
@@ -25,6 +25,26 @@
 //!
 //! The key insight: backend work is parallelized via CGUs, roughly 2 per module.
 //! Only the slowest module's backend cost affects wall-clock time.
+//!
+//! ## Rmeta Pipelining
+//!
+//! Cargo uses **pipelined compilation**: downstream crates can start compiling
+//! as soon as their dependencies' **rmeta** (metadata) is ready, without waiting
+//! for the full **rlib** (compiled code). This is critical for accurate modeling:
+//!
+//! - **Rmeta** contains type signatures, trait impls — available after frontend
+//! - **Rlib** contains compiled code — only needed for final linking
+//!
+//! For scheduling purposes:
+//! ```text
+//! rmeta_ready_time = start_time + frontend_cost
+//! finish_time      = start_time + total_cost
+//!
+//! downstream.start_time = max(dep.rmeta_ready_time for dep in dependencies)
+//! ```
+//!
+//! This means backend work (codegen) runs in parallel with downstream frontend
+//! work, significantly increasing effective parallelism.
 //!
 //! ## Target-Level Analysis
 //!
@@ -43,16 +63,20 @@
 //!
 //! ## Algorithm
 //!
-//! The critical path is the longest weighted path through the target dependency
-//! DAG. We compute this using dynamic programming in topological order:
+//! The critical path is computed using dynamic programming in topological order,
+//! accounting for rmeta pipelining:
 //!
 //! 1. Build a directed graph of target dependencies
 //! 2. Process targets in topological order (dependencies before dependents)
-//! 3. For each target: `dist[t] = cost[t] + max(dist[dep] for dep in deps)`
-//! 4. The critical path length is the maximum `dist[t]` across all targets
+//! 3. For each target:
+//!    - `start[t] = max(rmeta_ready[dep] for dep in deps)`
+//!    - `rmeta_ready[t] = start[t] + frontend_cost[t]`
+//!    - `finish[t] = start[t] + total_cost[t]`
+//! 4. The critical path length is the maximum `finish[t]` across all targets
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read;
+use std::fmt;
+use std::io::{Read, Write};
 
 use indexmap::IndexSet;
 use petgraph::Direction;
@@ -60,29 +84,53 @@ use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use tarjanize_schemas::{Module, SymbolGraph};
 
-/// Details about a single target on the critical path.
+/// Details about a single target, including timing with rmeta pipelining.
 #[derive(Debug, Clone)]
 pub struct TargetOnPath {
     /// Target identifier in `{package}/{target}` format.
     /// Examples: `my-package/lib`, `my-package/test`, `my-package/bin/cli`.
     pub name: String,
 
-    /// Estimated cost of this target alone (frontend + backend + overhead).
-    pub cost: f64,
+    /// Frontend cost in milliseconds (type checking, borrow checking).
+    /// This determines when rmeta is available for downstream crates.
+    pub frontend_cost: f64,
 
-    /// Cumulative cost from the start of the critical path to this target
-    /// (includes this target's cost and all its transitive dependencies on the path).
-    pub cumulative_cost: f64,
+    /// Backend cost in milliseconds (LLVM codegen).
+    /// Runs in parallel with downstream frontend work due to rmeta pipelining.
+    pub backend_cost: f64,
+
+    /// Overhead cost in milliseconds (metadata generation).
+    pub overhead_cost: f64,
+
+    /// Total cost of this target alone (frontend + backend + overhead).
+    pub total_cost: f64,
+
+    /// When this target can start (max of dependencies' `rmeta_ready_time`).
+    /// With infinite parallelism, this is the earliest possible start.
+    pub start_time: f64,
+
+    /// When rmeta is available (start + frontend). Downstream targets can begin
+    /// their frontend work at this point, even though codegen is still running.
+    pub rmeta_ready_time: f64,
+
+    /// When this target fully completes (start + `total_cost`).
+    pub finish_time: f64,
 
     /// Direct dependencies of this target (target identifiers).
     pub dependencies: Vec<String>,
 }
 
-/// Result of critical path analysis.
+/// Result of critical path analysis with rmeta pipelining.
 #[derive(Debug, Clone)]
 pub struct CriticalPathResult {
-    /// Total cost of the critical path (sum of target costs along the path).
-    pub cost: f64,
+    /// Minimum build time with infinite parallelism (max finish time).
+    /// Accounts for rmeta pipelining: downstream targets start when upstream
+    /// rmeta is ready, not when upstream fully completes.
+    pub critical_path_ms: f64,
+
+    /// What the critical path would be without pipelining (for comparison).
+    /// Computed as if downstream targets waited for full completion.
+    pub critical_path_no_pipelining_ms: f64,
 
     /// Targets on the critical path, from deepest dependency to top-level.
     /// Each entry is a target identifier like `my-package/lib`.
@@ -91,10 +139,10 @@ pub struct CriticalPathResult {
     /// Detailed information for each target on the critical path.
     pub path_details: Vec<TargetOnPath>,
 
-    /// All targets with their costs, sorted by cost descending.
+    /// All targets with their timing details, sorted by `finish_time` descending.
     pub all_targets: Vec<TargetOnPath>,
 
-    /// Total cost of all targets (sequential build time).
+    /// Sum of all target costs (theoretical sequential build time).
     pub total_cost: f64,
 
     /// Number of targets in the graph.
@@ -104,10 +152,118 @@ pub struct CriticalPathResult {
     pub symbol_count: usize,
 }
 
+impl CriticalPathResult {
+    /// Writes a human-readable report to the given writer.
+    ///
+    /// The report includes summary statistics and timing tables for all targets.
+    pub fn write_report(&self, mut w: impl Write) -> std::io::Result<()> {
+        // Summary statistics.
+        writeln!(
+            w,
+            "Critical path (pipelined): {:.2} ms",
+            self.critical_path_ms
+        )?;
+        writeln!(
+            w,
+            "Critical path (no pipeline): {:.2} ms",
+            self.critical_path_no_pipelining_ms
+        )?;
+
+        // Avoid division by zero for empty graphs.
+        let pipelining_benefit = if self.critical_path_no_pipelining_ms > 0.0 {
+            100.0
+                * (1.0
+                    - self.critical_path_ms
+                        / self.critical_path_no_pipelining_ms)
+        } else {
+            0.0
+        };
+        writeln!(
+            w,
+            "Pipelining benefit:        {:.2} ms ({:.1}%)",
+            self.critical_path_no_pipelining_ms - self.critical_path_ms,
+            pipelining_benefit
+        )?;
+
+        writeln!(w, "Total cost (sequential):   {:.2} ms", self.total_cost)?;
+
+        let parallelism = if self.critical_path_ms > 0.0 {
+            self.total_cost / self.critical_path_ms
+        } else {
+            1.0
+        };
+        writeln!(w, "Parallelism ratio:         {parallelism:.2}x")?;
+        writeln!(w, "Target count:              {}", self.target_count)?;
+        writeln!(w, "Symbol count:              {}", self.symbol_count)?;
+
+        // Table header for timing details.
+        let header = format!(
+            "{:>10}  {:>10}  {:>10}  {:>10}  {:<40}  Dependencies",
+            "Start", "Rmeta", "Finish", "Cost", "Target"
+        );
+        let separator = "-".repeat(header.len() + 20);
+
+        if !self.path_details.is_empty() {
+            writeln!(w, "\nCritical path ({} targets):\n", self.path.len())?;
+            writeln!(w, "{header}")?;
+            writeln!(w, "{separator}")?;
+
+            for target in &self.path_details {
+                writeln!(w, "{target}")?;
+            }
+        }
+
+        if !self.all_targets.is_empty() {
+            writeln!(
+                w,
+                "\nAll targets by finish time ({} targets):\n",
+                self.all_targets.len()
+            )?;
+            writeln!(w, "{header}")?;
+            writeln!(w, "{separator}")?;
+
+            for target in &self.all_targets {
+                writeln!(w, "{target}")?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl fmt::Display for TargetOnPath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Format dependencies: show first few, then count if many.
+        let deps_str = if self.dependencies.is_empty() {
+            "(none)".to_string()
+        } else if self.dependencies.len() <= 3 {
+            self.dependencies.join(", ")
+        } else {
+            format!(
+                "{}, ... (+{} more)",
+                self.dependencies[..3].join(", "),
+                self.dependencies.len() - 3
+            )
+        };
+
+        write!(
+            f,
+            "{:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}  {:<40}  {}",
+            self.start_time,
+            self.rmeta_ready_time,
+            self.finish_time,
+            self.total_cost,
+            self.name,
+            deps_str
+        )
+    }
+}
+
 /// Computes the critical path of a symbol graph at the target level.
 ///
-/// The critical path is the longest weighted path through the target dependency
-/// DAG. This represents the minimum build time with infinite parallelism.
+/// Uses rmeta pipelining: downstream targets can start when upstream rmeta
+/// is ready (after frontend), not when upstream fully completes. This
+/// accurately models Cargo's actual scheduling behavior.
 ///
 /// Each compilation target (lib, test, bin, etc.) is a separate node. This
 /// naturally resolves dev-dependency "cycles" because test targets depend on
@@ -120,9 +276,11 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     let (target_names, target_costs, symbol_count, graph) =
         build_target_graph(symbol_graph);
 
-    if target_names.is_empty() {
+    let n = target_names.len();
+    if n == 0 {
         return CriticalPathResult {
-            cost: 0.0,
+            critical_path_ms: 0.0,
+            critical_path_no_pipelining_ms: 0.0,
             path: Vec::new(),
             path_details: Vec::new(),
             all_targets: Vec::new(),
@@ -132,7 +290,7 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
         };
     }
 
-    let total_cost: f64 = target_costs.iter().sum();
+    let total_cost: f64 = target_costs.iter().map(TargetCosts::total).sum();
 
     // Topological sort. With target-level analysis, the graph should always
     // be a DAG (no cycles from dev-dependencies). If there are cycles, it
@@ -142,13 +300,13 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
             "WARNING: cycle detected in target dependency graph, \
              skipping critical path computation"
         );
-        // Return early with just the target costs.
+        // Return early with just the target costs (no timing computed).
         let mut all_targets: Vec<TargetOnPath> = target_names
             .iter()
             .enumerate()
             .map(|(idx, name)| {
                 let node = NodeIndex::new(idx);
-                let cost = target_costs[idx];
+                let costs = target_costs[idx];
                 let dependencies: Vec<String> = graph
                     .neighbors_directed(node, Direction::Incoming)
                     .map(|dep| {
@@ -157,54 +315,88 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
                     .collect();
                 TargetOnPath {
                     name: name.clone(),
-                    cost,
-                    cumulative_cost: cost,
+                    frontend_cost: costs.frontend,
+                    backend_cost: costs.backend,
+                    overhead_cost: costs.overhead,
+                    total_cost: costs.total(),
+                    start_time: 0.0,
+                    rmeta_ready_time: costs.frontend,
+                    finish_time: costs.total(),
                     dependencies,
                 }
             })
             .collect();
-        all_targets.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap());
+        all_targets
+            .sort_by(|a, b| b.finish_time.partial_cmp(&a.finish_time).unwrap());
 
         return CriticalPathResult {
-            cost: total_cost,
+            critical_path_ms: total_cost,
+            critical_path_no_pipelining_ms: total_cost,
             path: Vec::new(),
             path_details: Vec::new(),
             all_targets,
             total_cost,
-            target_count: target_names.len(),
+            target_count: n,
             symbol_count,
         };
     };
 
-    // DP: dist[t] = cost to build target t and all its transitive dependencies.
-    let mut dist: Vec<f64> = target_costs.clone();
-    let mut predecessor: Vec<Option<NodeIndex>> =
-        vec![None; target_names.len()];
+    // DP with rmeta pipelining.
+    //
+    // For each target t:
+    //   start[t] = max(rmeta_ready[dep] for dep in dependencies)
+    //   rmeta_ready[t] = start[t] + frontend_cost[t]
+    //   finish[t] = start[t] + total_cost[t]
+    //
+    // The critical path is the chain of dependencies that determines the
+    // latest finish time. We track predecessors based on which dependency's
+    // rmeta_ready time determined each target's start time.
+    let mut start: Vec<f64> = vec![0.0; n];
+    let mut rmeta_ready: Vec<f64> = vec![0.0; n];
+    let mut finish: Vec<f64> = vec![0.0; n];
+    let mut predecessor: Vec<Option<NodeIndex>> = vec![None; n];
+
+    // Also compute non-pipelined timing for comparison.
+    let mut finish_no_pipeline: Vec<f64> = vec![0.0; n];
 
     for &node in &sorted {
-        let node_cost = target_costs[node.index()];
+        let idx = node.index();
+        let costs = target_costs[idx];
 
-        // Find max distance among dependencies (incoming edges).
-        let mut max_dep_dist = 0.0f64;
+        // Find max rmeta_ready among dependencies (pipelined scheduling).
+        let mut max_dep_rmeta = 0.0f64;
         let mut max_dep_node: Option<NodeIndex> = None;
 
+        // Also track max finish time for non-pipelined comparison.
+        let mut max_dep_finish = 0.0f64;
+
         for dep in graph.neighbors_directed(node, Direction::Incoming) {
-            if dist[dep.index()] > max_dep_dist {
-                max_dep_dist = dist[dep.index()];
+            let dep_idx = dep.index();
+            if rmeta_ready[dep_idx] > max_dep_rmeta {
+                max_dep_rmeta = rmeta_ready[dep_idx];
                 max_dep_node = Some(dep);
             }
+            max_dep_finish = max_dep_finish.max(finish[dep_idx]);
         }
 
-        dist[node.index()] = node_cost + max_dep_dist;
-        predecessor[node.index()] = max_dep_node;
+        start[idx] = max_dep_rmeta;
+        rmeta_ready[idx] = max_dep_rmeta + costs.frontend;
+        finish[idx] = max_dep_rmeta + costs.total();
+        predecessor[idx] = max_dep_node;
+
+        // Non-pipelined: wait for full completion of dependencies.
+        finish_no_pipeline[idx] = max_dep_finish + costs.total();
     }
 
-    // Find the target with maximum distance (end of critical path).
-    let (max_node, &max_cost) = dist
+    // Critical path ends at the target with latest finish time.
+    let (max_node, &critical_path_ms) = finish
         .iter()
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap();
+
+    let critical_path_no_pipelining_ms =
+        finish_no_pipeline.iter().fold(0.0f64, |a, &b| a.max(b));
 
     // Reconstruct the critical path by following predecessors from the end node.
     let mut path_nodes = Vec::new();
@@ -215,6 +407,30 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     }
     path_nodes.reverse();
 
+    // Helper to build TargetOnPath from index.
+    let build_target_on_path = |idx: usize| {
+        let node = NodeIndex::new(idx);
+        let name = target_names.get_index(idx).unwrap().clone();
+        let costs = target_costs[idx];
+
+        let dependencies: Vec<String> = graph
+            .neighbors_directed(node, Direction::Incoming)
+            .map(|dep| target_names.get_index(dep.index()).unwrap().clone())
+            .collect();
+
+        TargetOnPath {
+            name,
+            frontend_cost: costs.frontend,
+            backend_cost: costs.backend,
+            overhead_cost: costs.overhead,
+            total_cost: costs.total(),
+            start_time: start[idx],
+            rmeta_ready_time: rmeta_ready[idx],
+            finish_time: finish[idx],
+            dependencies,
+        }
+    };
+
     // Build path names and details.
     let path: Vec<String> = path_nodes
         .iter()
@@ -223,62 +439,46 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
 
     let path_details: Vec<TargetOnPath> = path_nodes
         .iter()
-        .map(|&node| {
-            let name = target_names.get_index(node.index()).unwrap().clone();
-            let cost = target_costs[node.index()];
-            let cumulative_cost = dist[node.index()];
-
-            let dependencies: Vec<String> = graph
-                .neighbors_directed(node, Direction::Incoming)
-                .map(|dep| target_names.get_index(dep.index()).unwrap().clone())
-                .collect();
-
-            TargetOnPath {
-                name,
-                cost,
-                cumulative_cost,
-                dependencies,
-            }
-        })
+        .map(|&node| build_target_on_path(node.index()))
         .collect();
 
-    // Build all_targets: every target with its cost, sorted by cost descending.
-    let mut all_targets: Vec<TargetOnPath> = target_names
-        .iter()
-        .enumerate()
-        .map(|(idx, name)| {
-            let node = NodeIndex::new(idx);
-            let cost = target_costs[idx];
-            let cumulative_cost = dist[idx];
-
-            let dependencies: Vec<String> = graph
-                .neighbors_directed(node, Direction::Incoming)
-                .map(|dep| target_names.get_index(dep.index()).unwrap().clone())
-                .collect();
-
-            TargetOnPath {
-                name: name.clone(),
-                cost,
-                cumulative_cost,
-                dependencies,
-            }
-        })
-        .collect();
-
-    all_targets.sort_by(|a, b| b.cost.partial_cmp(&a.cost).unwrap());
+    // Build all_targets, sorted by finish_time descending.
+    let mut all_targets: Vec<TargetOnPath> =
+        (0..n).map(build_target_on_path).collect();
+    all_targets
+        .sort_by(|a, b| b.finish_time.partial_cmp(&a.finish_time).unwrap());
 
     CriticalPathResult {
-        cost: max_cost,
+        critical_path_ms,
+        critical_path_no_pipelining_ms,
         path,
         path_details,
         all_targets,
         total_cost,
-        target_count: target_names.len(),
+        target_count: n,
         symbol_count,
     }
 }
 
+/// Reads a symbol graph, computes critical path, and writes a report.
+///
+/// This is the main entry point for the cost analysis phase. It mirrors the
+/// API of `tarjanize_condense::run` for consistency.
+pub fn run(mut input: impl Read, output: impl Write) -> std::io::Result<()> {
+    let mut json = String::new();
+    input.read_to_string(&mut json)?;
+
+    let symbol_graph: SymbolGraph = serde_json::from_str(&json)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+    let result = critical_path(&symbol_graph);
+    result.write_report(output)
+}
+
 /// Convenience function to compute critical path from JSON input.
+///
+/// Use [`run`] for the standard read-compute-write workflow. This function
+/// is useful when you need to inspect the result programmatically.
 pub fn critical_path_from_reader(
     mut input: impl Read,
 ) -> Result<CriticalPathResult, serde_json::Error> {
@@ -290,21 +490,40 @@ pub fn critical_path_from_reader(
     Ok(critical_path(&symbol_graph))
 }
 
+/// Cost breakdown for a single target.
+#[derive(Debug, Clone, Copy, Default)]
+struct TargetCosts {
+    frontend: f64,
+    backend: f64,
+    overhead: f64,
+}
+
+impl TargetCosts {
+    fn total(&self) -> f64 {
+        self.frontend + self.backend + self.overhead
+    }
+}
+
 /// Builds a target-level dependency graph.
 ///
 /// Returns (`target_names`, `target_costs`, `symbol_count`, graph) where:
 /// - `target_names`: `IndexSet` of target identifiers (`{package}/{target}`) for O(1) lookup
-/// - `target_costs`: `Vec` of target wall-clock costs indexed by target
+/// - `target_costs`: `Vec` of `TargetCosts` with frontend/backend/overhead breakdown
 /// - `symbol_count`: total number of symbols across all targets
 /// - `graph`: `DiGraph` where edges point from dependency targets to dependent
 ///   targets (edge B → A means target A depends on target B)
 fn build_target_graph(
     symbol_graph: &SymbolGraph,
-) -> (IndexSet<String>, Vec<f64>, usize, DiGraph<usize, ()>) {
+) -> (
+    IndexSet<String>,
+    Vec<TargetCosts>,
+    usize,
+    DiGraph<usize, ()>,
+) {
     // Build target name index. Each target gets a unique identifier: `{package}/{target}`.
     // Example: "my-package/lib", "my-package/test", "my-package/bin/cli".
     let mut target_names: IndexSet<String> = IndexSet::new();
-    let mut target_costs: HashMap<String, f64> = HashMap::new();
+    let mut target_costs_map: HashMap<String, TargetCosts> = HashMap::new();
     let mut symbol_count = 0;
 
     for (package_name, package) in &symbol_graph.packages {
@@ -316,20 +535,23 @@ fn build_target_graph(
             // Count symbols in this target.
             symbol_count += count_symbols_in_module(&crate_data.root);
 
-            // Compute wall-clock cost using the formula:
-            // cost = frontend_time + backend_time + overhead
-            let frontend_time = collect_frontend_cost(&crate_data.root);
-            let backend_time = max_module_backend_cost(&crate_data.root);
-            let overhead = crate_data.metadata_ms;
+            // Compute cost breakdown:
+            // - frontend: sum of all symbol frontend costs (serial)
+            // - backend: max module backend cost (parallel via CGUs)
+            // - overhead: metadata generation time
+            let costs = TargetCosts {
+                frontend: collect_frontend_cost(&crate_data.root),
+                backend: max_module_backend_cost(&crate_data.root),
+                overhead: crate_data.metadata_ms,
+            };
 
-            target_costs
-                .insert(target_id, frontend_time + backend_time + overhead);
+            target_costs_map.insert(target_id, costs);
         }
     }
 
-    let costs: Vec<f64> = target_names
+    let costs: Vec<TargetCosts> = target_names
         .iter()
-        .map(|name| target_costs.get(name).copied().unwrap_or(0.0))
+        .map(|name| target_costs_map.get(name).copied().unwrap_or_default())
         .collect();
 
     // Build target dependency graph.
@@ -571,7 +793,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // Frontend is summed: 10 + 20 = 30
-        assert!((result.cost - 30.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 30.0).abs() < f64::EPSILON);
         assert_eq!(result.path, vec![target_id("my-pkg", "lib")]);
         assert_eq!(result.target_count, 1);
         assert_eq!(result.symbol_count, 2);
@@ -602,7 +824,7 @@ mod tests {
         let graph = make_graph(crates);
         let result = critical_path(&graph);
 
-        assert!((result.cost - 170.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 170.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -661,7 +883,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // frontend = 15, backend = max(10, 100, 50) = 100
-        assert!((result.cost - 115.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 115.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -686,7 +908,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // frontend(10) + backend(0) + metadata(3) = 13
-        assert!((result.cost - 13.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 13.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -712,7 +934,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // Single target, so critical path = total cost = 30
-        assert!((result.cost - 30.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 30.0).abs() < f64::EPSILON);
         assert_eq!(result.path, vec![target_id("my-pkg", "lib")]);
         assert_eq!(result.target_count, 1);
         assert_eq!(result.symbol_count, 2);
@@ -747,7 +969,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // Critical path is max(100, 50) = 100
-        assert!((result.cost - 100.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 100.0).abs() < f64::EPSILON);
         // Total cost is 150 (sequential)
         assert!((result.total_cost - 150.0).abs() < f64::EPSILON);
         // Parallelism ratio = 150/100 = 1.5x
@@ -786,8 +1008,9 @@ mod tests {
         let graph = make_graph(crates);
         let result = critical_path(&graph);
 
+        // With frontend-only costs, pipelining doesn't help (no backend to overlap).
         // Critical path = pkg-b/lib + pkg-a/lib = 150
-        assert!((result.cost - 150.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![target_id("pkg-b", "lib"), target_id("pkg-a", "lib")]
@@ -800,7 +1023,7 @@ mod tests {
     fn test_diamond_targets() {
         // pkg-a/lib depends on pkg-b/lib (100) and pkg-c/lib (50)
         // pkg-b/lib and pkg-c/lib both depend on pkg-d/lib (30)
-        // Critical path: d(30) → b(100) → a(10) = 140
+        // With frontend-only costs, critical path: d(30) → b(100) → a(10) = 140
         let mut crates = HashMap::new();
 
         let mut symbols_a = HashMap::new();
@@ -859,7 +1082,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // Critical path = d(30) + b(100) + a(10) = 140
-        assert!((result.cost - 140.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 140.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![
@@ -879,7 +1102,7 @@ mod tests {
         };
         let result = critical_path(&graph);
 
-        assert!((result.cost).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms).abs() < f64::EPSILON);
         assert!(result.path.is_empty());
         assert_eq!(result.target_count, 0);
         assert_eq!(result.symbol_count, 0);
@@ -888,9 +1111,9 @@ mod tests {
     #[test]
     fn test_lib_and_test_targets() {
         // Test that lib and test targets are handled separately.
-        // pkg-a has both lib (100ms) and test (50ms) targets.
+        // pkg-a has both lib (100ms frontend) and test (50ms frontend) targets.
         // The test target depends on the lib target.
-        // Critical path: lib(100) → test(50) = 150
+        // With frontend-only costs: lib(100) → test(50) = 150
 
         let mut lib_symbols = HashMap::new();
         lib_symbols.insert("lib_fn".to_string(), make_symbol(100.0, &[]));
@@ -924,7 +1147,7 @@ mod tests {
         let result = critical_path(&graph);
 
         // Critical path: lib(100) → test(50) = 150
-        assert!((result.cost - 150.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![target_id("pkg-a", "lib"), target_id("pkg-a", "test")]
@@ -1025,8 +1248,9 @@ mod tests {
         // Should compute successfully (no cycle)
         assert!(!result.path.is_empty(), "path should not be empty");
 
+        // With frontend-only costs:
         // Critical path: pkg-a/lib(100) → pkg-b/lib(30) → pkg-a/test(50) = 180
-        assert!((result.cost - 180.0).abs() < f64::EPSILON);
+        assert!((result.critical_path_ms - 180.0).abs() < f64::EPSILON);
         assert_eq!(
             result.path,
             vec![
@@ -1039,6 +1263,84 @@ mod tests {
         // Total cost = 100 + 30 + 50 = 180
         assert!((result.total_cost - 180.0).abs() < f64::EPSILON);
         assert_eq!(result.target_count, 3);
+    }
+
+    #[test]
+    fn test_rmeta_pipelining_benefit() {
+        // This test demonstrates the benefit of rmeta pipelining.
+        //
+        // Setup:
+        // - pkg-a/lib: frontend=100, backend=50 (total=150)
+        // - pkg-b/lib: frontend=30, backend=0 (total=30), depends on pkg-a/lib
+        //
+        // Without pipelining (wait for full completion):
+        //   pkg-a finishes at 150, pkg-b starts at 150, finishes at 180
+        //   Critical path = 180
+        //
+        // With pipelining (wait for rmeta only):
+        //   pkg-a: rmeta ready at 100, finish at 150
+        //   pkg-b: starts at 100, finishes at 130
+        //   Critical path = max(150, 130) = 150
+        //
+        // The 30ms improvement comes from pkg-b running during pkg-a's backend.
+
+        let mut symbols_a = HashMap::new();
+        symbols_a.insert(
+            "a".to_string(),
+            make_symbol_split(100.0, 50.0, &[]), // frontend=100, backend=50
+        );
+
+        let mut symbols_b = HashMap::new();
+        symbols_b.insert(
+            "b".to_string(),
+            make_symbol(30.0, &[&dep("pkg-a", "lib", "a")]), // frontend=30, backend=0
+        );
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "pkg-a".to_string(),
+            make_crate(Module {
+                symbols: symbols_a,
+                submodules: HashMap::new(),
+            }),
+        );
+        crates.insert(
+            "pkg-b".to_string(),
+            make_crate(Module {
+                symbols: symbols_b,
+                submodules: HashMap::new(),
+            }),
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // With pipelining: critical path = 150 (pkg-a's total cost)
+        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
+
+        // Without pipelining: would be 180 (pkg-a 150 + pkg-b 30)
+        assert!(
+            (result.critical_path_no_pipelining_ms - 180.0).abs()
+                < f64::EPSILON
+        );
+
+        // Verify timing details for pkg-b.
+        let pkg_b = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-a/lib")
+            .unwrap();
+        assert!((pkg_b.start_time - 0.0).abs() < f64::EPSILON);
+        assert!((pkg_b.rmeta_ready_time - 100.0).abs() < f64::EPSILON);
+        assert!((pkg_b.finish_time - 150.0).abs() < f64::EPSILON);
+
+        let pkg_b = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-b/lib")
+            .unwrap();
+        assert!((pkg_b.start_time - 100.0).abs() < f64::EPSILON); // starts when pkg-a rmeta ready
+        assert!((pkg_b.finish_time - 130.0).abs() < f64::EPSILON);
     }
 
     #[test]

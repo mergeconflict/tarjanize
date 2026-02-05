@@ -68,7 +68,7 @@ use crate::scc::condense_and_partition;
 /// ```
 pub fn run(
     mut input: impl Read,
-    output: &mut dyn Write,
+    mut output: impl Write,
 ) -> Result<(), CondenseError> {
     let _span = debug_span!("run").entered();
 
@@ -84,7 +84,7 @@ pub fn run(
     let optimized = condense_and_partition(&symbol_graph);
 
     // Step 3: Write output JSON.
-    serde_json::to_writer_pretty(&mut *output, &optimized)
+    serde_json::to_writer_pretty(&mut output, &optimized)
         .map_err(|e| CondenseError::new(CondenseErrorKind::Serialization(e)))?;
     writeln!(output)?;
 

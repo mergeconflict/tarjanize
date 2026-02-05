@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -33,6 +33,40 @@ struct Cli {
     command: Commands,
 }
 
+/// Common I/O arguments for commands that read/write files or stdio.
+#[derive(Parser)]
+struct IoArgs {
+    /// Input file (reads from stdin if not specified)
+    #[arg(short, long)]
+    input: Option<String>,
+
+    /// Output file (writes to stdout if not specified)
+    #[arg(short, long)]
+    output: Option<String>,
+}
+
+impl IoArgs {
+    /// Sets up stdio/file I/O and calls the provided function.
+    fn run<F>(self, f: F) -> Result<()>
+    where
+        F: FnOnce(Box<dyn Read>, Box<dyn Write>) -> Result<()>,
+    {
+        let stdin = std::io::stdin();
+        let reader: Box<dyn Read> = match self.input {
+            Some(path) => Box::new(BufReader::new(File::open(path)?)),
+            None => Box::new(stdin.lock()),
+        };
+
+        let stdout = std::io::stdout();
+        let writer: Box<dyn Write> = match self.output {
+            Some(path) => Box::new(BufWriter::new(File::create(path)?)),
+            None => Box::new(stdout.lock()),
+        };
+
+        f(reader, writer)
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Condense symbol graph into DAG of SCCs
@@ -40,12 +74,8 @@ enum Commands {
     /// Computes strongly connected components from the symbol graph and produces
     /// a condensed graph where cycles become single nodes.
     Condense {
-        /// Input `symbol_graph.json` file (reads from stdin if not specified)
-        input: Option<String>,
-
-        /// Output file path (writes to stdout if not specified)
-        #[arg(short, long)]
-        output: Option<String>,
+        #[command(flatten)]
+        io: IoArgs,
     },
 
     /// Compute build costs and critical path of a symbol graph
@@ -54,33 +84,9 @@ enum Commands {
     /// the dependency graph), which represents minimum build time with infinite
     /// parallelism.
     Cost {
-        /// Input `symbol_graph.json` file (reads from stdin if not specified)
-        input: Option<String>,
+        #[command(flatten)]
+        io: IoArgs,
     },
-}
-
-/// Prints a single target's details in table format.
-fn print_target_detail(target_detail: &tarjanize_cost::TargetOnPath) {
-    // Format dependencies: show first few, then count if many.
-    let deps_str = if target_detail.dependencies.is_empty() {
-        "(none)".to_string()
-    } else if target_detail.dependencies.len() <= 3 {
-        target_detail.dependencies.join(", ")
-    } else {
-        format!(
-            "{}, ... (+{} more)",
-            target_detail.dependencies[..3].join(", "),
-            target_detail.dependencies.len() - 3
-        )
-    };
-
-    println!(
-        "{:>12.2}  {:>12.2}  {:<40}  {}",
-        target_detail.cost,
-        target_detail.cumulative_cost,
-        target_detail.name,
-        deps_str
-    );
 }
 
 fn main() -> Result<()> {
@@ -98,75 +104,7 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Condense { input, output } => {
-            // Set up input reader.
-            let stdin = std::io::stdin();
-            let reader: Box<dyn std::io::Read> = match input {
-                Some(path) => Box::new(BufReader::new(File::open(path)?)),
-                None => Box::new(stdin.lock()),
-            };
-
-            // Set up output writer.
-            let stdout = std::io::stdout();
-            let mut writer: Box<dyn Write> = match output {
-                Some(path) => Box::new(BufWriter::new(File::create(path)?)),
-                None => Box::new(stdout.lock()),
-            };
-
-            tarjanize_condense::run(reader, &mut *writer)?;
-            Ok(())
-        }
-
-        Commands::Cost { input } => {
-            let stdin = std::io::stdin();
-            let reader: Box<dyn std::io::Read> = match input {
-                Some(path) => Box::new(BufReader::new(File::open(path)?)),
-                None => Box::new(stdin.lock()),
-            };
-
-            let result = tarjanize_cost::critical_path_from_reader(reader)?;
-
-            println!("Critical path cost: {:.2} ms", result.cost);
-            println!("Total cost:         {:.2} ms", result.total_cost);
-            println!("Target count:       {}", result.target_count);
-            println!("Symbol count:       {}", result.symbol_count);
-            println!(
-                "Parallelism ratio:  {:.2}x",
-                result.total_cost / result.cost
-            );
-
-            if !result.path_details.is_empty() {
-                println!("\nCritical path ({} targets):\n", result.path.len());
-
-                println!(
-                    "{:>12}  {:>12}  {:<40}  Dependencies",
-                    "Cost (ms)", "Cumulative", "Target"
-                );
-                println!("{}", "-".repeat(100));
-
-                for target_detail in &result.path_details {
-                    print_target_detail(target_detail);
-                }
-            }
-
-            if !result.all_targets.is_empty() {
-                println!(
-                    "\nAll targets by cost ({} targets):\n",
-                    result.all_targets.len()
-                );
-
-                println!(
-                    "{:>12}  {:>12}  {:<40}  Dependencies",
-                    "Cost (ms)", "Cumulative", "Target"
-                );
-                println!("{}", "-".repeat(100));
-
-                for target_detail in &result.all_targets {
-                    print_target_detail(target_detail);
-                }
-            }
-
-            Ok(())
-        }
+        Commands::Condense { io } => io.run(|r, w| Ok(tarjanize_condense::run(r, w)?)),
+        Commands::Cost { io } => io.run(|r, w| Ok(tarjanize_cost::run(r, w)?)),
     }
 }
