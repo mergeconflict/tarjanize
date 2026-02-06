@@ -728,12 +728,10 @@ fn test_cost_from_profile() {
     let (_, symbol) = find_symbol(&graph, "profiled_fn").expect("should exist");
     // Cost should be positive (from profile data).
     // We check frontend cost since that's what gets populated for most symbols.
-    let total_cost = symbol.frontend_cost_ms + symbol.backend_cost_ms;
     assert!(
-        total_cost >= 0.0,
-        "Cost should be non-negative: frontend={}, backend={}",
-        symbol.frontend_cost_ms,
-        symbol.backend_cost_ms
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        "Cost should be non-negative: event_times_sum={}",
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
     );
 }
 
@@ -742,12 +740,10 @@ fn test_cost_impl_profile_match() {
     let graph = extract_fixture("cost_impl_profile_match");
     // Impl block should have cost from profile.
     let (_, symbol) = find_symbol(&graph, "{{impl}}").expect("should exist");
-    let total_cost = symbol.frontend_cost_ms + symbol.backend_cost_ms;
     assert!(
-        total_cost >= 0.0,
-        "Impl cost should be non-negative: frontend={}, backend={}",
-        symbol.frontend_cost_ms,
-        symbol.backend_cost_ms
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        "Impl cost should be non-negative: event_times_sum={}",
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
     );
 }
 
@@ -869,9 +865,11 @@ fn test_cost_empty_function() {
     let graph = extract_fixture("cost_empty_function");
     // Empty functions still have cost (from type checking, etc.).
     let (_, symbol) = find_symbol(&graph, "empty_fn").expect("should exist");
-    // We just verify the symbol exists and has non-negative costs.
-    let total_cost = symbol.frontend_cost_ms + symbol.backend_cost_ms;
-    assert!(total_cost >= 0.0, "Empty fn should have non-negative cost");
+    // We just verify the symbol exists and has non-negative cost.
+    assert!(
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        "Empty fn should have non-negative cost"
+    );
 }
 
 // =============================================================================
@@ -886,12 +884,10 @@ fn test_cost_sum_nested() {
     // Parent function should exist and have positive cost that includes nested fn.
     let (_, symbol) =
         find_symbol(&graph, "outer_with_nested").expect("should exist");
-    let total_cost = symbol.frontend_cost_ms + symbol.backend_cost_ms;
     assert!(
-        total_cost >= 0.0,
-        "Outer fn should have non-negative cost including nested: frontend={}, backend={}",
-        symbol.frontend_cost_ms,
-        symbol.backend_cost_ms
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        "Outer fn should have non-negative cost including nested: event_times_sum={}",
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
     );
     // Nested function should NOT appear as separate symbol.
     assert_no_symbol(&graph, "nested_helper");
@@ -903,12 +899,10 @@ fn test_cost_sum_closures() {
     // Parent function should exist and have positive cost that includes closures.
     let (_, symbol) =
         find_symbol(&graph, "outer_with_closures").expect("should exist");
-    let total_cost = symbol.frontend_cost_ms + symbol.backend_cost_ms;
     assert!(
-        total_cost >= 0.0,
-        "Outer fn should have non-negative cost including closures: frontend={}, backend={}",
-        symbol.frontend_cost_ms,
-        symbol.backend_cost_ms
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        "Outer fn should have non-negative cost including closures: event_times_sum={}",
+        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
     );
     // Closures should NOT appear as separate symbols.
     assert_no_symbol(&graph, "{{closure}}");

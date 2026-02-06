@@ -1,5 +1,7 @@
 # Rustc Compilation Cost Analysis
 
+> **Current status**: This document describes how rustc compilation works internally and remains a useful reference on rustc's frontend/backend phases, CGUs, self-profile data, and mono items. However, **tarjanize no longer tracks backend costs**. Validation showed that backend cost modeling (CGU→symbol attribution via mono items) is unreliable and irrelevant for crate splitting — frontend time is serial, determines rmeta readiness, and gates downstream crates, while backend time runs in parallel via CGUs and doesn't meaningfully affect the critical path. The current cost model uses only `frontend_wall_ms` per target. The "Schema Design for Cost Storage" and "Cost Modeling" sections below reflect the original design; see the plan file for what was actually removed.
+
 This document describes how rustc compiles code, what profiling data is available, and how to store and use that data for accurate build time prediction.
 
 ## Problem Statement

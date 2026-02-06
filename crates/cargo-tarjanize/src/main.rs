@@ -29,7 +29,6 @@ extern crate rustc_span;
 
 mod driver;
 mod extract;
-mod mono_items;
 mod orchestrator;
 mod profile;
 

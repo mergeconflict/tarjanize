@@ -9,9 +9,9 @@
 //! version. The extraction happens in the `after_analysis` callback, which
 //! gives us access to the fully type-checked HIR and THIR.
 //!
-//! After rustc completes (including codegen), the driver processes profile
-//! data and mono-items to compute costs, assembles a complete `Crate`, and
-//! deletes the raw profile files to avoid disk space exhaustion.
+//! After rustc completes, the driver processes profile data to compute
+//! per-event timing breakdowns, assembles a complete `Crate`, and deletes
+//! the raw profile files to avoid disk space exhaustion.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -22,11 +22,10 @@ use std::{env, fs};
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_interface::interface::Compiler;
 use rustc_middle::ty::TyCtxt;
-use tarjanize_schemas::{Crate, Module, SymbolKind};
+use tarjanize_schemas::{Crate, Module};
 use tracing::{debug, info, trace, warn};
 
 use crate::extract;
-use crate::mono_items::MonoItemsMap;
 use crate::orchestrator::{
     ENV_OUTPUT_DIR, ENV_PROFILE_DIR, ENV_SKIP_PROFILE, ENV_WORKSPACE_CRATES,
     ENV_WORKSPACE_PATHS,
@@ -150,36 +149,9 @@ pub fn run(args: &[String]) -> ExitCode {
         fs::create_dir_all(&dir)
             .expect("failed to create profile subdirectory");
         compiler_args.push(format!("-Zself-profile={}", dir.display()));
-        compiler_args
-            .push("-Zself-profile-events=default,llvm,args".to_string());
+        compiler_args.push("-Zself-profile-events=default,args".to_string());
         Some(dir)
     };
-
-    // Print mono-items for backend cost distribution.
-    // This tells us which symbols are codegen'd into which CGU.
-    // We redirect stdout to a file because cargo swallows rustc's stdout.
-    compiler_args.push("-Zprint-mono-items=yes".to_string());
-
-    // Capture mono-items output by redirecting stdout to a file.
-    // Rustc's `-Zprint-mono-items` outputs to stdout, which cargo swallows.
-    // We redirect to a file that the orchestrator reads later.
-    // Use append mode since multiple targets (lib, bin, test) may compile.
-    // Use package_name so all targets for a package share the same file.
-    let mono_items_path = callbacks
-        .config
-        .output_dir
-        .join(format!("{}_mono_items.txt", callbacks.package_name));
-
-    // Redirect stdout to the mono-items file during compilation.
-    // The gag crate provides safe file descriptor redirection.
-    // When `_redirect` is dropped, stdout is automatically restored.
-    let mono_file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&mono_items_path)
-        .expect("failed to open mono-items file");
-    let _redirect =
-        gag::Redirect::stdout(mono_file).expect("failed to redirect stdout");
 
     let exit_code = run_via_rustc_driver(&compiler_args, &mut callbacks);
 
@@ -470,8 +442,7 @@ impl Callbacks for TarjanizeCallbacks {
     /// Called after type checking is complete.
     ///
     /// Extracts symbols and stores them for post-compilation processing.
-    /// We can't apply costs here because codegen hasn't happened yet -
-    /// profile data for backend costs isn't available until after codegen.
+    /// Profile data is applied after rustc completes.
     fn after_analysis(
         &mut self,
         _compiler: &Compiler,
@@ -549,11 +520,13 @@ fn write_crate_without_costs(
     );
 }
 
-/// Process profile data, apply costs to the module, and write the final Crate.
+/// Process profile data, apply per-event timing breakdowns to the module, and
+/// write the final Crate.
 ///
-/// This runs after rustc completes (including codegen) so we have access to:
-/// - Mono-items output (which symbols are in which CGU)
-/// - Self-profile data (timing for frontend, backend, and overhead)
+/// This runs after rustc completes so we have access to self-profile data
+/// for per-event timing attribution. Backend cost tracking was removed because
+/// it's unreliable and irrelevant for crate splitting (backend is parallel via
+/// CGUs and doesn't meaningfully affect the critical path).
 ///
 /// After writing the Crate JSON, deletes the profile directory for this target
 /// to avoid accumulating huge amounts of temp data on large workspaces.
@@ -579,32 +552,6 @@ fn process_and_write_crate(
     )
     .entered();
 
-    // Load mono-items for backend cost distribution.
-    // Uses package_name because mono-items are written per-package.
-    let mono_items_path = config
-        .output_dir
-        .join(format!("{package_name}_mono_items.txt"));
-    let mono_items = if mono_items_path.exists() {
-        match fs::read_to_string(&mono_items_path) {
-            Ok(content) => {
-                let map = MonoItemsMap::parse(content.as_bytes(), package_name);
-                debug!(
-                    package_name,
-                    cgu_count = map.cgu_to_items.len(),
-                    "loaded mono-items"
-                );
-                Some(map)
-            }
-            Err(e) => {
-                warn!(package_name, error = %e, "failed to read mono-items");
-                None
-            }
-        }
-    } else {
-        debug!(package_name, "no mono-items file");
-        None
-    };
-
     // Load profile data from this target's dedicated profile directory.
     let profile_data = {
         let _span = tracing::info_span!(
@@ -617,30 +564,22 @@ fn process_and_write_crate(
         ProfileData::load_from_dir(profile_dir)
     };
 
-    // Distribute backend costs from CGU timing to individual symbols.
-    let backend_costs = if let Some(ref mono) = mono_items {
-        distribute_backend_costs(&profile_data, mono)
-    } else {
-        HashMap::new()
-    };
-
-    // Apply costs to the module.
+    // Apply per-event timing breakdowns to the module's symbols.
     // Use crate_name for profile lookups since profile data is keyed by rustc
     // crate name (e.g., "sync_mpsc"), not cargo package name (e.g., "tokio").
-    apply_frontend_costs(&mut module, crate_name, &profile_data);
-    apply_backend_costs(&mut module, crate_name, &backend_costs);
+    apply_event_times(&mut module, crate_name, &profile_data);
 
-    // Get crate overhead.
-    // Also uses crate_name since profile overhead is keyed by rustc crate name.
-    let overhead = profile_data
-        .get_crate_overhead(crate_name)
+    // Get target timings (wall-clock time and unattributed event times).
+    // Also uses crate_name since profile data is keyed by rustc crate name.
+    let timings = profile_data
+        .get_target_timings(crate_name)
         .cloned()
         .unwrap_or_default();
 
-    // Build the complete Crate.
+    // Build the complete Target.
     // Dependencies are populated later by the orchestrator from cargo metadata.
     let crate_data = Crate {
-        metadata_ms: overhead.metadata_ms,
+        timings,
         root: module,
         ..Default::default()
     };
@@ -664,7 +603,6 @@ fn process_and_write_crate(
     debug!(
         path = %output_path.display(),
         bytes = json.len(),
-        backend_symbols = backend_costs.len(),
         "wrote crate with costs"
     );
 
@@ -681,91 +619,26 @@ fn process_and_write_crate(
     }
 }
 
-/// Distribute backend costs from CGU timing to individual symbols.
+/// Apply per-event timing breakdowns from profile data to symbols.
 ///
-/// For each CGU, we have:
-/// - Total CGU cost from profile data
-/// - List of symbols in that CGU from mono-items
-///
-/// We distribute the CGU cost equally among its symbols.
-fn distribute_backend_costs(
-    profile_data: &ProfileData,
-    mono_items: &MonoItemsMap,
-) -> HashMap<String, f64> {
-    let mut costs: HashMap<String, f64> = HashMap::new();
-
-    let cgu_costs = profile_data.cgu_costs();
-
-    for (cgu_name, items) in &mono_items.cgu_to_items {
-        let Some(cgu_duration) = cgu_costs.get(cgu_name) else {
-            debug!(cgu_name, "CGU not found in profile data");
-            continue;
-        };
-
-        if items.is_empty() {
-            continue;
-        }
-
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "CGU item counts are small, precision loss is negligible"
-        )]
-        let cost_per_item = cgu_duration.as_millis_f64() / items.len() as f64;
-
-        for item in items {
-            *costs.entry(item.clone()).or_default() += cost_per_item;
-        }
-    }
-
-    costs
-}
-
-/// Apply frontend costs from profile data to symbols.
-fn apply_frontend_costs(
+/// For each symbol, looks up its event-level self-time map from the profile
+/// data and stores it in `symbol.event_times_ms`. Symbols without profile
+/// data keep an empty map.
+fn apply_event_times(
     module: &mut Module,
     path_prefix: &str,
     profile_data: &ProfileData,
 ) {
     for (name, symbol) in &mut module.symbols {
         let full_path = format!("{path_prefix}::{name}");
-        let cost = profile_data.get_frontend_cost_ms(&full_path).unwrap_or(0.0);
-        symbol.frontend_cost_ms = cost;
-    }
-
-    for (submod_name, submodule) in &mut module.submodules {
-        let submod_path = format!("{path_prefix}::{submod_name}");
-        apply_frontend_costs(submodule, &submod_path, profile_data);
-    }
-}
-
-/// Apply backend costs from CGU distribution to symbols.
-fn apply_backend_costs(
-    module: &mut Module,
-    path_prefix: &str,
-    backend_costs: &HashMap<String, f64>,
-) {
-    for (name, symbol) in &mut module.symbols {
-        let full_path = format!("{path_prefix}::{name}");
-        let mut cost = backend_costs.get(&full_path).copied().unwrap_or(0.0);
-
-        // For impl blocks, sum all costs from paths starting with any anchor.
-        if let SymbolKind::Impl { anchors, .. } = &symbol.kind {
-            for anchor in anchors {
-                let prefix = format!("{anchor}::");
-                for (path, &path_cost) in backend_costs {
-                    if path.starts_with(&prefix) {
-                        cost += path_cost;
-                    }
-                }
-            }
+        if let Some(event_map) = profile_data.get_event_times_ms(&full_path) {
+            symbol.event_times_ms = event_map;
         }
-
-        symbol.backend_cost_ms = cost;
     }
 
     for (submod_name, submodule) in &mut module.submodules {
         let submod_path = format!("{path_prefix}::{submod_name}");
-        apply_backend_costs(submodule, &submod_path, backend_costs);
+        apply_event_times(submodule, &submod_path, profile_data);
     }
 }
 

@@ -12,8 +12,10 @@ use indexmap::IndexSet;
 use petgraph::algo::condensation;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::unionfind::UnionFind;
+use tarjanize_cost::{TwoVarFit, two_var_fit};
 use tarjanize_schemas::{
-    Crate, Module, Package, Symbol, SymbolGraph, SymbolKind,
+    Crate, Module, Package, Symbol, SymbolGraph, SymbolKind, TargetTimings,
+    sum_event_times,
 };
 use tracing::debug;
 
@@ -89,6 +91,10 @@ struct SymbolIndex<'a> {
     paths: IndexSet<String>,
     /// Original crate name for each symbol.
     original_crates: Vec<String>,
+    /// Original target key (e.g., `"pkg/lib"`) for each symbol.
+    /// Used to look up target-level metadata (e.g., `metadata_decode_*` costs)
+    /// from the original graph when predicting synthetic target wall times.
+    original_targets: Vec<String>,
 }
 
 impl<'a> SymbolIndex<'a> {
@@ -106,7 +112,13 @@ impl<'a> SymbolIndex<'a> {
                 // Paths use [package/target]::module::symbol format.
                 // This matches the format used by the orchestrator for dependencies.
                 let crate_prefix = format!("[{package_name}/{target_key}]");
-                index.add_module(package_name, &crate_prefix, &crate_data.root);
+                let target_id = format!("{package_name}/{target_key}");
+                index.add_module(
+                    package_name,
+                    &target_id,
+                    &crate_prefix,
+                    &crate_data.root,
+                );
             }
         }
         index
@@ -116,6 +128,7 @@ impl<'a> SymbolIndex<'a> {
     fn add_module(
         &mut self,
         crate_name: &str,
+        target_id: &str,
         module_path: &str,
         module: &'a Module,
     ) {
@@ -124,11 +137,12 @@ impl<'a> SymbolIndex<'a> {
             self.paths.insert(path);
             self.symbols.push(symbol);
             self.original_crates.push(crate_name.to_string());
+            self.original_targets.push(target_id.to_string());
         }
 
         for (submodule_name, submodule) in &module.submodules {
             let submodule_path = format!("{module_path}::{submodule_name}");
-            self.add_module(crate_name, &submodule_path, submodule);
+            self.add_module(crate_name, target_id, &submodule_path, submodule);
         }
     }
 
@@ -150,6 +164,11 @@ impl<'a> SymbolIndex<'a> {
     /// Returns the original crate name for a symbol.
     fn get_original_crate(&self, index: usize) -> &str {
         &self.original_crates[index]
+    }
+
+    /// Returns the original target key (e.g., `"pkg/lib"`) for a symbol.
+    fn get_original_target(&self, index: usize) -> &str {
+        &self.original_targets[index]
     }
 
     /// Returns the number of symbols in the index.
@@ -476,31 +495,15 @@ pub(crate) fn condense_and_partition(
     build_output_graph(&index, set_to_symbols, symbol_graph)
 }
 
-/// Coefficient for estimating metadata time from frontend cost.
-///
-/// For synthetic crates (from SCC merging), metadata is estimated as:
-/// `metadata_ms = METADATA_SLOPE * frontend_ms + METADATA_INTERCEPT`
-///
-/// TODO: Validate power law model `metadata = k * frontend^0.33` across
-/// multiple codebases before switching to that formula.
-const METADATA_SLOPE: f64 = 0.26;
-
-/// Fixed per-crate overhead for metadata generation in milliseconds.
-/// TODO: Remove once power law model is validated.
-const METADATA_INTERCEPT: f64 = 1662.0;
-
 /// Builds the output `SymbolGraph` from grouped symbols.
 ///
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
-///
-/// Crate-level overhead (`metadata_ms`) is estimated from total frontend cost
-/// using a linear model (R² = 0.705). See `docs/cost-model-validation.md`.
 fn build_output_graph(
     index: &SymbolIndex<'_>,
     set_to_symbols: HashMap<u32, Vec<usize>>,
-    _original_graph: &SymbolGraph,
+    original_graph: &SymbolGraph,
 ) -> SymbolGraph {
     // Sort sets by ID for deterministic output.
     let mut sets: Vec<_> = set_to_symbols.into_iter().collect();
@@ -509,8 +512,8 @@ fn build_output_graph(
     // Track used crate names to avoid collisions.
     let mut used_names: HashSet<String> = HashSet::new();
 
-    // Compute crate names and overhead for each set.
-    let mut set_crate_data: Vec<(u32, String, Vec<usize>, f64)> = Vec::new();
+    // Compute crate names for each set.
+    let mut set_crate_data: Vec<(u32, String, Vec<usize>)> = Vec::new();
     for (set_id, symbol_indices) in sets {
         // Collect unique original crates contributing to this set.
         let original_crates_set: HashSet<&str> = symbol_indices
@@ -521,15 +524,6 @@ fn build_output_graph(
             original_crates_set.iter().copied().collect();
         original_crates.sort_unstable();
 
-        // Estimate metadata time from total frontend cost of symbols in this crate.
-        // Frontend cost is the best single predictor of metadata time (R² = 0.705).
-        let total_frontend_ms: f64 = symbol_indices
-            .iter()
-            .map(|&i| index.get_symbol(i).frontend_cost_ms)
-            .sum();
-        let metadata_ms =
-            METADATA_SLOPE * total_frontend_ms + METADATA_INTERCEPT;
-
         let base_name = original_crates.join("-");
         let crate_name = if used_names.contains(&base_name) {
             format!("{base_name}-{set_id}")
@@ -537,26 +531,95 @@ fn build_output_graph(
             base_name
         };
         used_names.insert(crate_name.clone());
-        set_crate_data.push((set_id, crate_name, symbol_indices, metadata_ms));
+        set_crate_data.push((set_id, crate_name, symbol_indices));
     }
 
     // Pass 1: Compute old path → new path mapping.
     let set_crate_names: Vec<_> = set_crate_data
         .iter()
-        .map(|(id, name, indices, _)| (*id, name.clone(), indices.clone()))
+        .map(|(id, name, indices)| (*id, name.clone(), indices.clone()))
         .collect();
     let path_mapping = compute_path_mapping(index, &set_crate_names);
+
+    // Fit the two-variable regression model on original targets so we can
+    // predict wall times for synthetic targets. The model is:
+    //   wall_time = a · Σ(symbol_attr) + b · Σ(metadata_decode_*)
+    //
+    // Pre-compute per-target metadata decode sums from the original graph.
+    let target_meta: HashMap<String, f64> = original_graph
+        .packages
+        .iter()
+        .flat_map(|(pkg, p)| {
+            p.targets.iter().map(move |(tgt, crate_data)| {
+                let target_id = format!("{pkg}/{tgt}");
+                let meta: f64 = crate_data
+                    .timings
+                    .event_times_ms
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("metadata_decode_"))
+                    .map(|(_, v)| v)
+                    .sum();
+                (target_id, meta)
+            })
+        })
+        .collect();
+
+    // Build regression data from targets that have wall-clock profiling data.
+    let mut regression_data: Vec<(f64, f64, f64)> = Vec::new();
+    for (pkg, p) in &original_graph.packages {
+        for (tgt, crate_data) in &p.targets {
+            let wall = crate_data.timings.wall_time_ms;
+            if wall <= 0.0 {
+                continue;
+            }
+            let target_id = format!("{pkg}/{tgt}");
+            let attr = collect_symbol_attr(&crate_data.root);
+            let meta = target_meta.get(&target_id).copied().unwrap_or(0.0);
+            regression_data.push((attr, meta, wall));
+        }
+    }
+
+    let model = two_var_fit(&regression_data);
 
     // Pass 2: Build output graph using the mapping.
     // Each partition becomes a separate package. The target type is determined
     // from the original target type of the symbols (they all share the same type
     // since symbols from different target types can't form cycles).
     let mut packages = HashMap::new();
-    for (_set_id, crate_name, symbol_indices, metadata_ms) in set_crate_data {
+    for (_set_id, crate_name, symbol_indices) in set_crate_data {
         let root_module =
             build_module_tree(index, &symbol_indices, &path_mapping);
+
+        // Sum per-symbol attributed event times for the synthetic target.
+        let attr: f64 = symbol_indices
+            .iter()
+            .map(|&i| sum_event_times(&index.get_symbol(i).event_times_ms))
+            .sum();
+
+        // Max metadata decode cost from constituent original targets.
+        // A synthetic target inherits the dependencies of all its
+        // constituents, so its metadata cost is at least as large as the
+        // largest constituent.
+        let constituent_targets: HashSet<&str> = symbol_indices
+            .iter()
+            .map(|&i| index.get_original_target(i))
+            .collect();
+        let meta: f64 = constituent_targets
+            .iter()
+            .filter_map(|t| target_meta.get(*t))
+            .copied()
+            .fold(0.0_f64, f64::max);
+
+        // Apply the fitted model to predict wall time. If the model
+        // couldn't be fitted (insufficient profiling data), fall back
+        // to the raw symbol attribution sum.
+        let wall_time_ms = predict_wall_time(model.as_ref(), attr, meta);
+
         let crate_data = Crate {
-            metadata_ms,
+            timings: TargetTimings {
+                wall_time_ms,
+                ..Default::default()
+            },
             root: root_module,
             // Dependencies for synthetic crates would need to be computed
             // from symbol dependencies if needed for downstream analysis.
@@ -569,6 +632,32 @@ fn build_output_graph(
     }
 
     SymbolGraph { packages }
+}
+
+/// Recursively sums all per-symbol `event_times_ms` values in a module tree.
+///
+/// This is the total attributed self-time for a target — the first predictor
+/// in the two-variable regression model.
+fn collect_symbol_attr(module: &Module) -> f64 {
+    let mut total = 0.0;
+    for symbol in module.symbols.values() {
+        total += sum_event_times(&symbol.event_times_ms);
+    }
+    for submodule in module.submodules.values() {
+        total += collect_symbol_attr(submodule);
+    }
+    total
+}
+
+/// Predicts wall time using the fitted two-variable model.
+///
+/// Falls back to the raw symbol attribution sum when no model is available
+/// (e.g., insufficient profiling data for regression).
+fn predict_wall_time(model: Option<&TwoVarFit>, attr: f64, meta: f64) -> f64 {
+    match model {
+        Some(fit) => fit.a * attr + fit.b * meta,
+        None => attr,
+    }
 }
 
 /// Computes a mapping from old symbol paths to new symbol paths.
@@ -779,8 +868,7 @@ fn rewrite_symbol(
 
     Symbol {
         file: symbol.file.clone(),
-        frontend_cost_ms: symbol.frontend_cost_ms,
-        backend_cost_ms: symbol.backend_cost_ms,
+        event_times_ms: symbol.event_times_ms.clone(),
         dependencies: new_dependencies,
         kind: new_kind,
     }
@@ -823,8 +911,7 @@ mod tests {
     fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
             dependencies: deps.iter().map(|&s| s.to_string()).collect(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -1162,13 +1249,13 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "metadata_ms": 0,
+                            "timings": {},
                             "root": {
                                 "symbols": {
-                                    "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::D"] },
-                                    "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
-                                    "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
-                                    "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } }
+                                    "A": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::D"] },
+                                    "B": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
+                                    "D": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" } }
                                 }
                             }
                         }
@@ -1249,14 +1336,14 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "metadata_ms": 0,
+                            "timings": {},
                             "root": {
                                 "symbols": {
-                                    "A": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::E"] },
-                                    "B": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
-                                    "C": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
-                                    "D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" } },
-                                    "E": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] }
+                                    "A": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::E"] },
+                                    "B": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] },
+                                    "D": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" } },
+                                    "E": { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::D"] }
                                 }
                             }
                         }
@@ -1314,14 +1401,14 @@ mod tests {
                 "c": {
                     "targets": {
                         "lib": {
-                            "metadata_ms": 0,
+                            "timings": {},
                             "root": {
                                 "symbols": {
-                                    "A":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::impl_D"] },
-                                    "B":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
-                                    "C":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" }, "dependencies": ["[c/lib]::D"] },
-                                    "D":      { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "module_def": { "kind": "Struct" } },
-                                    "impl_D": { "file": "", "frontend_cost_ms": 1, "backend_cost_ms": 0, "impl": { "name": "impl D", "anchors": ["[c/lib]::D"] }, "dependencies": ["[c/lib]::D"] }
+                                    "A":      { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C", "[c/lib]::impl_D"] },
+                                    "B":      { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Function" }, "dependencies": ["[c/lib]::C"] },
+                                    "C":      { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Struct" }, "dependencies": ["[c/lib]::D"] },
+                                    "D":      { "file": "", "event_times_ms": {"typeck": 1.0}, "module_def": { "kind": "Struct" } },
+                                    "impl_D": { "file": "", "event_times_ms": {"typeck": 1.0}, "impl": { "name": "impl D", "anchors": ["[c/lib]::D"] }, "dependencies": ["[c/lib]::D"] }
                                 }
                             }
                         }
@@ -1360,20 +1447,24 @@ mod tests {
     }
 
     #[test]
-    fn test_metadata_estimated_from_frontend_cost() {
-        // Test that metadata is estimated from frontend cost using the formula:
-        // metadata_ms = 0.26 * frontend_ms + 1662
+    fn test_synthetic_wall_times_from_per_symbol_costs() {
+        // Verify that merged crates get synthetic wall-clock times computed
+        // from per-symbol costs:
+        //   wall_time_ms = sum of all symbol event_times_ms
         //
-        // Two independent symbols with different frontend costs become separate
-        // crates, each with metadata estimated from its frontend cost.
+        // Chain: a → b (single dependent, merges into one crate).
+        // a: event_times_ms total=100
+        // b: event_times_ms total=200
+        //
+        // Expected merged crate:
+        //   wall_time_ms = 100 + 200 = 300
         let mut symbols = HashMap::new();
         symbols.insert(
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                frontend_cost_ms: 1000.0, // Expected: 0.26 * 1000 + 1662 = 1922
-                backend_cost_ms: 0.0,
-                dependencies: HashSet::new(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 100.0)]),
+                dependencies: [path("my_crate", "b")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
                     visibility: Visibility::Public,
@@ -1384,8 +1475,7 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                frontend_cost_ms: 5000.0, // Expected: 0.26 * 5000 + 1662 = 2962
-                backend_cost_ms: 0.0,
+                event_times_ms: HashMap::from([("typeck".to_string(), 200.0)]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1409,35 +1499,259 @@ mod tests {
         let symbol_graph = make_graph(crates);
         let result = condense_and_partition(&symbol_graph);
 
-        // Two independent symbols → two crates.
-        assert_eq!(result.packages.len(), 2);
+        // Chain merges into one crate.
+        assert_eq!(result.packages.len(), 1);
 
-        // Find crates by their symbol content.
-        let crate_a = result
-            .packages
-            .values()
-            .find(|c| get_root(c).symbols.contains_key("a"))
-            .expect("crate with symbol a");
-        let crate_b = result
-            .packages
-            .values()
-            .find(|c| get_root(c).symbols.contains_key("b"))
-            .expect("crate with symbol b");
+        let pkg = result.packages.values().next().unwrap();
+        let timings = &get_synthetic(pkg).timings;
 
-        // Verify metadata estimated from formula: 0.26 * frontend + 1662
-        let expected_a = METADATA_SLOPE * 1000.0 + METADATA_INTERCEPT; // 1922
-        let expected_b = METADATA_SLOPE * 5000.0 + METADATA_INTERCEPT; // 2962
-
-        let metadata_a = get_synthetic(crate_a).metadata_ms;
-        let metadata_b = get_synthetic(crate_b).metadata_ms;
-
+        // wall_time_ms = sum of all symbol event_times_ms = 100 + 200 = 300
         assert!(
-            (metadata_a - expected_a).abs() < 0.01,
-            "Expected metadata_ms ~{expected_a}, got {metadata_a}"
+            (timings.wall_time_ms - 300.0).abs() < 0.01,
+            "Expected wall_time_ms ~300, got {}",
+            timings.wall_time_ms
+        );
+    }
+
+    #[test]
+    fn test_synthetic_wall_times_per_crate() {
+        // Verify each single-symbol crate has wall_time_ms matching
+        // the symbol's total event_times_ms.
+        //
+        // Fork: a and b both depend on c.
+        // Result: {a}, {b}, {c} — three crates (c is a boundary).
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "a".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                dependencies: [path("my_crate", "c")].into_iter().collect(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        symbols.insert(
+            "b".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 80.0)]),
+                dependencies: [path("my_crate", "c")].into_iter().collect(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        symbols.insert(
+            "c".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 30.0)]),
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my_crate".to_string(),
+            tarjanize_schemas::Crate {
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            },
+        );
+
+        let symbol_graph = make_graph(crates);
+        let result = condense_and_partition(&symbol_graph);
+
+        // Three crates: {a}, {b}, {c}.
+        assert_eq!(result.packages.len(), 3);
+
+        // Each single-symbol crate should have wall_time_ms matching the
+        // symbol's total event_times_ms.
+        for pkg in result.packages.values() {
+            let timings = &get_synthetic(pkg).timings;
+            let root = get_root(pkg);
+            assert_eq!(root.symbols.len(), 1);
+
+            let symbol = root.symbols.values().next().unwrap();
+            assert!(
+                (timings.wall_time_ms
+                    - sum_event_times(&symbol.event_times_ms))
+                .abs()
+                    < 0.01,
+                "wall_time_ms should match symbol total event_times_ms"
+            );
+        }
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "test requires 4 packages with profiling data for regression"
+    )]
+    fn test_model_based_prediction_for_merged_crate() {
+        // Verify that when enough original targets have wall-clock profiling
+        // data (wall_time_ms > 0 and metadata_decode_* entries), the
+        // two-variable regression model is fitted and used to predict
+        // synthetic target wall times — not just raw symbol attribution sums.
+        //
+        // Setup: 4 packages with a single lib target each.
+        //   - pkg_a has symbols `a → b` (chain, will merge into one crate)
+        //   - pkg_b, pkg_c, pkg_d each have one independent symbol
+        //
+        // All packages have profiling data that perfectly fits:
+        //   wall_time = 2.0 * attr + 3.0 * meta
+        //
+        // After merge, the synthetic crate containing {a, b} should have
+        // its wall_time_ms predicted by the model, not just attr sum.
+
+        // Helper to make a package with one symbol and profiling data.
+        fn make_profiled_package(
+            symbol_name: &str,
+            symbol_attr: f64,
+            meta: f64,
+            deps: HashSet<String>,
+        ) -> Package {
+            let wall = 2.0 * symbol_attr + 3.0 * meta;
+            let mut symbols = HashMap::new();
+            symbols.insert(
+                symbol_name.to_string(),
+                Symbol {
+                    file: "test.rs".to_string(),
+                    event_times_ms: HashMap::from([(
+                        "typeck".to_string(),
+                        symbol_attr,
+                    )]),
+                    dependencies: deps,
+                    kind: SymbolKind::ModuleDef {
+                        kind: "Function".to_string(),
+                        visibility: Visibility::Public,
+                    },
+                },
+            );
+            let crate_data = Crate {
+                timings: TargetTimings {
+                    wall_time_ms: wall,
+                    event_times_ms: HashMap::from([(
+                        "metadata_decode_entry_foo".to_string(),
+                        meta,
+                    )]),
+                },
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            };
+            let mut targets = HashMap::new();
+            targets.insert("lib".to_string(), crate_data);
+            Package { targets }
+        }
+
+        // pkg_a: two symbols forming a chain (a → b), which will merge.
+        let mut pkg_a_symbols = HashMap::new();
+        pkg_a_symbols.insert(
+            "a".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 100.0)]),
+                dependencies: [path("pkg_a", "b")].into_iter().collect(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        pkg_a_symbols.insert(
+            "b".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        let pkg_a_crate = Crate {
+            timings: TargetTimings {
+                // attr = 100 + 50 = 150, meta = 20
+                // wall = 2*150 + 3*20 = 360
+                wall_time_ms: 360.0,
+                event_times_ms: HashMap::from([(
+                    "metadata_decode_entry_foo".to_string(),
+                    20.0,
+                )]),
+            },
+            root: Module {
+                symbols: pkg_a_symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+        let mut pkg_a_targets = HashMap::new();
+        pkg_a_targets.insert("lib".to_string(), pkg_a_crate);
+        let pkg_a = Package {
+            targets: pkg_a_targets,
+        };
+
+        // Independent packages that provide regression data points.
+        let pkg_b = make_profiled_package("x", 200.0, 10.0, HashSet::new());
+        let pkg_c = make_profiled_package("y", 80.0, 30.0, HashSet::new());
+        let pkg_d = make_profiled_package("z", 300.0, 5.0, HashSet::new());
+
+        let mut packages = HashMap::new();
+        packages.insert("pkg_a".to_string(), pkg_a);
+        packages.insert("pkg_b".to_string(), pkg_b);
+        packages.insert("pkg_c".to_string(), pkg_c);
+        packages.insert("pkg_d".to_string(), pkg_d);
+
+        let symbol_graph = SymbolGraph { packages };
+        let result = condense_and_partition(&symbol_graph);
+
+        // pkg_a's two symbols merge into one crate; the other three stay
+        // separate. Total = 4 packages in output.
+        assert_eq!(result.packages.len(), 4);
+
+        // Find the merged crate (contains both a and b).
+        let merged = result
+            .packages
+            .values()
+            .find(|pkg| {
+                let root = get_root(pkg);
+                root.symbols.len() == 2
+            })
+            .expect("should have a merged crate with 2 symbols");
+
+        let timings = &get_synthetic(merged).timings;
+
+        // The model fits wall = 2*attr + 3*meta perfectly.
+        // Merged crate: attr = 100 + 50 = 150, meta = max(20) = 20
+        // Predicted wall = 2*150 + 3*20 = 360
+        //
+        // Without the model, wall would just be attr = 150. Verify we get
+        // the model-based prediction instead.
+        assert!(
+            timings.wall_time_ms > 200.0,
+            "Model-based prediction should be higher than raw attr (150); \
+             got {}",
+            timings.wall_time_ms
         );
         assert!(
-            (metadata_b - expected_b).abs() < 0.01,
-            "Expected metadata_ms ~{expected_b}, got {metadata_b}"
+            (timings.wall_time_ms - 360.0).abs() < 1.0,
+            "Expected wall_time_ms ~360 from model (2*150 + 3*20), got {}",
+            timings.wall_time_ms
         );
     }
 }

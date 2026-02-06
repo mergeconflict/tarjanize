@@ -15,5 +15,6 @@ workspace = true
 [dependencies]
 tarjanize-schemas.workspace = true
 indexmap.workspace = true
+jiff.workspace = true
 petgraph.workspace = true
 serde_json.workspace = true

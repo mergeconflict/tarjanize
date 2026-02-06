@@ -50,14 +50,29 @@ python3 simulate_model_parallelism.py omicron.json
 | `analyze_frontend_codegen.py` | Breakdown of frontend vs codegen time |
 | `analyze_rmeta_pipelining.py` | Evidence of cargo's rmeta pipelining |
 
+### Cost Predictor Analysis
+
+| Script | Description |
+|--------|-------------|
+| `stepwise_regression.py` | Forward stepwise regression to find best event-cost predictors of wall time |
+
+```bash
+# Find best predictors for a workspace
+python3 stepwise_regression.py ~/validation/data/tokio/symbol_graph_check.json
+
+# Exclude outlier targets
+python3 stepwise_regression.py ~/validation/data/omicron/symbol_graph_check.json \
+    --exclude nexus-db-queries/lib
+```
+
 ### Key Findings
 
 These scripts produced the findings documented in `docs/cost-model-validation.md`:
 
 1. **Model accuracy**: LIB targets R² = 0.856, merged lib+test R² = 0.917
 2. **Component contribution**: Metadata +10% R², linking +0.4% (negligible)
-3. **Frontend dominance**: 70% of lib compilation is frontend (type checking)
-4. **Rmeta pipelining**: Test targets start before lib finishes (uses rmeta, not rlib)
+3. **Frontend dominance**: 70% of lib compilation is frontend (type checking) — this led to the decision to track only frontend costs in the model
+4. **Rmeta pipelining**: Test targets start before lib finishes (uses rmeta, not rlib). Note: pipelining is no longer modeled explicitly since backend tracking was removed
 
 ## Usage Examples
 

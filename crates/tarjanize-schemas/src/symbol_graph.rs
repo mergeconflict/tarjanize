@@ -30,6 +30,16 @@ fn is_zero(value: &f64) -> bool {
     *value == 0.0
 }
 
+/// Helper to sum all values in a `HashMap<String, f64>`.
+///
+/// Used by both `Symbol.event_times_ms` (total attributed cost) and
+/// `TargetTimings.event_times_ms` (total unattributed cost).
+pub fn sum_event_times<S: ::std::hash::BuildHasher>(
+    map: &HashMap<String, f64, S>,
+) -> f64 {
+    map.values().sum()
+}
+
 /// Root structure representing the entire symbol graph of a workspace.
 ///
 /// The symbol graph captures all symbols and their dependencies within a
@@ -69,15 +79,56 @@ pub struct Package {
     /// - `"bin/{name}"` for binary targets
     /// - `"example/{name}"` for example targets
     /// - `"bench/{name}"` for benchmark targets
-    pub targets: HashMap<String, Crate>,
+    pub targets: HashMap<String, Target>,
 }
 
-/// A crate (rustc compilation unit) within a package.
+/// Wall-clock timing for a compilation target.
 ///
-/// Each crate represents a separate compilation unit with its own:
+/// Captures the profiler's wall-clock time and unattributed event self-times
+/// per compilation target. For crate splitting, only frontend time matters —
+/// it's serial, determines rmeta readiness, and gates downstream crates.
+///
+/// `event_times_ms` contains ONLY unattributed event self-times — events
+/// that could NOT be attributed to a specific symbol via `DefPath`. Together
+/// with `Symbol.event_times_ms`, the two maps account for all profiled
+/// self-time with no double-counting: every millisecond of profiled
+/// self-time lands in exactly one place.
+///
+/// These values come directly from `-Zself-profile` wall-clock intervals when
+/// profiling is enabled. For synthetic crates (from condense), they are
+/// estimated from per-symbol costs and the fitted regression model.
+#[derive(
+    Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
+)]
+pub struct TargetTimings {
+    /// Wall-clock time in milliseconds.
+    ///
+    /// Wall-clock elapsed time of all profiled events. Measured as
+    /// max(end) - min(start) across all events in the profile.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    #[schemars(range(min = 0.0))]
+    pub wall_time_ms: f64,
+
+    /// Unattributed self-time breakdown by event label (ms).
+    ///
+    /// Keys are the original self-profile event labels (e.g.
+    /// `"metadata_decode_entry_generics_of"`, `"LLVM_module_codegen"`).
+    /// Values are accumulated self-time for events that were NOT attributed
+    /// to a specific symbol via `DefPath`. Together with `Symbol.event_times_ms`,
+    /// these two maps account for all profiled self-time.
+    ///
+    /// The metadata decode cost for the regression model is derived by summing
+    /// all `metadata_decode_*` entries at query time.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub event_times_ms: HashMap<String, f64>,
+}
+
+/// A compilation target (rustc compilation unit) within a package.
+///
+/// Each target represents a separate compilation unit with its own:
 /// - Module tree containing symbols
-/// - Overhead costs (linking, metadata generation)
-/// - Dependencies on other crates
+/// - Timing data (wall-clock frontend + event cost breakdown)
+/// - Dependencies on other targets
 ///
 /// This separation allows accurate modeling of:
 /// - Dev-dependency relationships (tests depend on libs, not vice versa)
@@ -86,31 +137,30 @@ pub struct Package {
 #[derive(
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
-pub struct Crate {
-    /// Metadata generation time in milliseconds.
-    ///
-    /// Fixed cost for generating crate metadata (`generate_crate_metadata`).
-    /// This is required for downstream crates to depend on this one.
-    /// Only meaningful for lib targets.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    #[schemars(range(min = 0.0))]
-    pub metadata_ms: f64,
+pub struct Target {
+    /// Wall-clock timing breakdown for this target.
+    pub timings: TargetTimings,
 
-    /// Dependencies on other crates.
+    /// Dependencies on other targets.
     ///
-    /// Each entry is a crate reference in the format `"{package}/{target}"`:
+    /// Each entry is a target reference in the format `"{package}/{target}"`:
     /// - `"other-package/lib"` - depends on another package's library
-    /// - `"my-package/lib"` - test/bin crate depends on own library
+    /// - `"my-package/lib"` - test/bin target depends on own library
     ///
-    /// For lib crates: contains normal dependencies (`{dep-package}/lib`)
-    /// For test crates: normal + dev deps + own lib (`{self-package}/lib`)
-    /// For bin crates: normal deps + own lib (`{self-package}/lib`)
+    /// For lib targets: contains normal dependencies (`{dep-package}/lib`)
+    /// For test targets: normal + dev deps + own lib (`{self-package}/lib`)
+    /// For bin targets: normal deps + own lib (`{self-package}/lib`)
     #[serde(default, skip_serializing_if = "HashSet::is_empty")]
     pub dependencies: HashSet<String>,
 
-    /// The root module containing all symbols and submodules for this crate.
+    /// The root module containing all symbols and submodules for this target.
     pub root: Module,
 }
+
+/// Type alias for backwards compatibility during the `Crate` → `Target` rename.
+///
+/// TODO: Remove once all downstream code uses `Target` directly.
+pub type Crate = Target;
 
 /// A module (or crate root) containing symbols and submodules.
 ///
@@ -145,29 +195,19 @@ pub struct Symbol {
     /// Path to the symbol's file relative to the crate root.
     pub file: String,
 
-    /// Frontend compilation cost in milliseconds.
+    /// Self-time breakdown by event label for events attributed to this symbol
+    /// after descendant aggregation (ms).
     ///
-    /// Includes parsing, type checking, borrow checking, and other serial
-    /// compilation phases. Populated from rustc's self-profile data when
-    /// profiling is enabled. Defaults to 0.0.
+    /// Keys are profiler event labels (e.g. `"typeck"`, `"mir_borrowck"`,
+    /// `"predicates_of"`). Values are accumulated self-time for that event
+    /// across this symbol and all its descendants (closures, generic params,
+    /// anonymous consts, opaque types, etc.).
     ///
-    /// Frontend costs are serial - when compiling symbols A and B:
-    /// `total_frontend = A.frontend_cost_ms + B.frontend_cost_ms`
-    #[serde(default, skip_serializing_if = "is_zero")]
-    #[schemars(range(min = 0.0))]
-    pub frontend_cost_ms: f64,
-
-    /// Backend compilation cost in milliseconds.
-    ///
-    /// Includes LLVM codegen, which can run in parallel across CGUs.
-    /// Populated by distributing CGU costs to symbols via mono-items mapping.
-    /// Defaults to 0.0.
-    ///
-    /// Backend costs can parallelize - when compiling symbols A and B in
-    /// parallel: `total_backend = max(A.backend_cost_ms, B.backend_cost_ms)`
-    #[serde(default, skip_serializing_if = "is_zero")]
-    #[schemars(range(min = 0.0))]
-    pub backend_cost_ms: f64,
+    /// The total attributed cost for this symbol is `sum(event_times_ms.values())`.
+    /// This replaces the old scalar `frontend_cost_ms` field and provides
+    /// per-event visibility for regression testing.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub event_times_ms: HashMap<String, f64>,
 
     /// Fully qualified paths of symbols this symbol depends on. A dependency
     /// means this symbol's definition references the target in some way
@@ -321,21 +361,22 @@ mod tests {
     }
 
     prop_compose! {
-        /// Strategy for generating arbitrary Symbol values with non-negative
-        /// integer costs.
-        ///
-        /// Note that floating-point values don't survive roundtrip
-        /// serialization/deserialization perfectly.
+        /// Strategy for generating arbitrary Symbol values with event_times_ms
+        /// containing integer-valued costs (floats don't survive JSON roundtrip
+        /// perfectly).
         fn arb_symbol()
             (
                 file in arb_name(),
-                frontend_cost_ms in (0..1_000_000).prop_map(f64::from),
-                backend_cost_ms in (0..1_000_000).prop_map(f64::from),
+                event_times_ms in hash_map(
+                    arb_name(),
+                    (0..1_000_000).prop_map(f64::from),
+                    0..5,
+                ),
                 dependencies in hash_set(arb_path(), 0..5),
                 kind in arb_symbol_kind(),
             )
         -> Symbol {
-            Symbol { file, frontend_cost_ms, backend_cost_ms, dependencies, kind }
+            Symbol { file, event_times_ms, dependencies, kind }
         }
     }
 
@@ -365,16 +406,31 @@ mod tests {
         )
     }
 
-    /// Strategy for generating arbitrary Crate values (compilation units).
-    fn arb_crate() -> impl Strategy<Value = Crate> {
+    /// Strategy for generating arbitrary `TargetTimings` values.
+    ///
+    /// Generates timing values with an optional `event_times_ms` map containing
+    /// integer-valued costs (floats don't survive JSON roundtrip perfectly).
+    fn arb_target_timings() -> impl Strategy<Value = TargetTimings> {
         (
             (0..1_000_000).prop_map(f64::from),
-            // Dependencies are crate references like "package/lib" or "package/bin/name"
+            hash_map(arb_name(), (0..1_000_000).prop_map(f64::from), 0..5),
+        )
+            .prop_map(|(wall_time_ms, event_times_ms)| TargetTimings {
+                wall_time_ms,
+                event_times_ms,
+            })
+    }
+
+    /// Strategy for generating arbitrary Target values (compilation units).
+    fn arb_target() -> impl Strategy<Value = Target> {
+        (
+            arb_target_timings(),
+            // Dependencies are target references like "package/lib" or "package/bin/name"
             hash_set(arb_path(), 0..5),
             arb_module(),
         )
-            .prop_map(|(metadata_ms, dependencies, root)| Crate {
-                metadata_ms,
+            .prop_map(|(timings, dependencies, root)| Target {
+                timings,
                 dependencies,
                 root,
             })
@@ -393,7 +449,7 @@ mod tests {
     /// Strategy for generating arbitrary Package values.
     fn arb_package() -> impl Strategy<Value = Package> {
         // Generate 1-4 targets per package
-        hash_map(arb_target_key(), arb_crate(), 1..5)
+        hash_map(arb_target_key(), arb_target(), 1..5)
             .prop_map(|targets| Package { targets })
     }
 

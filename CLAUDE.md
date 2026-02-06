@@ -34,7 +34,7 @@ Phase 2: SCC + Partition + Reorganize  → optimized_symbol_graph.json  (tarjani
 Cost:    Critical Path Analysis        → report  (tarjanize cost)
 ```
 
-Phase 1 extracts the symbol graph. Phase 2 computes SCCs, merges them via union-find into optimal crate groupings (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`. The cost command computes build metrics including critical path with rmeta pipelining.
+Phase 1 extracts the symbol graph. Phase 2 computes SCCs, merges them via union-find into optimal crate groupings (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`. The cost command computes build metrics including critical path analysis.
 
 See PLAN.md for the full specification and future phases.
 
@@ -71,8 +71,7 @@ tarjanize/
     │   │   ├── orchestrator.rs  # Coordinates cargo check with RUSTC_WRAPPER
     │   │   ├── driver.rs    # Custom rustc driver for symbol extraction
     │   │   ├── extract.rs   # HIR/THIR analysis for dependency extraction
-    │   │   ├── profile.rs   # Self-profile parsing for cost estimation
-    │   │   └── mono_items.rs  # CGU→symbol mapping for backend cost distribution
+    │   │   └── profile.rs   # Self-profile parsing for cost estimation
     │   └── tests/fixtures/  # Integration test fixtures
     │
     ├── tarjanize-condense/  # Phase 2: SCC + partition + reorganize
@@ -81,7 +80,7 @@ tarjanize/
     │       ├── error.rs     # CondenseError
     │       └── scc.rs       # SCC, union-find merging, anchor constraint fixing
     │
-    └── tarjanize-cost/      # Cost analysis: critical path with rmeta pipelining
+    └── tarjanize-cost/      # Cost analysis: critical path scheduling
         └── src/
             └── lib.rs       # critical_path(), run(), CriticalPathResult
 ```
@@ -101,7 +100,6 @@ tarjanize/
 - **driver.rs** - Custom rustc driver that runs extraction callbacks
 - **extract.rs** - Walks rustc's HIR and THIR to extract symbols and dependencies
 - **profile.rs** - Parses `-Zself-profile` output for accurate compilation costs
-- **mono_items.rs** - Parses `-Zprint-mono-items` output for CGU→symbol mapping (backend cost distribution)
 
 **tarjanize-condense** (library)
 - **lib.rs** - Public API: `run()` reads SymbolGraph JSON, outputs optimized SymbolGraph JSON
@@ -109,7 +107,7 @@ tarjanize/
 - **scc.rs** - SCC computation via petgraph condensation, union-find merging, and anchor constraint fixing (orphan rule)
 
 **tarjanize-cost** (library)
-- **lib.rs** - Critical path analysis with rmeta pipelining. Models frontend (serial), backend (parallel CGUs), and overhead costs. Target-level analysis avoids dev-dependency cycles.
+- **lib.rs** - Critical path analysis. Models frontend compilation costs (serial). Target-level analysis avoids dev-dependency cycles.
 
 ## Key Patterns
 
@@ -122,8 +120,6 @@ tarjanize/
 **Profile Matching**: For accurate cost estimation, `--profile` runs with `-Zself-profile`. The profile uses compiler internal paths (`{{impl}}[N]`) which are stored in `Symbol.profile_key` for matching.
 
 **Target-Level Analysis**: The cost model operates at the compilation target level (`{package}/{target}` format, e.g. `my-pkg/lib`, `my-pkg/test`), not the package level. This naturally resolves dev-dependency "cycles" since test targets depend on lib targets, not vice versa.
-
-**Rmeta Pipelining**: The cost model accounts for Cargo's pipelined compilation — downstream targets can start frontend work when upstream rmeta is ready (after frontend), without waiting for backend codegen to complete.
 
 **Anchor Constraints**: Impl blocks have "anchors" (the trait and self type). When partitioning, the orphan rule requires at least one anchor to be in the same crate as the impl. The condense phase uses a hitting set algorithm to find minimal merges satisfying all constraints.
 
@@ -156,11 +152,12 @@ cargo hack check --feature-powerset  # Verify all feature combinations compile
 Read these docs for deeper context on specific topics:
 
 - **[PLAN.md](PLAN.md)** — Full project specification: algorithm details, optimality proofs, phase design
-- **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R²=0.856 accuracy, rmeta pipelining discovery, per-symbol cost skew (top 1% = 75% of cost), and why only lib targets matter for critical path
-- **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — How rustc compilation works: frontend/backend/overhead cost breakdown, CGU parallelism, what profiling data is available
+- **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R²=0.856 accuracy, per-symbol cost skew (top 1% = 75% of cost), and why only lib targets matter for critical path. Also documents the validation directory structure at `/home/debian/github/validation/` (repos + extracted data for tokio, omicron, helix, and 8 other workspaces)
+- **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). Note: tarjanize only tracks frontend costs; backend/CGU tracking was removed as unreliable for crate-splitting predictions
+- **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties (item count, predicate count, MIR size, etc.) drive compilation time, and how to extract them for better cost prediction
 - **[docs/validation-plan.md](docs/validation-plan.md)** — Plan to validate cost model across 10 popular Rust workspaces (Zed, Bevy, uv, ruff, etc.)
 - **[docs/external-profile-plan.md](docs/external-profile-plan.md)** — Two-pass profiling plan to fix 10-15x cost inflation from extraction callback overhead
-- **[PLAN_COST_TRACKING.md](PLAN_COST_TRACKING.md)** — Implementation plan for frontend/backend cost separation in schemas
+- **[PLAN_COST_TRACKING.md](PLAN_COST_TRACKING.md)** — Historical: implementation plan for frontend/backend cost separation (backend tracking later removed)
 - **[PLAN_TARGETS.md](PLAN_TARGETS.md)** — Implementation plan for separating lib/test/bin targets to fix dev-dependency cycles
 - **[TARJAN.md](TARJAN.md)** — Reference: Tarjan's SCC algorithm explained
 - **[scripts/README.md](scripts/README.md)** — Python analysis scripts for comparing model predictions vs actual cargo build times

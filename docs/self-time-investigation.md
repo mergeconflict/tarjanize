@@ -242,6 +242,8 @@ Possible explanations:
 
 ## Current R² Results
 
+> Note: These results are from the investigation period when backend costs were still tracked. Backend cost tracking has since been removed from tarjanize.
+
 With the self-time algorithm (but with the duplicate bug):
 
 | Configuration | LIB R² | TEST R² | MERGED R² |
@@ -253,19 +255,34 @@ The LIB R² is very poor (0.008) because the modeled costs are ~10x inflated due
 
 ## Next Steps
 
-1. **Fix the duplicate accumulation bug**:
-   - Investigate profile directory structure
-   - Ensure each profile file is only loaded once
-   - Or deduplicate profile files by their unique ID
+1. **Per-crate wall-clock vs CPU time analysis**:
+   - Goal: Determine if the ~3x gap between profile time and actual build time is
+     consistent across all crates (constant factor) or varies (something interesting).
+   - For each crate, compare three values:
+     - **Profile wall-clock**: `max(event.end) - min(event.start)` from `.mm_profdata`
+     - **Profile CPU time**: `sum(event.duration)` from `.mm_profdata`
+     - **Actual timing**: Per-unit time from `cargo build --timings` HTML
+   - How to do it:
+     1. Run `cargo tarjanize` to generate profile data (in temp profile dirs)
+     2. Before cleanup, copy profile files or run analysis inline
+     3. For each `.mm_profdata` file, use `analyzeme::ProfilingData` to iterate events
+        and compute `wall = max(end) - min(start)` and `cpu = sum(duration)`
+     4. Parse `cargo-timing.html` to get actual per-unit times (use existing
+        `load_unit_data()` pattern from `scripts/analyze_actual_parallelism.py`)
+     5. Join by crate name and compute ratios: `cpu/wall` (parallelism factor)
+        and `wall/actual` (overhead factor)
+   - Could extend `scripts/analyze_profile_parallelism.py` to batch-process all
+     profile files in a directory, or add this analysis to `profile.rs` directly
+   - Expected output: table showing per-crate ratios to identify if gap is constant
 
 2. **Validate self-time correctness**:
-   - Once duplicates are fixed, verify that modeled costs match actual times better
-   - Expected: ~3x inflation (due to parallel frontend), not ~10x
+   - Verify that modeled costs match actual times after self-time fix
+   - Current: R²=0.99 for lib targets with ~1.5x inflation factor
 
 3. **Consider parallel frontend**:
-   - The remaining ~3x gap is due to `-Zthreads`
-   - For cost modeling, this might be acceptable as a constant factor
-   - Or we could try to estimate the parallelism factor
+   - The remaining gap may be due to `-Zthreads` parallelism
+   - For cost modeling, might be acceptable as a constant factor
+   - Or we could try to estimate the parallelism factor from thread_id distribution
 
 ## Files Changed
 

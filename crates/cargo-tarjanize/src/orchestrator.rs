@@ -3,15 +3,17 @@
 //! The build process has two steps:
 //!
 //! 1. **Profile build** (optional, skipped with `--no-profile`):
-//!    Run `cargo +nightly build` with `-Zself-profile` but NO `RUSTC_WRAPPER`.
+//!    Run `cargo +nightly check` with `-Zself-profile` but NO `RUSTC_WRAPPER`.
 //!    Produces clean profile data without extraction overhead.
 //!
-//! 2. **Extraction build**:
-//!    Run `cargo build` with `RUSTC_WRAPPER` to extract symbols and mono-items.
+//! 2. **Extraction check**:
+//!    Run `cargo check` with `RUSTC_WRAPPER` to extract symbols.
 //!    Profile data (if collected) is merged with extracted symbols.
 //!
-//! Separating profiling from extraction ensures profile data only contains
-//! real compilation work, not overhead from our extraction callbacks.
+//! We use `cargo check` instead of `cargo build` because we only need frontend
+//! compilation data (type checking, trait resolution, MIR optimization). The
+//! check command produces rmeta but skips codegen/LLVM/linking, giving us
+//! clean frontend-only profiles and faster extraction.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -27,7 +29,7 @@ use tracing::{debug, info, warn};
 use crate::driver::CrateResult;
 use crate::{Cli, ENV_VERBOSITY};
 
-/// Configuration for running cargo builds.
+/// Configuration for running cargo check.
 /// Bundles all the parameters needed by `run_profile_build` and `run_extraction_build`.
 struct BuildConfig<'a> {
     manifest_path: &'a Path,
@@ -172,7 +174,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
         packages: &cli.package,
     };
 
-    // Single cargo build pass: driver does profiling, extraction, cost
+    // Single cargo check pass: driver does profiling, extraction, cost
     // application, and cleanup for each crate as it compiles.
     run_build(
         &config,
@@ -197,7 +199,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
     Ok(())
 }
 
-/// Run a single cargo build that does profiling, extraction, and cleanup.
+/// Run a single cargo check that does profiling, extraction, and cleanup.
 ///
 /// Uses `RUSTC_WRAPPER` to run our custom driver. For workspace crates, the
 /// driver:
@@ -216,7 +218,7 @@ fn run_build(
     info!("running build");
 
     let mut cmd = Command::new("cargo");
-    cmd.arg("build")
+    cmd.arg("check")
         .arg("--all-targets")
         .arg("--manifest-path")
         .arg(config.manifest_path);
@@ -248,11 +250,11 @@ fn run_build(
         cmd.env(ENV_SKIP_PROFILE, "1");
     }
 
-    debug!(manifest = %config.manifest_path.display(), no_profile, "running cargo build");
-    let status = cmd.status().context("failed to run cargo build")?;
+    debug!(manifest = %config.manifest_path.display(), no_profile, "running cargo check");
+    let status = cmd.status().context("failed to run cargo check")?;
 
     if !status.success() {
-        anyhow::bail!("cargo build failed with status: {status}");
+        anyhow::bail!("cargo check failed with status: {status}");
     }
 
     Ok(())
@@ -292,7 +294,7 @@ fn aggregate_results(
     workspace_crates: &[String],
     metadata: &Metadata,
 ) -> Result<SymbolGraph> {
-    // Load the crate mapping that was written before cargo build.
+    // Load the crate mapping that was written before cargo check.
     let crate_mapping = load_crate_mapping(output_dir)?;
 
     let mut packages: HashMap<String, Package> = HashMap::new();

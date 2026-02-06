@@ -245,8 +245,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -276,8 +276,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::ModuleDef {
                 kind: kind_name.to_string(),
@@ -299,8 +299,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::ModuleDef {
                 kind: "Trait".to_string(),
@@ -324,8 +324,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::ModuleDef {
                 kind: "TypeAlias".to_string(),
@@ -362,8 +362,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::ModuleDef {
                 kind: kind_name.to_string(),
@@ -382,8 +382,8 @@ impl<'tcx> Extractor<'tcx> {
         // Macros don't have type-level dependencies we can easily extract.
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Macro".to_string(),
@@ -417,8 +417,8 @@ impl<'tcx> Extractor<'tcx> {
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
+
             dependencies: deps,
             kind: SymbolKind::Impl {
                 name: impl_name,

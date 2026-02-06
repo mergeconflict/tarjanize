@@ -6,45 +6,14 @@
 //!
 //! ## Cost Model
 //!
-//! Rustc compilation has phases with different parallelism characteristics:
-//!
-//! - **Frontend** (parsing, type checking, borrow checking) — serial within a crate
-//! - **Backend** (LLVM optimization, codegen) — parallel across Codegen Units (CGUs)
-//! - **Overhead** (metadata generation) — per-crate fixed costs
-//!
-//! We model crate compile time using the wall-clock prediction formula:
+//! For crate splitting, only **frontend time** matters — it's serial within a
+//! crate, determines rmeta readiness, and gates downstream crates. Backend time
+//! (LLVM codegen) is parallel via CGUs and doesn't meaningfully affect the
+//! critical path.
 //!
 //! ```text
-//! crate_cost = frontend_time + backend_time + overhead
-//!
-//! where:
-//!   frontend_time = Σ symbol.frontend_cost_ms           (serial - sum all)
-//!   backend_time  = max(module.backend_cost_ms())       (parallel - max across modules)
-//!   overhead      = crate.metadata_ms
+//! crate_cost = wall_time_ms = Σ sum(symbol.event_times_ms)
 //! ```
-//!
-//! The key insight: backend work is parallelized via CGUs, roughly 2 per module.
-//! Only the slowest module's backend cost affects wall-clock time.
-//!
-//! ## Rmeta Pipelining
-//!
-//! Cargo uses **pipelined compilation**: downstream crates can start compiling
-//! as soon as their dependencies' **rmeta** (metadata) is ready, without waiting
-//! for the full **rlib** (compiled code). This is critical for accurate modeling:
-//!
-//! - **Rmeta** contains type signatures, trait impls — available after frontend
-//! - **Rlib** contains compiled code — only needed for final linking
-//!
-//! For scheduling purposes:
-//! ```text
-//! rmeta_ready_time = start_time + frontend_cost
-//! finish_time      = start_time + total_cost
-//!
-//! downstream.start_time = max(dep.rmeta_ready_time for dep in dependencies)
-//! ```
-//!
-//! This means backend work (codegen) runs in parallel with downstream frontend
-//! work, significantly increasing effective parallelism.
 //!
 //! ## Target-Level Analysis
 //!
@@ -63,15 +32,13 @@
 //!
 //! ## Algorithm
 //!
-//! The critical path is computed using dynamic programming in topological order,
-//! accounting for rmeta pipelining:
+//! The critical path is computed using dynamic programming in topological order:
 //!
 //! 1. Build a directed graph of target dependencies
 //! 2. Process targets in topological order (dependencies before dependents)
 //! 3. For each target:
-//!    - `start[t] = max(rmeta_ready[dep] for dep in deps)`
-//!    - `rmeta_ready[t] = start[t] + frontend_cost[t]`
-//!    - `finish[t] = start[t] + total_cost[t]`
+//!    - `start[t] = max(finish[dep] for dep in deps)`
+//!    - `finish[t] = start[t] + wall_time_ms[t]`
 //! 4. The critical path length is the maximum `finish[t]` across all targets
 
 use std::collections::HashMap;
@@ -82,9 +49,9 @@ use indexmap::IndexSet;
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
-use tarjanize_schemas::{Module, SymbolGraph};
+use tarjanize_schemas::{Module, SymbolGraph, TargetTimings, sum_event_times};
 
-/// Details about a single target, including timing with rmeta pipelining.
+/// Details about a single target on the critical path.
 #[derive(Debug, Clone)]
 pub struct TargetOnPath {
     /// Target identifier in `{package}/{target}` format.
@@ -92,45 +59,36 @@ pub struct TargetOnPath {
     pub name: String,
 
     /// Frontend cost in milliseconds (type checking, borrow checking).
-    /// This determines when rmeta is available for downstream crates.
+    /// This is the only cost dimension — backend time is parallel via CGUs
+    /// and doesn't affect the critical path.
     pub frontend_cost: f64,
 
-    /// Backend cost in milliseconds (LLVM codegen).
-    /// Runs in parallel with downstream frontend work due to rmeta pipelining.
-    pub backend_cost: f64,
-
-    /// Overhead cost in milliseconds (metadata generation).
-    pub overhead_cost: f64,
-
-    /// Total cost of this target alone (frontend + backend + overhead).
-    pub total_cost: f64,
-
-    /// When this target can start (max of dependencies' `rmeta_ready_time`).
+    /// When this target can start (max of dependencies' `finish_time`).
     /// With infinite parallelism, this is the earliest possible start.
     pub start_time: f64,
 
-    /// When rmeta is available (start + frontend). Downstream targets can begin
-    /// their frontend work at this point, even though codegen is still running.
-    pub rmeta_ready_time: f64,
-
-    /// When this target fully completes (start + `total_cost`).
+    /// When this target fully completes (`start_time + frontend_cost`).
     pub finish_time: f64,
 
     /// Direct dependencies of this target (target identifiers).
     pub dependencies: Vec<String>,
+
+    /// Raw wall-clock timings from profiler (zeros if no profiling data).
+    /// These are the actual measured compilation times, unmodified.
+    pub wall_timings: TargetTimings,
+
+    /// Per-symbol model timings (frontend = sum of symbol frontend costs).
+    /// Computed from symbol-level cost estimates, independent of whether
+    /// profiling data was available.
+    pub symbol_timings: TargetTimings,
 }
 
-/// Result of critical path analysis with rmeta pipelining.
+/// Result of critical path analysis.
 #[derive(Debug, Clone)]
 pub struct CriticalPathResult {
     /// Minimum build time with infinite parallelism (max finish time).
-    /// Accounts for rmeta pipelining: downstream targets start when upstream
-    /// rmeta is ready, not when upstream fully completes.
+    /// Only frontend time matters — backend is parallel via CGUs.
     pub critical_path_ms: f64,
-
-    /// What the critical path would be without pipelining (for comparison).
-    /// Computed as if downstream targets waited for full completion.
-    pub critical_path_no_pipelining_ms: f64,
 
     /// Targets on the critical path, from deepest dependency to top-level.
     /// Each entry is a target identifier like `my-package/lib`.
@@ -160,32 +118,14 @@ impl CriticalPathResult {
         // Summary statistics.
         writeln!(
             w,
-            "Critical path (pipelined): {:.2} ms",
-            self.critical_path_ms
+            "Critical path:             {}",
+            format_duration_ms(self.critical_path_ms)
         )?;
         writeln!(
             w,
-            "Critical path (no pipeline): {:.2} ms",
-            self.critical_path_no_pipelining_ms
+            "Total cost (sequential):   {}",
+            format_duration_ms(self.total_cost)
         )?;
-
-        // Avoid division by zero for empty graphs.
-        let pipelining_benefit = if self.critical_path_no_pipelining_ms > 0.0 {
-            100.0
-                * (1.0
-                    - self.critical_path_ms
-                        / self.critical_path_no_pipelining_ms)
-        } else {
-            0.0
-        };
-        writeln!(
-            w,
-            "Pipelining benefit:        {:.2} ms ({:.1}%)",
-            self.critical_path_no_pipelining_ms - self.critical_path_ms,
-            pipelining_benefit
-        )?;
-
-        writeln!(w, "Total cost (sequential):   {:.2} ms", self.total_cost)?;
 
         let parallelism = if self.critical_path_ms > 0.0 {
             self.total_cost / self.critical_path_ms
@@ -198,8 +138,8 @@ impl CriticalPathResult {
 
         // Table header for timing details.
         let header = format!(
-            "{:>10}  {:>10}  {:>10}  {:>10}  {:<40}  Dependencies",
-            "Start", "Rmeta", "Finish", "Cost", "Target"
+            "{:>10}  {:>10}  {:>10}  {:<40}  Dependencies",
+            "Start", "Finish", "Cost", "Target"
         );
         let separator = "-".repeat(header.len() + 20);
 
@@ -227,6 +167,158 @@ impl CriticalPathResult {
             }
         }
 
+        self.write_validation_table(&mut w)?;
+
+        Ok(())
+    }
+
+    /// Writes a model validation table showing actual vs predicted compilation
+    /// times.
+    ///
+    /// Only emitted when at least one target has non-zero wall-clock data
+    /// from profiling. Fits the two-variable model (`wall = a·attr + b·meta`)
+    /// on lib targets only (cleaner signal — no recompilation noise from test
+    /// targets), then shows per-target predictions and percentage errors for
+    /// all targets. Sorted by absolute error descending so the worst
+    /// predictions appear first.
+    ///
+    /// Falls back to showing just Target + Actual when fewer than 3 lib
+    /// targets are available (insufficient for model fitting).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "formatting-heavy table output, splitting would scatter layout logic"
+    )]
+    fn write_validation_table(&self, mut w: impl Write) -> std::io::Result<()> {
+        // Collect targets that have wall-clock profiling data.
+        let validated: Vec<&TargetOnPath> = self
+            .all_targets
+            .iter()
+            .filter(|t| t.wall_timings.wall_time_ms > 0.0)
+            .collect();
+
+        if validated.is_empty() {
+            return Ok(());
+        }
+
+        // Build regression data per target: (attr, meta, wall).
+        let regression_data: Vec<(f64, f64, f64)> = validated
+            .iter()
+            .map(|t| {
+                let attr = t.symbol_timings.wall_time_ms;
+                let meta: f64 = t
+                    .wall_timings
+                    .event_times_ms
+                    .iter()
+                    .filter(|(k, _)| k.starts_with("metadata_decode_"))
+                    .map(|(_, v)| v)
+                    .sum();
+                let wall = t.wall_timings.wall_time_ms;
+                (attr, meta, wall)
+            })
+            .collect();
+
+        // Fit on lib targets only — lib targets have cleaner signal because
+        // test targets include recompiled lib code, which skews the model.
+        let lib_regression_data: Vec<(f64, f64, f64)> = validated
+            .iter()
+            .zip(&regression_data)
+            .filter(|(t, _)| t.name.ends_with("/lib"))
+            .map(|(_, &data)| data)
+            .collect();
+
+        let lib_count = lib_regression_data.len();
+        let other_count = validated.len() - lib_count;
+        let fit = two_var_fit(&lib_regression_data);
+
+        if fit.is_some() {
+            writeln!(
+                w,
+                "\nModel validation ({} targets with profiling, \
+                 fit on {} lib targets):\n",
+                validated.len(),
+                lib_count,
+            )?;
+        } else {
+            writeln!(
+                w,
+                "\nModel validation ({} targets with profiling):\n",
+                validated.len()
+            )?;
+        }
+
+        if let Some(ref fit) = fit {
+            // Build rows with predictions and sort by absolute error.
+            // Predictions use the lib-fitted model for all targets.
+            let mut rows: Vec<(&str, f64, f64, f64, f64)> = validated
+                .iter()
+                .zip(&regression_data)
+                .map(|(t, &(attr, meta, _))| {
+                    let actual = t.wall_timings.wall_time_ms;
+                    let predicted = fit.a * attr + fit.b * meta;
+                    let delta_ms = predicted - actual;
+                    let error_pct = delta_ms / actual * 100.0;
+                    (t.name.as_str(), actual, predicted, delta_ms, error_pct)
+                })
+                .collect();
+            rows.sort_by(|a, b| {
+                b.4.abs()
+                    .partial_cmp(&a.4.abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            // Table header: actual, predicted, delta, error%.
+            writeln!(
+                w,
+                "{:<35} {:>9} {:>9} {:>9}  {:>7}",
+                "Target", "Actual", "Predicted", "Delta", "Error%",
+            )?;
+            writeln!(w, "{}", "-".repeat(74))?;
+
+            for (name, actual, predicted, delta_ms, error_pct) in &rows {
+                writeln!(
+                    w,
+                    "{:<35} {:>9} {:>9} {:>9}  {:>6.1}%",
+                    truncate_name(name, 35),
+                    format_duration_ms(*actual),
+                    format_duration_ms(*predicted),
+                    format_duration_ms(*delta_ms),
+                    error_pct,
+                )?;
+            }
+        } else {
+            // Fewer than 3 lib targets — can't fit the model. Show actuals.
+            writeln!(w, "{:<35} {:>9}", "Target", "Actual")?;
+            writeln!(w, "{}", "-".repeat(46))?;
+
+            for target in &validated {
+                writeln!(
+                    w,
+                    "{:<35} {:>9}",
+                    truncate_name(&target.name, 35),
+                    format_duration_ms(target.wall_timings.wall_time_ms),
+                )?;
+            }
+        }
+
+        // Summary statistics.
+        writeln!(w)?;
+        writeln!(
+            w,
+            "Targets compared:    {} ({} lib, {} other)",
+            validated.len(),
+            lib_count,
+            other_count,
+        )?;
+
+        if let Some(ref fit) = fit {
+            writeln!(
+                w,
+                "Two-var fit:         wall = {:.2} * attr + {:.2} * meta",
+                fit.a, fit.b,
+            )?;
+            writeln!(w, "R² (two-var):        {:.4}", fit.r_squared)?;
+        }
+
         Ok(())
     }
 }
@@ -248,22 +340,143 @@ impl fmt::Display for TargetOnPath {
 
         write!(
             f,
-            "{:>10.1}  {:>10.1}  {:>10.1}  {:>10.1}  {:<40}  {}",
-            self.start_time,
-            self.rmeta_ready_time,
-            self.finish_time,
-            self.total_cost,
+            "{:>10}  {:>10}  {:>10}  {:<40}  {}",
+            format_duration_ms(self.start_time),
+            format_duration_ms(self.finish_time),
+            format_duration_ms(self.frontend_cost),
             self.name,
             deps_str
         )
     }
 }
 
+/// Intermediate representation of the target dependency graph.
+///
+/// Contains the dependency graph plus three timing views per target:
+/// - `effective`: what the scheduler uses (wall-clock if available,
+///   per-symbol fallback)
+/// - `wall`: raw profiler wall-clock times (zeros if no profiling)
+/// - `symbol_model`: per-symbol cost model (frontend = sum of symbol costs)
+struct TargetGraph {
+    /// Target identifiers in `{package}/{target}` format.
+    names: IndexSet<String>,
+    /// Timings used by the scheduler (wall-clock when available, else
+    /// per-symbol). This is what determines scheduling and critical path.
+    effective: Vec<TargetTimings>,
+    /// Raw profiler wall-clock times. Zeros when no profiling data exists.
+    /// Never augmented — represents exactly what the profiler measured.
+    wall: Vec<TargetTimings>,
+    /// Per-symbol cost model: frontend = sum of symbol frontend costs.
+    /// Always computed from symbols.
+    symbol_model: Vec<TargetTimings>,
+    /// Total number of symbols across all targets.
+    symbol_count: usize,
+    /// Dependency graph where edges point from dependency to dependent.
+    graph: DiGraph<usize, ()>,
+}
+
+/// Result of two-variable no-intercept regression.
+///
+/// Fits `y = a * x1 + b * x2` (no intercept). Used to model
+/// `wall_time = a * attr + b * meta` where `attr` is the sum of
+/// symbol-attributed event times and `meta` is the sum of
+/// `metadata_decode_*` event times.
+#[derive(Debug)]
+pub struct TwoVarFit {
+    /// Coefficient for the first predictor (symbol attribution).
+    pub a: f64,
+    /// Coefficient for the second predictor (metadata decode).
+    pub b: f64,
+    /// Coefficient of determination (R²).
+    pub r_squared: f64,
+}
+
+/// Fits `y = a * x1 + b * x2` (no intercept) via ordinary least squares.
+///
+/// The no-intercept constraint is physically motivated: zero code plus zero
+/// dependencies should produce zero compilation time.
+///
+/// Solves the normal equations `(X^T X) β = X^T y` where X is the n×2
+/// matrix of predictors and β = [a, b]^T.
+///
+/// Returns `None` if fewer than 3 data points or if the predictor matrix
+/// is singular (collinear or all-zero predictors).
+///
+/// # Arguments
+///
+/// * `data` - Slice of `(x1, x2, y)` triples: (symbol attribution sum,
+///   metadata decode sum, wall time).
+// TODO: consider moving this to a dedicated numerical crate or using an
+// existing OLS crate from the ecosystem.
+pub fn two_var_fit(data: &[(f64, f64, f64)]) -> Option<TwoVarFit> {
+    // Need at least 3 data points for a meaningful R² statistic.
+    if data.len() < 3 {
+        return None;
+    }
+
+    // Compute X^T X (2×2 symmetric matrix) and X^T y (2×1 vector).
+    // X^T X = [[Σx1², Σx1·x2], [Σx1·x2, Σx2²]]
+    // X^T y = [Σx1·y, Σx2·y]
+    let mut s11 = 0.0; // Σx1²
+    let mut s12 = 0.0; // Σx1·x2
+    let mut s22 = 0.0; // Σx2²
+    let mut sy1 = 0.0; // Σx1·y
+    let mut sy2 = 0.0; // Σx2·y
+
+    for &(x1, x2, y) in data {
+        s11 += x1 * x1;
+        s12 += x1 * x2;
+        s22 += x2 * x2;
+        sy1 += x1 * y;
+        sy2 += x2 * y;
+    }
+
+    // Solve 2×2 system via Cramer's rule.
+    // det(X^T X) = s11 * s22 - s12²
+    let det = s11 * s22 - s12 * s12;
+
+    let (a, b) = if det.abs() < 1e-15 {
+        // Singular matrix — handle degenerate cases where one predictor
+        // is all zeros (degenerates to single-variable regression).
+        if s11 > 1e-15 && s22.abs() < 1e-15 {
+            // Only x1 has variance: y = a * x1
+            (sy1 / s11, 0.0)
+        } else if s22 > 1e-15 && s11.abs() < 1e-15 {
+            // Only x2 has variance: y = b * x2
+            (0.0, sy2 / s22)
+        } else {
+            // Both zero or truly collinear — can't fit.
+            return None;
+        }
+    } else {
+        let a = (s22 * sy1 - s12 * sy2) / det;
+        let b = (s11 * sy2 - s12 * sy1) / det;
+        (a, b)
+    };
+
+    // R² for no-intercept model: R² = 1 - SS_res / SS_tot
+    // where SS_tot = Σy² (NOT centered, since there's no intercept).
+    let mut ss_res = 0.0;
+    let mut ss_tot = 0.0;
+    for &(x1, x2, y) in data {
+        let predicted = a * x1 + b * x2;
+        ss_res += (y - predicted).powi(2);
+        ss_tot += y * y;
+    }
+
+    let r_squared = if ss_tot == 0.0 {
+        1.0
+    } else {
+        1.0 - ss_res / ss_tot
+    };
+
+    Some(TwoVarFit { a, b, r_squared })
+}
+
 /// Computes the critical path of a symbol graph at the target level.
 ///
-/// Uses rmeta pipelining: downstream targets can start when upstream rmeta
-/// is ready (after frontend), not when upstream fully completes. This
-/// accurately models Cargo's actual scheduling behavior.
+/// Only frontend time matters for scheduling — backend time (LLVM codegen)
+/// is parallel via CGUs and doesn't affect the critical path.
 ///
 /// Each compilation target (lib, test, bin, etc.) is a separate node. This
 /// naturally resolves dev-dependency "cycles" because test targets depend on
@@ -273,14 +486,19 @@ impl fmt::Display for TargetOnPath {
     reason = "core algorithm, splitting would obscure logic"
 )]
 pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
-    let (target_names, target_costs, symbol_count, graph) =
-        build_target_graph(symbol_graph);
+    let TargetGraph {
+        names: target_names,
+        effective: target_timings,
+        wall: wall_timings,
+        symbol_model: symbol_timings,
+        symbol_count,
+        graph,
+    } = build_target_graph(symbol_graph);
 
     let n = target_names.len();
     if n == 0 {
         return CriticalPathResult {
             critical_path_ms: 0.0,
-            critical_path_no_pipelining_ms: 0.0,
             path: Vec::new(),
             path_details: Vec::new(),
             all_targets: Vec::new(),
@@ -290,7 +508,7 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
         };
     }
 
-    let total_cost: f64 = target_costs.iter().map(TargetCosts::total).sum();
+    let total_cost: f64 = target_timings.iter().map(|t| t.wall_time_ms).sum();
 
     // Topological sort. With target-level analysis, the graph should always
     // be a DAG (no cycles from dev-dependencies). If there are cycles, it
@@ -300,13 +518,13 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
             "WARNING: cycle detected in target dependency graph, \
              skipping critical path computation"
         );
-        // Return early with just the target costs (no timing computed).
+        // Return early with just the target timings (no scheduling computed).
         let mut all_targets: Vec<TargetOnPath> = target_names
             .iter()
             .enumerate()
             .map(|(idx, name)| {
                 let node = NodeIndex::new(idx);
-                let costs = target_costs[idx];
+                let timings = &target_timings[idx];
                 let dependencies: Vec<String> = graph
                     .neighbors_directed(node, Direction::Incoming)
                     .map(|dep| {
@@ -315,14 +533,12 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
                     .collect();
                 TargetOnPath {
                     name: name.clone(),
-                    frontend_cost: costs.frontend,
-                    backend_cost: costs.backend,
-                    overhead_cost: costs.overhead,
-                    total_cost: costs.total(),
+                    frontend_cost: timings.wall_time_ms,
                     start_time: 0.0,
-                    rmeta_ready_time: costs.frontend,
-                    finish_time: costs.total(),
+                    finish_time: timings.wall_time_ms,
                     dependencies,
+                    wall_timings: wall_timings[idx].clone(),
+                    symbol_timings: symbol_timings[idx].clone(),
                 }
             })
             .collect();
@@ -331,7 +547,6 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
 
         return CriticalPathResult {
             critical_path_ms: total_cost,
-            critical_path_no_pipelining_ms: total_cost,
             path: Vec::new(),
             path_details: Vec::new(),
             all_targets,
@@ -341,51 +556,38 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
         };
     };
 
-    // DP with rmeta pipelining.
+    // DP scheduling: process targets in topological order.
     //
     // For each target t:
-    //   start[t] = max(rmeta_ready[dep] for dep in dependencies)
-    //   rmeta_ready[t] = start[t] + frontend_cost[t]
-    //   finish[t] = start[t] + total_cost[t]
+    //   start[t] = max(finish[dep] for dep in dependencies)
+    //   finish[t] = start[t] + wall_time_ms[t]
     //
     // The critical path is the chain of dependencies that determines the
     // latest finish time. We track predecessors based on which dependency's
-    // rmeta_ready time determined each target's start time.
+    // finish time determined each target's start time.
     let mut start: Vec<f64> = vec![0.0; n];
-    let mut rmeta_ready: Vec<f64> = vec![0.0; n];
     let mut finish: Vec<f64> = vec![0.0; n];
     let mut predecessor: Vec<Option<NodeIndex>> = vec![None; n];
 
-    // Also compute non-pipelined timing for comparison.
-    let mut finish_no_pipeline: Vec<f64> = vec![0.0; n];
-
     for &node in &sorted {
         let idx = node.index();
-        let costs = target_costs[idx];
+        let timings = &target_timings[idx];
 
-        // Find max rmeta_ready among dependencies (pipelined scheduling).
-        let mut max_dep_rmeta = 0.0f64;
-        let mut max_dep_node: Option<NodeIndex> = None;
-
-        // Also track max finish time for non-pipelined comparison.
+        // Find max finish time among dependencies.
         let mut max_dep_finish = 0.0f64;
+        let mut max_dep_node: Option<NodeIndex> = None;
 
         for dep in graph.neighbors_directed(node, Direction::Incoming) {
             let dep_idx = dep.index();
-            if rmeta_ready[dep_idx] > max_dep_rmeta {
-                max_dep_rmeta = rmeta_ready[dep_idx];
+            if finish[dep_idx] > max_dep_finish {
+                max_dep_finish = finish[dep_idx];
                 max_dep_node = Some(dep);
             }
-            max_dep_finish = max_dep_finish.max(finish[dep_idx]);
         }
 
-        start[idx] = max_dep_rmeta;
-        rmeta_ready[idx] = max_dep_rmeta + costs.frontend;
-        finish[idx] = max_dep_rmeta + costs.total();
+        start[idx] = max_dep_finish;
+        finish[idx] = max_dep_finish + timings.wall_time_ms;
         predecessor[idx] = max_dep_node;
-
-        // Non-pipelined: wait for full completion of dependencies.
-        finish_no_pipeline[idx] = max_dep_finish + costs.total();
     }
 
     // Critical path ends at the target with latest finish time.
@@ -394,9 +596,6 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
         .enumerate()
         .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
         .unwrap();
-
-    let critical_path_no_pipelining_ms =
-        finish_no_pipeline.iter().fold(0.0f64, |a, &b| a.max(b));
 
     // Reconstruct the critical path by following predecessors from the end node.
     let mut path_nodes = Vec::new();
@@ -411,7 +610,7 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
     let build_target_on_path = |idx: usize| {
         let node = NodeIndex::new(idx);
         let name = target_names.get_index(idx).unwrap().clone();
-        let costs = target_costs[idx];
+        let timings = &target_timings[idx];
 
         let dependencies: Vec<String> = graph
             .neighbors_directed(node, Direction::Incoming)
@@ -420,14 +619,12 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
 
         TargetOnPath {
             name,
-            frontend_cost: costs.frontend,
-            backend_cost: costs.backend,
-            overhead_cost: costs.overhead,
-            total_cost: costs.total(),
+            frontend_cost: timings.wall_time_ms,
             start_time: start[idx],
-            rmeta_ready_time: rmeta_ready[idx],
             finish_time: finish[idx],
             dependencies,
+            wall_timings: wall_timings[idx].clone(),
+            symbol_timings: symbol_timings[idx].clone(),
         }
     };
 
@@ -450,7 +647,6 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
 
     CriticalPathResult {
         critical_path_ms,
-        critical_path_no_pipelining_ms,
         path,
         path_details,
         all_targets,
@@ -490,68 +686,75 @@ pub fn critical_path_from_reader(
     Ok(critical_path(&symbol_graph))
 }
 
-/// Cost breakdown for a single target.
-#[derive(Debug, Clone, Copy, Default)]
-struct TargetCosts {
-    frontend: f64,
-    backend: f64,
-    overhead: f64,
-}
-
-impl TargetCosts {
-    fn total(&self) -> f64 {
-        self.frontend + self.backend + self.overhead
-    }
-}
-
-/// Builds a target-level dependency graph.
+/// Builds a target-level dependency graph with three timing views.
 ///
-/// Returns (`target_names`, `target_costs`, `symbol_count`, graph) where:
-/// - `target_names`: `IndexSet` of target identifiers (`{package}/{target}`) for O(1) lookup
-/// - `target_costs`: `Vec` of `TargetCosts` with frontend/backend/overhead breakdown
-/// - `symbol_count`: total number of symbols across all targets
-/// - `graph`: `DiGraph` where edges point from dependency targets to dependent
-///   targets (edge B → A means target A depends on target B)
-fn build_target_graph(
-    symbol_graph: &SymbolGraph,
-) -> (
-    IndexSet<String>,
-    Vec<TargetCosts>,
-    usize,
-    DiGraph<usize, ()>,
-) {
-    // Build target name index. Each target gets a unique identifier: `{package}/{target}`.
+/// Returns a [`TargetGraph`] containing:
+/// - `names`: `IndexSet` of target identifiers (`{package}/{target}`)
+/// - `effective`: timings used by the scheduler (wall-clock when profiled,
+///   per-symbol fallback otherwise)
+/// - `wall`: raw profiler wall-clock times (zeros if not profiled)
+/// - `symbol_model`: per-symbol model (frontend = sum of symbol costs)
+/// - `symbol_count`: total symbols across all targets
+/// - `graph`: `DiGraph` where edges point from dependency to dependent
+fn build_target_graph(symbol_graph: &SymbolGraph) -> TargetGraph {
+    // Build target name index. Each target gets a unique identifier:
+    // `{package}/{target}`.
     // Example: "my-package/lib", "my-package/test", "my-package/bin/cli".
     let mut target_names: IndexSet<String> = IndexSet::new();
-    let mut target_costs_map: HashMap<String, TargetCosts> = HashMap::new();
+    let mut effective_map: HashMap<String, TargetTimings> = HashMap::new();
+    let mut wall_map: HashMap<String, TargetTimings> = HashMap::new();
+    let mut symbol_model_map: HashMap<String, TargetTimings> = HashMap::new();
     let mut symbol_count = 0;
 
     for (package_name, package) in &symbol_graph.packages {
-        for (target_key, crate_data) in &package.targets {
-            // Target identifier: {package}/{target}
+        for (target_key, target_data) in &package.targets {
             let target_id = format!("{package_name}/{target_key}");
             target_names.insert(target_id.clone());
 
-            // Count symbols in this target.
-            symbol_count += count_symbols_in_module(&crate_data.root);
+            symbol_count += count_symbols_in_module(&target_data.root);
 
-            // Compute cost breakdown:
-            // - frontend: sum of all symbol frontend costs (serial)
-            // - backend: max module backend cost (parallel via CGUs)
-            // - overhead: metadata generation time
-            let costs = TargetCosts {
-                frontend: collect_frontend_cost(&crate_data.root),
-                backend: max_module_backend_cost(&crate_data.root),
-                overhead: crate_data.metadata_ms,
+            // Wall-clock: raw profiler data, may be zeros.
+            let wall = target_data.timings.clone();
+
+            // Per-symbol model: built purely from per-symbol costs.
+            // frontend = sum of all symbol event_times_ms values
+            //
+            // The validation table compares this against wall-clock to
+            // measure how much per-symbol attribution captures. The gap
+            // reveals unattributed time (crate-level work, external
+            // queries, etc.) tracked in event_times_ms but not assigned
+            // to individual symbols.
+            let symbol_model = TargetTimings {
+                wall_time_ms: collect_frontend_cost(&target_data.root),
+                event_times_ms: target_data.timings.event_times_ms.clone(),
             };
 
-            target_costs_map.insert(target_id, costs);
+            // Effective: wall-clock when profiled, per-symbol fallback
+            // otherwise. The scheduler uses these for critical path
+            // computation.
+            let effective = if wall.wall_time_ms > 0.0 {
+                wall.clone()
+            } else {
+                symbol_model.clone()
+            };
+
+            wall_map.insert(target_id.clone(), wall);
+            symbol_model_map.insert(target_id.clone(), symbol_model);
+            effective_map.insert(target_id, effective);
         }
     }
 
-    // Test targets recompile the lib code (cargo builds with --test flag), so add
-    // the lib's frontend/backend costs to test targets. This models the fact that
-    // `cargo test` doesn't reuse the lib compilation - it's a fresh build.
+    // Test targets recompile the lib code (cargo builds with --test flag),
+    // so add the lib's frontend costs to test targets. This models the fact
+    // that `cargo test` doesn't reuse the lib compilation — it's a fresh
+    // build.
+    //
+    // Augmentation rules:
+    // - `symbol_model`: always augmented (per-symbol costs only cover
+    //   test-specific code)
+    // - `effective`: augmented only when test lacks wall-clock times
+    //   (otherwise profiled time already includes lib recompilation)
+    // - `wall`: never augmented (raw profiler data, unmodified)
     for (package_name, package) in &symbol_graph.packages {
         if !package.targets.contains_key("test") {
             continue;
@@ -559,17 +762,41 @@ fn build_target_graph(
         let test_id = format!("{package_name}/test");
         let lib_id = format!("{package_name}/lib");
 
-        if let Some(lib_costs) = target_costs_map.get(&lib_id).copied()
-            && let Some(test_costs) = target_costs_map.get_mut(&test_id)
+        let test_has_wall_times = package
+            .targets
+            .get("test")
+            .is_some_and(|t| t.timings.wall_time_ms > 0.0);
+
+        // Always augment symbol_model for test targets — per-symbol costs
+        // from the test target only cover test-specific symbols, not the lib
+        // code that gets recompiled with `--test`.
+        if let Some(lib_sym) = symbol_model_map.get(&lib_id).cloned()
+            && let Some(test_sym) = symbol_model_map.get_mut(&test_id)
         {
-            test_costs.frontend += lib_costs.frontend;
-            test_costs.backend = test_costs.backend.max(lib_costs.backend);
+            test_sym.wall_time_ms += lib_sym.wall_time_ms;
+        }
+
+        // Augment effective only when test lacks profiling data.
+        if !test_has_wall_times
+            && let Some(lib_eff) = effective_map.get(&lib_id).cloned()
+            && let Some(test_eff) = effective_map.get_mut(&test_id)
+        {
+            test_eff.wall_time_ms += lib_eff.wall_time_ms;
         }
     }
 
-    let costs: Vec<TargetCosts> = target_names
+    // Collect timing vectors in target_names order.
+    let effective: Vec<TargetTimings> = target_names
         .iter()
-        .map(|name| target_costs_map.get(name).copied().unwrap_or_default())
+        .map(|name| effective_map.get(name).cloned().unwrap_or_default())
+        .collect();
+    let wall: Vec<TargetTimings> = target_names
+        .iter()
+        .map(|name| wall_map.get(name).cloned().unwrap_or_default())
+        .collect();
+    let symbol_model: Vec<TargetTimings> = target_names
+        .iter()
+        .map(|name| symbol_model_map.get(name).cloned().unwrap_or_default())
         .collect();
 
     // Build target dependency graph.
@@ -579,16 +806,16 @@ fn build_target_graph(
     }
 
     // For each target, add edges from its dependencies.
-    // Dependencies come from cargo metadata (crate_data.dependencies) in
+    // Dependencies come from cargo metadata (target_data.dependencies) in
     // "package/target" format (e.g., "tokio/lib", "serde/lib").
     for (package_name, package) in &symbol_graph.packages {
-        for (target_key, crate_data) in &package.targets {
+        for (target_key, target_data) in &package.targets {
             let target_id = format!("{package_name}/{target_key}");
             let Some(target_idx) = target_names.get_index_of(&target_id) else {
                 continue;
             };
 
-            for dep_target in &crate_data.dependencies {
+            for dep_target in &target_data.dependencies {
                 // Skip self-dependencies and unknown targets.
                 if dep_target == &target_id {
                     continue;
@@ -605,16 +832,23 @@ fn build_target_graph(
         }
     }
 
-    (target_names, costs, symbol_count, graph)
+    TargetGraph {
+        names: target_names,
+        effective,
+        wall,
+        symbol_model,
+        symbol_count,
+        graph,
+    }
 }
 
 /// Collects total frontend cost across all symbols in a module tree.
-/// Frontend work is serial, so we sum all costs.
+/// Frontend work is serial, so we sum all `event_times_ms` values per symbol.
 fn collect_frontend_cost(module: &Module) -> f64 {
     let mut total = 0.0;
 
     for symbol in module.symbols.values() {
-        total += symbol.frontend_cost_ms;
+        total += sum_event_times(&symbol.event_times_ms);
     }
 
     for submodule in module.submodules.values() {
@@ -624,26 +858,40 @@ fn collect_frontend_cost(module: &Module) -> f64 {
     total
 }
 
-/// Computes the maximum backend cost across all modules.
+/// Formats a millisecond duration as a human-readable string.
 ///
-/// Backend work is parallel via CGUs (roughly 2 per module). The wall-clock
-/// backend time is determined by the slowest module, not the sum.
+/// Uses `jiff::SignedDuration` with `SpanPrinter` configured for sign-prefix
+/// style (`Direction::Sign`), producing `"-1m 10s"` instead of `"1m 10s ago"`.
 ///
-/// For a module tree, we compute backend cost at each level and take the max.
-fn max_module_backend_cost(module: &Module) -> f64 {
-    // Backend cost for this module = sum of its direct symbols' backend costs.
-    let this_module_cost: f64 =
-        module.symbols.values().map(|s| s.backend_cost_ms).sum();
+/// Values ≥ 1s are rounded to the nearest second for cleaner output.
+/// Sub-second values keep millisecond precision (rounding would lose all
+/// information).
+fn format_duration_ms(ms: f64) -> String {
+    use jiff::fmt::friendly::{Direction, SpanPrinter};
 
-    // Recursively get max backend cost from submodules.
-    let max_submodule_cost = module
-        .submodules
-        .values()
-        .map(max_module_backend_cost)
-        .fold(0.0f64, f64::max);
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "practical durations are well within i64 range"
+    )]
+    let mut dur = jiff::SignedDuration::from_millis(ms.round() as i64);
 
-    // The effective backend time is the max of this module and any submodule.
-    this_module_cost.max(max_submodule_cost)
+    // Round to seconds when ≥ 1s; keep milliseconds for sub-second values.
+    if dur.abs() >= jiff::SignedDuration::from_secs(1) {
+        dur = dur.round(jiff::Unit::Second).unwrap();
+    }
+    SpanPrinter::new()
+        .direction(Direction::Sign)
+        .duration_to_string(&dur)
+}
+
+/// Truncates a target name to fit within `max_len` characters.
+/// If truncation is needed, replaces the last 3 characters with "...".
+fn truncate_name(name: &str, max_len: usize) -> String {
+    if name.len() <= max_len {
+        name.to_string()
+    } else {
+        format!("{}...", &name[..max_len - 3])
+    }
 }
 
 /// Counts symbols in a module tree.
@@ -661,17 +909,15 @@ mod tests {
 
     use super::*;
 
-    /// Creates a symbol with only frontend cost (backend = 0).
+    /// Creates a symbol with the given frontend cost.
+    /// The cost is stored in `event_times_ms` under the `"typeck"` key.
     fn make_symbol(frontend_cost: f64) -> Symbol {
-        make_symbol_split(frontend_cost, 0.0)
-    }
-
-    /// Creates a symbol with separate frontend and backend costs.
-    fn make_symbol_split(frontend: f64, backend: f64) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
-            frontend_cost_ms: frontend,
-            backend_cost_ms: backend,
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                frontend_cost,
+            )]),
             dependencies: std::collections::HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -697,13 +943,13 @@ mod tests {
         make_crate_with_deps(root, &[])
     }
 
-    /// Creates a crate with the given root module and specified overhead.
-    fn make_crate_with_overhead(
+    /// Creates a crate with the given root module and wall-clock timings.
+    fn make_crate_with_timings(
         root: Module,
-        metadata_ms: f64,
+        timings: TargetTimings,
     ) -> tarjanize_schemas::Crate {
         tarjanize_schemas::Crate {
-            metadata_ms,
+            timings,
             root,
             ..Default::default()
         }
@@ -761,113 +1007,41 @@ mod tests {
     }
 
     #[test]
-    fn test_backend_summed_within_module() {
-        // Within a module, backend costs are summed (same CGU).
-        // Across modules, we take max (parallel CGUs).
+    fn test_single_target_with_event_times_ms() {
+        // Symbol model uses per-symbol costs, not event_times_ms.
+        // event_times_ms are preserved for validation/reporting but don't
+        // affect scheduling.
         //
-        // Here we have one module with two symbols:
-        // - frontend: 10 + 10 = 20 (always summed)
-        // - backend: 100 + 50 = 150 (summed within module)
-        // - total: 20 + 150 = 170
-        let mut symbols = HashMap::new();
-        symbols.insert("foo".to_string(), make_symbol_split(10.0, 100.0));
-        symbols.insert("bar".to_string(), make_symbol_split(10.0, 50.0));
-
-        let mut crates = HashMap::new();
-        crates.insert(
-            "my-pkg".to_string(),
-            make_crate(Module {
-                symbols,
-                submodules: HashMap::new(),
-            }),
-        );
-
-        let graph = make_graph(crates);
-        let result = critical_path(&graph);
-
-        assert!((result.critical_path_ms - 170.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    #[expect(
-        clippy::similar_names,
-        reason = "mod_a/mod_b are intentionally parallel"
-    )]
-    fn test_backend_max_across_submodules() {
-        // Submodules compile in parallel - take max of their backend costs.
-        //
-        // root module: frontend=5, backend=10
-        // submodule A: frontend=5, backend=100
-        // submodule B: frontend=5, backend=50
-        //
-        // frontend = 5 + 5 + 5 = 15 (sum all)
-        // backend = max(10, 100, 50) = 100 (max across modules)
-        // total = 115
-        let mut root_symbols = HashMap::new();
-        root_symbols
-            .insert("root_fn".to_string(), make_symbol_split(5.0, 10.0));
-
-        let mut mod_a_symbols = HashMap::new();
-        mod_a_symbols.insert("a_fn".to_string(), make_symbol_split(5.0, 100.0));
-
-        let mut mod_b_symbols = HashMap::new();
-        mod_b_symbols.insert("b_fn".to_string(), make_symbol_split(5.0, 50.0));
-
-        let mut submodules = HashMap::new();
-        submodules.insert(
-            "mod_a".to_string(),
-            Module {
-                symbols: mod_a_symbols,
-                submodules: HashMap::new(),
-            },
-        );
-        submodules.insert(
-            "mod_b".to_string(),
-            Module {
-                symbols: mod_b_symbols,
-                submodules: HashMap::new(),
-            },
-        );
-
-        let mut crates = HashMap::new();
-        crates.insert(
-            "my-pkg".to_string(),
-            make_crate(Module {
-                symbols: root_symbols,
-                submodules,
-            }),
-        );
-
-        let graph = make_graph(crates);
-        let result = critical_path(&graph);
-
-        // frontend = 15, backend = max(10, 100, 50) = 100
-        assert!((result.critical_path_ms - 115.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn test_target_overhead_included() {
-        // Target with metadata overhead.
+        // Per-symbol frontend: foo = 10.
+        // event_times_ms: typeck=10, check_mod_type_wf=3 (total 13).
+        // Critical path uses per-symbol sum = 10.
         let mut symbols = HashMap::new();
         symbols.insert("foo".to_string(), make_symbol(10.0));
 
+        let mut event_times_ms = HashMap::new();
+        event_times_ms.insert("typeck".to_string(), 10.0);
+        event_times_ms.insert("check_mod_type_wf".to_string(), 3.0);
+
         let mut crates = HashMap::new();
         crates.insert(
             "my-pkg".to_string(),
-            make_crate_with_overhead(
+            make_crate_with_timings(
                 Module {
                     symbols,
                     submodules: HashMap::new(),
                 },
-                3.0,
+                TargetTimings {
+                    event_times_ms,
+                    ..Default::default()
+                },
             ),
         );
 
         let graph = make_graph(crates);
         let result = critical_path(&graph);
 
-        // frontend(10) + backend(0) + metadata(3) = 13
-        assert!((result.critical_path_ms - 13.0).abs() < f64::EPSILON);
+        // Per-symbol frontend sum = 10 (event_times_ms don't affect scheduling).
+        assert!((result.critical_path_ms - 10.0).abs() < f64::EPSILON);
     }
 
     #[test]
@@ -1217,83 +1391,907 @@ mod tests {
     }
 
     #[test]
-    fn test_rmeta_pipelining_benefit() {
-        // This test demonstrates the benefit of rmeta pipelining.
+    fn test_wall_clock_chain() {
+        // When wall-clock times are available, scheduling uses them directly.
         //
         // Setup:
-        // - pkg-a/lib: frontend=100, backend=50 (total=150)
-        // - pkg-b/lib: frontend=30, backend=0 (total=30), depends on pkg-a/lib
+        // - pkg-a/lib: frontend=120
+        // - pkg-b/lib: frontend=30, depends on pkg-a/lib
         //
-        // Without pipelining (wait for full completion):
-        //   pkg-a finishes at 150, pkg-b starts at 150, finishes at 180
-        //   Critical path = 180
-        //
-        // With pipelining (wait for rmeta only):
-        //   pkg-a: rmeta ready at 100, finish at 150
-        //   pkg-b: starts at 100, finishes at 130
-        //   Critical path = max(150, 130) = 150
-        //
-        // The 30ms improvement comes from pkg-b running during pkg-a's backend.
+        // Critical path: pkg-a(120) → pkg-b(30) = 150
 
         let mut symbols_a = HashMap::new();
-        symbols_a.insert(
-            "a".to_string(),
-            make_symbol_split(100.0, 50.0), // frontend=100, backend=50
-        );
+        symbols_a.insert("a".to_string(), make_symbol(1.0));
 
         let mut symbols_b = HashMap::new();
-        symbols_b.insert(
-            "b".to_string(),
-            make_symbol(30.0), // frontend=30, backend=0
-        );
+        symbols_b.insert("b".to_string(), make_symbol(1.0));
 
         let mut crates = HashMap::new();
         crates.insert(
             "pkg-a".to_string(),
-            make_crate(Module {
-                symbols: symbols_a,
-                submodules: HashMap::new(),
-            }),
+            make_crate_with_timings(
+                Module {
+                    symbols: symbols_a,
+                    submodules: HashMap::new(),
+                },
+                TargetTimings {
+                    wall_time_ms: 120.0,
+                    ..Default::default()
+                },
+            ),
         );
         crates.insert(
             "pkg-b".to_string(),
+            tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: 30.0,
+                    ..Default::default()
+                },
+                root: Module {
+                    symbols: symbols_b,
+                    submodules: HashMap::new(),
+                },
+                dependencies: ["pkg-a/lib".to_string()].into_iter().collect(),
+            },
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // Critical path = 120 + 30 = 150
+        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
+
+        let pkg_a = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-a/lib")
+            .unwrap();
+        assert!((pkg_a.finish_time - 120.0).abs() < f64::EPSILON);
+
+        // pkg-b starts when pkg-a finishes (120), finishes at 150
+        let pkg_b = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-b/lib")
+            .unwrap();
+        assert!((pkg_b.start_time - 120.0).abs() < f64::EPSILON);
+        assert!((pkg_b.finish_time - 150.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wall_time_used_when_available() {
+        // When TargetTimings has non-zero wall_time_ms, wall-clock times
+        // should be used directly instead of computing from per-symbol costs.
+        //
+        // Setup: one target with per-symbol costs that differ from wall-clock.
+        // - Per-symbol: frontend=10 (sum)
+        // - Wall-clock: frontend=25
+        //
+        // The cost model should use wall-clock frontend (25), not per-symbol (10).
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let crate_data = tarjanize_schemas::Crate {
+            timings: TargetTimings {
+                wall_time_ms: 25.0,
+                ..Default::default()
+            },
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let mut crates = HashMap::new();
+        crates.insert("my-pkg".to_string(), crate_data);
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // Should use wall-clock frontend (25), not per-symbol (10).
+        assert!((result.critical_path_ms - 25.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_zero_wall_time_falls_back_to_per_symbol() {
+        // When wall_time_ms is 0 (synthetic crate or no profiling),
+        // the cost model falls back to per-symbol computation.
+        //
+        // Setup: one target with wall_time_ms=0 but has symbol costs.
+        // - Per-symbol: frontend=25+15=40
+        // - Expected: frontend=40
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(25.0));
+        symbols.insert("bar".to_string(), make_symbol(15.0));
+
+        let crate_data = tarjanize_schemas::Crate {
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let mut crates = HashMap::new();
+        crates.insert("my-pkg".to_string(), crate_data);
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // Fallback: frontend=40
+        assert!((result.critical_path_ms - 40.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn test_wall_time_test_target_no_double_count() {
+        // When wall-clock times are available from profiling, test targets
+        // should NOT have lib costs added, because `rustc --test` recompiles
+        // the entire crate (lib + test code). The profiled wall-clock time
+        // for the test target already includes lib code compilation.
+        //
+        // Setup:
+        // - pkg-a/lib: wall-clock frontend=100
+        // - pkg-a/test: wall-clock frontend=150 (already includes lib's 100),
+        //   depends on pkg-a/lib
+        //
+        // Expected: test effective frontend = 150 (NOT 150 + 100 = 250)
+        // Critical path: lib(100) → test(150) = 250
+
+        let mut lib_symbols = HashMap::new();
+        lib_symbols.insert("lib_fn".to_string(), make_symbol(1.0));
+
+        let mut test_symbols = HashMap::new();
+        test_symbols.insert("test_fn".to_string(), make_symbol(1.0));
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "lib".to_string(),
+            tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: 100.0,
+                    ..Default::default()
+                },
+                root: Module {
+                    symbols: lib_symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            },
+        );
+        targets.insert(
+            "test".to_string(),
+            tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: 150.0, // Already includes lib's 100ms
+                    ..Default::default()
+                },
+                root: Module {
+                    symbols: test_symbols,
+                    submodules: HashMap::new(),
+                },
+                dependencies: ["pkg-a/lib".to_string()].into_iter().collect(),
+            },
+        );
+
+        let mut packages = HashMap::new();
+        packages.insert("pkg-a".to_string(), Package { targets });
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        // Test's wall-clock frontend is 150 (already includes lib).
+        // It should NOT be augmented to 250.
+        //
+        // lib: start=0, finish=100
+        // test: start=100 (after lib finishes), finish=100+150=250
+        // Critical path = 250
+        let test_target = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-a/test")
+            .unwrap();
+
+        assert!(
+            (test_target.frontend_cost - 150.0).abs() < f64::EPSILON,
+            "Test frontend should be 150 (wall-clock, already includes lib), \
+             got {} (likely double-counted)",
+            test_target.frontend_cost
+        );
+        assert!(
+            (result.critical_path_ms - 250.0).abs() < f64::EPSILON,
+            "Critical path should be 250, got {}",
+            result.critical_path_ms
+        );
+    }
+
+    #[test]
+    fn test_lib_wall_clock_test_per_symbol_augments() {
+        // When lib has wall-clock times but test uses per-symbol fallback,
+        // the test target SHOULD be augmented with lib costs. The test
+        // target's per-symbol costs only cover test-specific code, not the
+        // lib code that gets recompiled with `--test`.
+        //
+        // Setup:
+        // - pkg-a/lib: wall-clock frontend=100
+        // - pkg-a/test: per-symbol frontend=20 (test-only code)
+        //   After augmentation: frontend=20+100=120
+
+        let mut lib_symbols = HashMap::new();
+        lib_symbols.insert("lib_fn".to_string(), make_symbol(1.0));
+
+        let mut test_symbols = HashMap::new();
+        test_symbols.insert("test_fn".to_string(), make_symbol(20.0));
+
+        let mut targets = HashMap::new();
+        targets.insert(
+            "lib".to_string(),
+            tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: 100.0,
+                    ..Default::default()
+                },
+                root: Module {
+                    symbols: lib_symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            },
+        );
+        targets.insert(
+            "test".to_string(),
+            // No wall-clock times → per-symbol fallback.
             make_crate_with_deps(
                 Module {
-                    symbols: symbols_b,
+                    symbols: test_symbols,
                     submodules: HashMap::new(),
                 },
                 &["pkg-a/lib"],
             ),
         );
 
+        let mut packages = HashMap::new();
+        packages.insert("pkg-a".to_string(), Package { targets });
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        let test_target = result
+            .all_targets
+            .iter()
+            .find(|t| t.name == "pkg-a/test")
+            .unwrap();
+
+        // Per-symbol frontend (20) + lib wall-clock frontend (100) = 120.
+        assert!(
+            (test_target.frontend_cost - 120.0).abs() < f64::EPSILON,
+            "Test frontend should be augmented to 120, got {}",
+            test_target.frontend_cost
+        );
+    }
+
+    #[test]
+    fn test_scheduling_uses_wall_time_ms() {
+        // Verify that scheduling uses wall_time_ms:
+        //   finish = start + wall_time_ms
+        //
+        // Setup: single target with wall-clock frontend=40.
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(1.0));
+
+        let crate_data = tarjanize_schemas::Crate {
+            timings: TargetTimings {
+                wall_time_ms: 40.0,
+                ..Default::default()
+            },
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let mut crates = HashMap::new();
+        crates.insert("my-pkg".to_string(), crate_data);
+
         let graph = make_graph(crates);
         let result = critical_path(&graph);
 
-        // With pipelining: critical path = 150 (pkg-a's total cost)
-        assert!((result.critical_path_ms - 150.0).abs() < f64::EPSILON);
+        let target = &result.all_targets[0];
 
-        // Without pipelining: would be 180 (pkg-a 150 + pkg-b 30)
         assert!(
-            (result.critical_path_no_pipelining_ms - 180.0).abs()
-                < f64::EPSILON
+            (target.start_time).abs() < f64::EPSILON,
+            "start should be 0, got {}",
+            target.start_time
+        );
+        assert!(
+            (target.finish_time - 40.0).abs() < f64::EPSILON,
+            "finish should be frontend = 40, got {}",
+            target.finish_time
+        );
+        assert!(
+            (target.frontend_cost - 40.0).abs() < f64::EPSILON,
+            "frontend_cost should be 40, got {}",
+            target.frontend_cost
+        );
+    }
+
+    #[test]
+    fn test_validation_both_timings_populated() {
+        // When a target has both wall-clock and per-symbol data, both
+        // should be available in TargetOnPath for comparison. The
+        // effective timings (used by the scheduler) should use wall-clock,
+        // but the per-symbol model timings should also be populated.
+        //
+        // Setup: one target with wall-clock frontend=25 and per-symbol
+        // frontend=10.
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let crate_data = tarjanize_schemas::Crate {
+            timings: TargetTimings {
+                wall_time_ms: 25.0,
+                ..Default::default()
+            },
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let mut crates = HashMap::new();
+        crates.insert("my-pkg".to_string(), crate_data);
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        let target = &result.all_targets[0];
+
+        // Effective (scheduler) uses wall-clock frontend.
+        assert!(
+            (target.frontend_cost - 25.0).abs() < f64::EPSILON,
+            "effective frontend should be wall-clock 25, got {}",
+            target.frontend_cost
         );
 
-        // Verify timing details for pkg-b.
-        let pkg_b = result
+        // Wall timings should match profiler data exactly.
+        assert!(
+            (target.wall_timings.wall_time_ms - 25.0).abs() < f64::EPSILON,
+            "wall frontend should be 25, got {}",
+            target.wall_timings.wall_time_ms
+        );
+
+        // Symbol model timings should be computed from per-symbol costs.
+        assert!(
+            (target.symbol_timings.wall_time_ms - 10.0).abs() < f64::EPSILON,
+            "symbol frontend should be 10, got {}",
+            target.symbol_timings.wall_time_ms
+        );
+    }
+
+    #[test]
+    fn test_validation_table_appears_with_wall_data() {
+        // Verify that the validation table is emitted when wall-clock
+        // data is present.
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let crate_data = tarjanize_schemas::Crate {
+            timings: TargetTimings {
+                wall_time_ms: 50.0,
+                ..Default::default()
+            },
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        let mut crates = HashMap::new();
+        crates.insert("my-pkg".to_string(), crate_data);
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        let mut output = Vec::new();
+        result.write_report(&mut output).unwrap();
+        let report = String::from_utf8(output).unwrap();
+
+        assert!(
+            report.contains("Model validation"),
+            "report should contain validation table when wall data exists"
+        );
+        assert!(
+            report.contains("my-pkg/lib"),
+            "validation table should contain the target name"
+        );
+        assert!(
+            report.contains("Actual"),
+            "validation table should have Actual column"
+        );
+    }
+
+    #[test]
+    fn test_validation_table_absent_without_wall_data() {
+        // No wall-clock data → no validation table.
+
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my-pkg".to_string(),
+            make_crate(Module {
+                symbols,
+                submodules: HashMap::new(),
+            }),
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        let mut output = Vec::new();
+        result.write_report(&mut output).unwrap();
+        let report = String::from_utf8(output).unwrap();
+
+        assert!(
+            !report.contains("Model validation"),
+            "report should NOT contain validation table without wall data"
+        );
+    }
+
+    #[test]
+    fn test_event_times_ms_dont_affect_scheduling() {
+        // event_times_ms are preserved for validation but the symbol model
+        // uses per-symbol costs for scheduling, regardless of what
+        // event_times_ms contains.
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let mut event_times_ms = HashMap::new();
+        // Frontend events total 15, backend events total 28.
+        // None of these affect scheduling — only per-symbol costs do.
+        event_times_ms.insert("typeck".to_string(), 10.0);
+        event_times_ms.insert("check_mod_type_wf".to_string(), 5.0);
+        event_times_ms.insert("LLVM_module_codegen".to_string(), 20.0);
+        event_times_ms.insert("link_crate".to_string(), 8.0);
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my-pkg".to_string(),
+            make_crate_with_timings(
+                Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                TargetTimings {
+                    event_times_ms,
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // Per-symbol: frontend=10, backend=0. event_times_ms ignored.
+        assert!(
+            (result.critical_path_ms - 10.0).abs() < f64::EPSILON,
+            "Expected 10 (per-symbol only), got {}",
+            result.critical_path_ms
+        );
+    }
+
+    #[test]
+    fn test_event_times_ms_dont_override_per_symbol_sum() {
+        // Even when event_times_ms contains more time than per-symbol
+        // costs (due to unattributed work), the symbol model always
+        // uses per-symbol costs. The gap between event_times_ms total
+        // and per-symbol sum is visible in the validation table.
+        let mut symbols = HashMap::new();
+        // Per-symbol total: 10 + 20 = 30.
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+        symbols.insert("bar".to_string(), make_symbol(20.0));
+
+        let mut event_times_ms = HashMap::new();
+        // event_times_ms total: 30 + 15 = 45 (includes 15ms of
+        // unattributed check_mod_type_wf time).
+        event_times_ms.insert("typeck".to_string(), 30.0);
+        event_times_ms.insert("check_mod_type_wf".to_string(), 15.0);
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my-pkg".to_string(),
+            make_crate_with_timings(
+                Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                TargetTimings {
+                    event_times_ms,
+                    ..Default::default()
+                },
+            ),
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // Per-symbol sum (30) is used, not event_times_ms total (45).
+        assert!(
+            (result.critical_path_ms - 30.0).abs() < f64::EPSILON,
+            "Expected per-symbol sum = 30, got {} \
+             (event_times_ms total would be 45)",
+            result.critical_path_ms
+        );
+    }
+
+    #[test]
+    fn test_event_times_ms_with_chain() {
+        // event_times_ms don't affect scheduling — only per-symbol frontend
+        // costs matter. This test verifies scheduling with per-symbol
+        // costs even when event_times_ms are present.
+        //
+        // pkg-a/lib: per-symbol frontend=30
+        //            event_times_ms frontend=50 (ignored for scheduling)
+        // pkg-b/lib: per-symbol frontend=10, depends on pkg-a/lib
+        //
+        // Critical path: pkg-a(30) → pkg-b(10) = 40
+        let mut symbols_a = HashMap::new();
+        symbols_a.insert("a".to_string(), make_symbol(30.0));
+
+        let mut event_times_ms_a = HashMap::new();
+        event_times_ms_a.insert("typeck".to_string(), 35.0);
+        event_times_ms_a.insert("resolve_instance".to_string(), 15.0);
+
+        let mut symbols_b = HashMap::new();
+        symbols_b.insert("b".to_string(), make_symbol(10.0));
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "pkg-a".to_string(),
+            make_crate_with_timings(
+                Module {
+                    symbols: symbols_a,
+                    submodules: HashMap::new(),
+                },
+                TargetTimings {
+                    event_times_ms: event_times_ms_a,
+                    ..Default::default()
+                },
+            ),
+        );
+        crates.insert(
+            "pkg-b".to_string(),
+            tarjanize_schemas::Crate {
+                root: Module {
+                    symbols: symbols_b,
+                    submodules: HashMap::new(),
+                },
+                dependencies: ["pkg-a/lib".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        // pkg-a: frontend=30 (per-symbol)
+        // pkg-b: frontend=10, starts at 30 (after pkg-a finishes)
+        // Critical path = 30 + 10 = 40
+        assert!(
+            (result.critical_path_ms - 40.0).abs() < f64::EPSILON,
+            "Expected 40, got {}",
+            result.critical_path_ms
+        );
+
+        let pkg_a = result
             .all_targets
             .iter()
             .find(|t| t.name == "pkg-a/lib")
             .unwrap();
-        assert!((pkg_b.start_time - 0.0).abs() < f64::EPSILON);
-        assert!((pkg_b.rmeta_ready_time - 100.0).abs() < f64::EPSILON);
-        assert!((pkg_b.finish_time - 150.0).abs() < f64::EPSILON);
+        assert!(
+            (pkg_a.finish_time - 30.0).abs() < f64::EPSILON,
+            "pkg-a finish should be at 30 (per-symbol frontend)",
+        );
+    }
 
-        let pkg_b = result
-            .all_targets
-            .iter()
-            .find(|t| t.name == "pkg-b/lib")
-            .unwrap();
-        assert!((pkg_b.start_time - 100.0).abs() < f64::EPSILON); // starts when pkg-a rmeta ready
-        assert!((pkg_b.finish_time - 130.0).abs() < f64::EPSILON);
+    // =========================================================================
+    // two_var_fit tests
+    // =========================================================================
+
+    #[test]
+    fn test_validation_includes_two_var_fit() {
+        // Build 4 targets with wall-clock data and metadata decode events.
+        // The two-variable fit and per-target predictions should appear.
+        let mut packages = HashMap::new();
+        for (pkg, sym_cost, meta_cost, wall) in [
+            ("a", 100.0, 20.0, 400.0),
+            ("b", 50.0, 40.0, 280.0),
+            ("c", 200.0, 10.0, 700.0),
+            ("d", 30.0, 80.0, 330.0),
+        ] {
+            let mut symbols = HashMap::new();
+            symbols.insert("fn1".to_string(), make_symbol(sym_cost));
+
+            let mut event_times_ms = HashMap::new();
+            event_times_ms.insert(
+                "metadata_decode_entry_generics_of".to_string(),
+                meta_cost,
+            );
+
+            let crate_data = tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: wall,
+                    event_times_ms,
+                },
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            };
+
+            let mut targets = HashMap::new();
+            targets.insert("lib".to_string(), crate_data);
+            packages.insert(pkg.to_string(), Package { targets });
+        }
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        let mut output = Vec::new();
+        result.write_report(&mut output).unwrap();
+        let report = String::from_utf8(output).unwrap();
+
+        assert!(
+            report.contains("Two-var fit:"),
+            "report should contain two-variable fit when profiling data \
+             has metadata decode events. Report:\n{report}",
+        );
+        assert!(
+            report.contains("R² (two-var):"),
+            "report should contain two-variable R²",
+        );
+        // The table should show prediction columns.
+        assert!(
+            report.contains("Predicted"),
+            "report should contain Predicted column. Report:\n{report}",
+        );
+        assert!(
+            report.contains("Delta"),
+            "report should contain Delta column. Report:\n{report}",
+        );
+        assert!(
+            report.contains("Error%"),
+            "report should contain Error% column. Report:\n{report}",
+        );
+    }
+
+    #[test]
+    fn test_two_var_fit_perfect() {
+        // wall = 3·attr + 2·meta, 5 data points → R²=1.0, a=3.0, b=2.0
+        let data: Vec<(f64, f64, f64)> = vec![
+            (1.0, 1.0, 5.0),   // 3*1 + 2*1 = 5
+            (2.0, 3.0, 12.0),  // 3*2 + 2*3 = 12
+            (4.0, 1.0, 14.0),  // 3*4 + 2*1 = 14
+            (0.5, 5.0, 11.5),  // 3*0.5 + 2*5 = 11.5
+            (10.0, 2.0, 34.0), // 3*10 + 2*2 = 34
+        ];
+        let fit = two_var_fit(&data).expect("should fit");
+        assert!((fit.a - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", fit.a,);
+        assert!((fit.b - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", fit.b,);
+        assert!(
+            (fit.r_squared - 1.0).abs() < 1e-10,
+            "Expected R²=1.0, got {}",
+            fit.r_squared,
+        );
+    }
+
+    #[test]
+    fn test_two_var_fit_zero_metadata() {
+        // All metadata values zero → degenerates to wall = a·attr.
+        let data: Vec<(f64, f64, f64)> = vec![
+            (1.0, 0.0, 3.0),
+            (2.0, 0.0, 6.0),
+            (5.0, 0.0, 15.0),
+            (10.0, 0.0, 30.0),
+        ];
+        let fit = two_var_fit(&data).expect("should fit");
+        assert!((fit.a - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", fit.a,);
+        // b is irrelevant when all x2=0, but coefficient is well-defined (0).
+        assert!(
+            (fit.r_squared - 1.0).abs() < 1e-10,
+            "Expected R²=1.0, got {}",
+            fit.r_squared,
+        );
+    }
+
+    #[test]
+    fn test_two_var_fit_zero_attribution() {
+        // All attr values zero → degenerates to wall = b·meta.
+        let data: Vec<(f64, f64, f64)> = vec![
+            (0.0, 1.0, 2.0),
+            (0.0, 3.0, 6.0),
+            (0.0, 5.0, 10.0),
+            (0.0, 10.0, 20.0),
+        ];
+        let fit = two_var_fit(&data).expect("should fit");
+        assert!((fit.b - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", fit.b,);
+        assert!(
+            (fit.r_squared - 1.0).abs() < 1e-10,
+            "Expected R²=1.0, got {}",
+            fit.r_squared,
+        );
+    }
+
+    #[test]
+    fn test_two_var_fit_insufficient_data() {
+        // Fewer than 3 points → None.
+        assert!(two_var_fit(&[]).is_none());
+        assert!(two_var_fit(&[(1.0, 2.0, 3.0)]).is_none());
+        assert!(two_var_fit(&[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]).is_none());
+    }
+
+    #[test]
+    fn test_two_var_fit_realistic() {
+        // Simulated data with a≈3.4, b≈2.8 and some noise.
+        // Points generated as: wall ≈ 3.4·attr + 2.8·meta + noise
+        let data: Vec<(f64, f64, f64)> = vec![
+            (100.0, 20.0, 398.0),   // 3.4*100 + 2.8*20 = 396
+            (50.0, 40.0, 283.0),    // 3.4*50 + 2.8*40 = 282
+            (200.0, 10.0, 710.0),   // 3.4*200 + 2.8*10 = 708
+            (30.0, 80.0, 325.0),    // 3.4*30 + 2.8*80 = 326
+            (150.0, 50.0, 651.0),   // 3.4*150 + 2.8*50 = 650
+            (500.0, 100.0, 1982.0), // 3.4*500 + 2.8*100 = 1980
+            (10.0, 5.0, 49.0),      // 3.4*10 + 2.8*5 = 48
+        ];
+        let fit = two_var_fit(&data).expect("should fit");
+        assert!(
+            fit.r_squared > 0.99,
+            "Expected R² > 0.99, got {}",
+            fit.r_squared,
+        );
+        // Coefficients should be close to 3.4 and 2.8.
+        assert!((fit.a - 3.4).abs() < 0.1, "Expected a ≈ 3.4, got {}", fit.a,);
+        assert!((fit.b - 2.8).abs() < 0.1, "Expected b ≈ 2.8, got {}", fit.b,);
+    }
+
+    // =========================================================================
+    // format_duration_ms tests
+    // =========================================================================
+
+    #[test]
+    fn test_format_duration_ms() {
+        // Zero and sub-second.
+        assert_eq!(format_duration_ms(0.0), "0s");
+        assert_eq!(format_duration_ms(499.0), "499ms");
+
+        // >= 1s: rounded to nearest second.
+        assert_eq!(format_duration_ms(1_000.0), "1s");
+        assert_eq!(format_duration_ms(1_500.0), "2s");
+        assert_eq!(format_duration_ms(14_300.0), "14s");
+
+        // Minutes and seconds.
+        assert_eq!(format_duration_ms(60_000.0), "1m");
+        assert_eq!(format_duration_ms(70_000.0), "1m 10s");
+        assert_eq!(format_duration_ms(116_000.0), "1m 56s");
+
+        // Hours.
+        assert_eq!(format_duration_ms(3_600_000.0), "1h");
+        assert_eq!(format_duration_ms(3_661_000.0), "1h 1m 1s");
+        assert_eq!(format_duration_ms(7_320_000.0), "2h 2m");
+
+        // Negative values (deltas) — sign prefix, not "ago".
+        assert_eq!(format_duration_ms(-1_500.0), "-2s");
+        assert_eq!(format_duration_ms(-70_000.0), "-1m 10s");
+    }
+
+    // =========================================================================
+    // lib-only fit tests
+    // =========================================================================
+
+    #[test]
+    fn test_validation_fit_lib_only() {
+        // Mix of lib and non-lib targets. Model should fit on lib targets
+        // only, but predictions should appear for all targets.
+        let mut packages = HashMap::new();
+
+        // 4 lib targets — enough for fitting.
+        for (pkg, sym_cost, meta_cost, wall) in [
+            ("a", 100.0, 20.0, 400.0),
+            ("b", 50.0, 40.0, 280.0),
+            ("c", 200.0, 10.0, 700.0),
+            ("d", 30.0, 80.0, 330.0),
+        ] {
+            let mut symbols = HashMap::new();
+            symbols.insert("fn1".to_string(), make_symbol(sym_cost));
+
+            let mut event_times_ms = HashMap::new();
+            event_times_ms.insert(
+                "metadata_decode_entry_generics_of".to_string(),
+                meta_cost,
+            );
+
+            let crate_data = tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: wall,
+                    event_times_ms,
+                },
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            };
+
+            let mut targets = HashMap::new();
+            targets.insert("lib".to_string(), crate_data);
+            packages.insert(pkg.to_string(), Package { targets });
+        }
+
+        // Add 1 test target (non-lib) with profiling data to package "a".
+        let mut test_symbols = HashMap::new();
+        test_symbols.insert("test_fn".to_string(), make_symbol(60.0));
+
+        let mut test_event_times = HashMap::new();
+        test_event_times
+            .insert("metadata_decode_entry_generics_of".to_string(), 15.0);
+
+        let test_crate = tarjanize_schemas::Crate {
+            timings: TargetTimings {
+                wall_time_ms: 250.0,
+                event_times_ms: test_event_times,
+            },
+            root: Module {
+                symbols: test_symbols,
+                submodules: HashMap::new(),
+            },
+            ..Default::default()
+        };
+
+        packages
+            .get_mut("a")
+            .unwrap()
+            .targets
+            .insert("test".to_string(), test_crate);
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        let mut output = Vec::new();
+        result.write_report(&mut output).unwrap();
+        let report = String::from_utf8(output).unwrap();
+
+        // Header should show lib target count.
+        assert!(
+            report.contains("fit on 4 lib targets"),
+            "header should mention lib target count. Report:\n{report}",
+        );
+
+        // Summary should show lib/other breakdown.
+        assert!(
+            report.contains("4 lib, 1 other"),
+            "summary should show lib/other breakdown. Report:\n{report}",
+        );
+
+        // Non-lib target should still appear in predictions.
+        assert!(
+            report.contains("a/test"),
+            "non-lib target should appear in table. Report:\n{report}",
+        );
+
+        // Delta column should be present.
+        assert!(
+            report.contains("Delta"),
+            "Delta column should appear. Report:\n{report}",
+        );
     }
 }

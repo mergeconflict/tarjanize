@@ -1,6 +1,6 @@
 # Implementation Plan: Compilation Cost Tracking
 
-> **Status: Fully implemented.** This plan is historical — all phases below have been completed. Kept for reference on design decisions.
+> **Status: Superseded.** This plan was fully implemented, but backend cost tracking (`backend_cost_ms`, `mono_items.rs`, CGU→symbol attribution, `-Zprint-mono-items`, `gag` dependency) was subsequently **removed**. Validation against real workspaces showed backend cost modeling is unreliable and irrelevant for crate splitting — only frontend time matters for the critical path. The current model tracks only `frontend_cost_ms` per symbol and `frontend_wall_ms` per target. Kept for historical reference on design decisions.
 
 Implement detailed compilation cost tracking as specified in COMPILATION_COSTS.md, separating frontend and backend costs for accurate wall-clock time prediction.
 

@@ -103,8 +103,7 @@ mod tests {
     fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
-            frontend_cost_ms: 0.0,
-            backend_cost_ms: 0.0,
+            event_times_ms: HashMap::new(),
             dependencies: deps.iter().map(|&s| s.to_string()).collect(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
