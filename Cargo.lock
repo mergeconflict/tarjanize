@@ -973,8 +973,13 @@ dependencies = [
  "jiff",
  "petgraph",
  "serde_json",
+ "tarjanize-magsac",
  "tarjanize-schemas",
 ]
+
+[[package]]
+name = "tarjanize-magsac"
+version = "0.1.0"
 
 [[package]]
 name = "tarjanize-schemas"

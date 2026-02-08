@@ -34,7 +34,7 @@
 //! (min start to max end). We use `cargo check` so only frontend events
 //! are profiled — no LLVM, codegen, or linking.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::panic;
 use std::path::Path;
 use std::time::{Duration, SystemTime};
@@ -57,13 +57,51 @@ pub struct ProfileData {
     target_timings: HashMap<String, TargetTimings>,
 }
 
+/// Summary of unmatched frontend paths after roll-up.
+#[derive(Debug, Default)]
+pub struct RollupSummary {
+    /// Total unattributed time by event label (ms).
+    pub totals_by_label: HashMap<String, f64>,
+    /// Unmatched non-module frontend paths with total self-time (ms).
+    pub unmatched_paths: Vec<(String, f64)>,
+    /// Module-level frontend paths with total self-time (ms).
+    pub module_paths: Vec<(String, f64)>,
+    /// Total unattributed time across all unmatched paths (ms).
+    pub total_unmatched_ms: f64,
+}
+
+struct StackEntry<'a> {
+    event: Event<'a>,
+    self_time: Duration,
+    local_path: Option<String>,
+}
+
+struct PerThreadState<'a> {
+    /// Stack of open events paired with their accumulated self-time.
+    /// Self-time starts at full duration and decreases for children.
+    stack: Vec<StackEntry<'a>>,
+}
+
 impl ProfileData {
     /// Load profile data from a directory containing `.mm_profdata` files.
     ///
     /// Parses all profile files in the directory and categorizes timing data.
     /// Returns an empty `ProfileData` if the directory doesn't exist
     /// or contains no profile files.
-    pub fn load_from_dir(dir: &Path) -> Self {
+    /// Load profile data from a directory containing `.mm_profdata` files,
+    /// using a symbol allowlist to filter module paths during attribution.
+    ///
+    /// When `symbol_paths` is provided, events whose local `DefPath` does not
+    /// match an extracted symbol are attributed to the nearest symbol in the
+    /// event stack instead of being recorded under the module path.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "profile loading interleaves parsing, attribution, and summaries"
+    )]
+    pub fn load_from_dir_with_symbols(
+        dir: &Path,
+        symbol_paths: Option<&HashSet<String>>,
+    ) -> Self {
         let _span = info_span!("load_from_dir", dir = %dir.display()).entered();
 
         let mut data = ProfileData::default();
@@ -149,8 +187,26 @@ impl ProfileData {
                             .entered();
 
                             file_count += 1;
-                            event_count +=
-                                data.aggregate_profile(&profile, &crate_name);
+                            let aggregate_result = panic::catch_unwind(
+                                panic::AssertUnwindSafe(|| {
+                                    data.aggregate_profile(
+                                        &profile,
+                                        &crate_name,
+                                        symbol_paths,
+                                    )
+                                }),
+                            );
+                            match aggregate_result {
+                                Ok(count) => {
+                                    event_count += count;
+                                }
+                                Err(_) => {
+                                    warn!(
+                                        "profile data corrupted during aggregation: {}",
+                                        stem_path.display()
+                                    );
+                                }
+                            }
                         }
                         Ok(Err(e)) => {
                             debug!(
@@ -203,16 +259,8 @@ impl ProfileData {
         &mut self,
         profile: &ProfilingData,
         crate_name: &str,
+        symbol_paths: Option<&HashSet<String>>,
     ) -> usize {
-        // Per-thread state: stack of currently open events and their
-        // accumulated self-times. We need to track self-time separately because
-        // we modify it as we encounter children.
-        struct PerThreadState<'a> {
-            /// Stack of open events paired with their accumulated self-time.
-            /// Self-time starts at full duration and decreases for children.
-            stack: Vec<(Event<'a>, Duration)>,
-        }
-
         let mut threads: HashMap<u32, PerThreadState<'_>> = HashMap::new();
         let mut count = 0;
         let mut raw_duration_sum = Duration::ZERO;
@@ -223,6 +271,8 @@ impl ProfileData {
         // events (including backend) go to event_times_ms on the target.
         let mut min_start: Option<SystemTime> = None;
         let mut max_end: Option<SystemTime> = None;
+
+        let crate_prefix = format!("{crate_name}::");
 
         // Walk events in reverse order. Events are emitted at their end time,
         // so a parent event appears after all its children in the stream.
@@ -253,18 +303,28 @@ impl ProfileData {
             // Pop events from the stack that don't contain the current event.
             // After this loop, the top of the stack (if any) is the parent of
             // the current event.
-            while let Some((top_event, top_self_time)) =
-                thread.stack.last().cloned()
-            {
-                if top_event.contains(&event) {
+            while let Some(entry) = thread.stack.last() {
+                if entry.event.contains(&event) {
                     // Top event is parent of current event - keep it.
                     break;
                 }
 
                 // Top event ended before current event started - finalize it.
-                thread.stack.pop();
+                let entry = thread.stack.pop().expect("stack entry missing");
+                let ancestor_local = nearest_local_ancestor(
+                    &thread.stack,
+                    symbol_paths,
+                )
+                .cloned();
                 if let Some(recorded) =
-                    self.record_event(&top_event, top_self_time, crate_name)
+                    self.record_event(
+                        &entry.event,
+                        entry.self_time,
+                        crate_name,
+                        entry.local_path.as_deref(),
+                        ancestor_local.as_deref(),
+                        symbol_paths,
+                    )
                 {
                     recorded_self_time_sum += recorded;
                 }
@@ -272,20 +332,36 @@ impl ProfileData {
             }
 
             // Subtract current event's duration from parent's self-time.
-            if let Some((_, parent_self_time)) = thread.stack.last_mut() {
-                *parent_self_time = parent_self_time.saturating_sub(duration);
+            if let Some(parent) = thread.stack.last_mut() {
+                parent.self_time = parent.self_time.saturating_sub(duration);
             }
 
             // Push current event with initial self-time = full duration.
             // This will be reduced as we encounter its children.
-            thread.stack.push((event, duration));
+            let local_path =
+                local_path_for_event(&event, &crate_prefix);
+            thread.stack.push(StackEntry {
+                event,
+                self_time: duration,
+                local_path,
+            });
         }
 
         // Finalize any remaining events on the stacks.
         for (_, thread) in threads {
-            for (event, self_time) in thread.stack {
+            let mut stack = thread.stack;
+            while let Some(entry) = stack.pop() {
+                let ancestor_local =
+                    nearest_local_ancestor(&stack, symbol_paths).cloned();
                 if let Some(recorded) =
-                    self.record_event(&event, self_time, crate_name)
+                    self.record_event(
+                        &entry.event,
+                        entry.self_time,
+                        crate_name,
+                        entry.local_path.as_deref(),
+                        ancestor_local.as_deref(),
+                        symbol_paths,
+                    )
                 {
                     recorded_self_time_sum += recorded;
                 }
@@ -319,6 +395,10 @@ impl ProfileData {
     /// - Events without a usable `DefPath` go to `event_times_ms` (target-level,
     ///   keyed by event label).
     ///
+    /// If `symbol_paths` is provided, a local `DefPath` is only considered
+    /// a symbol when it exists in that set. Otherwise we fall back to the
+    /// nearest symbol ancestor from the event stack.
+    ///
     /// Returns the recorded self-time if the event was attributed to a symbol,
     /// otherwise None.
     fn record_event(
@@ -326,22 +406,30 @@ impl ProfileData {
         event: &Event<'_>,
         self_time: Duration,
         crate_name: &str,
+        local_path: Option<&str>,
+        ancestor_local: Option<&str>,
+        symbol_paths: Option<&HashSet<String>>,
     ) -> Option<Duration> {
         let label = &*event.label;
 
-        // Try to attribute to a symbol via DefPath.
-        if let Some(raw_path) = event.additional_data.first() {
-            let normalized = normalize_frontend_path(raw_path);
-            if !normalized.is_empty() {
-                // Attributed event: record ONLY in frontend_costs (per-symbol).
-                *self
-                    .frontend_costs
-                    .entry(normalized)
-                    .or_default()
-                    .entry(label.to_string())
-                    .or_default() += self_time;
-                return Some(self_time);
-            }
+        let local_matches_symbol = local_path.is_some_and(|path| {
+            symbol_paths.is_none_or(|symbols| symbols.contains(path))
+        });
+        let selected_path =
+            if local_matches_symbol { local_path } else { None }
+                .or(ancestor_local);
+
+        if let Some(path) = selected_path {
+            // TODO: Evaluate whether attribution should prefer the nearest
+            // local DefPath (current behavior) or the outermost local DefPath
+            // in the event stack to reduce fragmentation of external costs.
+            *self
+                .frontend_costs
+                .entry(path.to_string())
+                .or_default()
+                .entry(label.to_string())
+                .or_default() += self_time;
+            return Some(self_time);
         }
 
         // Unattributed event: record ONLY in event_times_ms (target-level).
@@ -389,6 +477,102 @@ impl ProfileData {
         // package names use hyphens. Normalize to match.
         let normalized = crate_name.replace('-', "_");
         self.target_timings.get(&normalized)
+    }
+
+    /// Roll up unmatched frontend paths to the nearest known symbol.
+    ///
+    /// For frontend paths that don't correspond to any extracted symbol, walk
+    /// up the `DefPath` until we find a parent that *is* a known symbol and
+    /// attribute the event costs there. This ensures nested items (e.g. consts
+    /// inside functions) roll up to their enclosing symbol instead of being
+    /// treated as unmatched.
+    ///
+    /// Returns a summary with per-event totals and per-path breakdowns for
+    /// any paths that still could not be attributed to a known symbol. These
+    /// totals should be recorded at the target level to avoid dropping time.
+    pub fn roll_up_unmatched_frontend_costs(
+        &mut self,
+        symbol_paths: &HashSet<String>,
+        module_paths: &HashSet<String>,
+        crate_prefix: &str,
+    ) -> RollupSummary {
+        let mut totals = HashMap::new();
+        let mut per_path_totals: Vec<(String, f64)> = Vec::new();
+        let mut module_path_totals: Vec<(String, f64)> = Vec::new();
+        let mut total_unmatched_ms = 0.0;
+        let mut module_unmatched_ms = 0.0;
+
+        let mut to_remove: Vec<String> = Vec::new();
+        let mut to_roll_up: Vec<(String, HashMap<String, Duration>)> =
+            Vec::new();
+
+        for (path, events) in &self.frontend_costs {
+            if !path.starts_with(crate_prefix) {
+                continue;
+            }
+            if symbol_paths.contains(path) {
+                continue;
+            }
+
+            if let Some(ancestor) =
+                find_symbol_ancestor(path, symbol_paths, crate_prefix)
+            {
+                to_roll_up.push((ancestor, events.clone()));
+            } else {
+                let mut path_total = 0.0;
+                for (label, duration) in events {
+                    let ms = duration.as_millis_f64();
+                    path_total += ms;
+                    *totals.entry(label.clone()).or_default() += ms;
+                }
+                total_unmatched_ms += path_total;
+                if module_paths.contains(path) {
+                    module_unmatched_ms += path_total;
+                    module_path_totals.push((path.clone(), path_total));
+                } else {
+                    per_path_totals.push((path.clone(), path_total));
+                }
+            }
+
+            to_remove.push(path.clone());
+        }
+
+        for path in to_remove {
+            self.frontend_costs.remove(&path);
+        }
+
+        for (ancestor, events) in to_roll_up {
+            let entry = self.frontend_costs.entry(ancestor).or_default();
+            for (label, duration) in events {
+                *entry.entry(label).or_default() += duration;
+            }
+        }
+
+        if !per_path_totals.is_empty() {
+            per_path_totals.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        if !module_path_totals.is_empty() {
+            module_path_totals.sort_by(|a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+
+        debug!(
+            unmatched_paths = per_path_totals.len(),
+            module_paths = module_path_totals.len(),
+            total_unmatched_ms,
+            module_unmatched_ms,
+            "unmatched frontend paths after roll-up"
+        );
+
+        RollupSummary {
+            totals_by_label: totals,
+            unmatched_paths: per_path_totals,
+            module_paths: module_path_totals,
+            total_unmatched_ms,
+        }
     }
 
     /// Get the number of unique frontend paths with timing data.
@@ -459,12 +643,55 @@ fn normalize_frontend_path(path: &str) -> String {
         return String::new();
     }
 
+    // Some events report DefId(...) strings instead of DefPaths.
+    // These don't map to extracted symbols, so treat them as unattributed.
+    if path.starts_with("DefId(") {
+        return String::new();
+    }
+
+    // Treat extern-crate roots like `my_crate::std` as unattributed. These
+    // are not real symbols we extract, but they may appear in profiles.
+    let segments: Vec<&str> = path.split("::").collect();
+    if segments.len() == 2 {
+        let last = segments[1];
+        if matches!(last, "std" | "core" | "alloc") {
+            return String::new();
+        }
+    }
+
     // Skip compiler-internal pseudo-paths that aren't real symbols.
     // These are compiler query keys, not DefPaths we can attribute to symbols.
     if path.starts_with("PseudoCanonicalInput")
         || path.starts_with("LocalModDefId")
     {
         return String::new();
+    }
+
+    // If a path contains an anonymous segment (`_` or `_[N]`), attribute it to
+    // the parent path. We never extract anonymous items as standalone symbols.
+    if let Some(idx) = segments.iter().position(|segment| {
+        *segment == "_"
+            || (segment.starts_with("_[") && segment.ends_with(']'))
+    }) {
+        if idx == 0 {
+            return String::new();
+        }
+        return segments[..idx].join("::");
+    }
+
+    // If a path contains an anonymous segment (`_[N]`) immediately followed by
+    // an impl block, it's an impl for an anonymous type. We don't extract
+    // anonymous types, so attribute to the parent module/type instead.
+    let segments: Vec<&str> = path.split("::").collect();
+    for i in 0..segments.len().saturating_sub(1) {
+        if is_descendant_segment(segments[i])
+            && segments[i + 1].starts_with("{{impl}}")
+        {
+            if i == 0 {
+                return String::new();
+            }
+            return segments[..i].join("::");
+        }
     }
 
     // Iteratively peel descendant segments from the end. We loop because
@@ -523,7 +750,31 @@ fn normalize_frontend_path(path: &str) -> String {
         return current[..end].to_string();
     }
 
-    current.to_string()
+    let mut normalized = current.to_string();
+
+    // Heuristic: fields show up as `Type::field` (no {{impl}} segment).
+    // We don't extract fields as symbols, so attribute them to the parent type.
+    if let Some(idx) = normalized.rfind("::") {
+        let parent = &normalized[..idx];
+        let last = &normalized[idx + 2..];
+        if let Some(parent_last_idx) = parent.rfind("::") {
+            let parent_last = &parent[parent_last_idx + 2..];
+            if parent_last
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_uppercase())
+                && last
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_lowercase())
+                && !parent_last.starts_with("{{")
+            {
+                normalized = parent.to_string();
+            }
+        }
+    }
+
+    normalized
 }
 
 /// Returns true if a `DefPath` segment is a compiler-internal descendant
@@ -560,6 +811,64 @@ fn is_descendant_segment(segment: &str) -> bool {
     false
 }
 
+fn local_path_for_event(event: &Event<'_>, crate_prefix: &str) -> Option<String> {
+    let raw_path = event.additional_data.first()?;
+    let normalized = normalize_frontend_path(raw_path);
+    if !normalized.starts_with(crate_prefix) {
+        return None;
+    }
+
+    // Filter extern-crate roots that sometimes show up as `crate::std`.
+    let local = normalized.strip_prefix(crate_prefix).unwrap_or("");
+    if matches!(local, "std" | "core" | "alloc") {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+fn find_symbol_ancestor(
+    path: &str,
+    symbol_paths: &HashSet<String>,
+    crate_prefix: &str,
+) -> Option<String> {
+    if !path.starts_with(crate_prefix) {
+        return None;
+    }
+
+    let mut current = path;
+    while let Some(sep_pos) = current.rfind("::") {
+        current = &current[..sep_pos];
+        if symbol_paths.contains(current) {
+            return Some(current.to_string());
+        }
+        if current.len() <= crate_prefix.len() {
+            break;
+        }
+    }
+
+    None
+}
+
+fn nearest_local_ancestor<'a>(
+    stack: &'a [StackEntry<'_>],
+    symbol_paths: Option<&HashSet<String>>,
+) -> Option<&'a String> {
+    if let Some(symbol_paths) = symbol_paths {
+        stack.iter().rev().find_map(|entry| {
+            entry
+                .local_path
+                .as_ref()
+                .and_then(|path| symbol_paths.contains(path).then_some(path))
+        })
+    } else {
+        stack
+            .iter()
+            .rev()
+            .find_map(|entry| entry.local_path.as_ref())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,6 +901,99 @@ mod tests {
     }
 
     #[test]
+    fn test_roll_up_unmatched_to_parent_symbol() {
+        let mut data = ProfileData::default();
+        data.frontend_costs.insert(
+            "my_crate::main::INIT_FILE".to_string(),
+            HashMap::from([(
+                "const_eval".to_string(),
+                Duration::from_millis(10),
+            )]),
+        );
+
+        let symbol_paths =
+            HashSet::from(["my_crate::main".to_string()]);
+        let module_paths = HashSet::new();
+        let summary = data.roll_up_unmatched_frontend_costs(
+            &symbol_paths,
+            &module_paths,
+            "my_crate::",
+        );
+
+        assert!(summary.totals_by_label.is_empty());
+        assert!(summary.unmatched_paths.is_empty());
+        assert!(!data
+            .frontend_costs
+            .contains_key("my_crate::main::INIT_FILE"));
+
+        let events =
+            data.frontend_costs.get("my_crate::main").expect("main events");
+        let ms = events
+            .get("const_eval")
+            .expect("rolled up event")
+            .as_millis_f64();
+        assert!((ms - 10.0).abs() < 1e-6, "ms={ms}");
+    }
+
+    #[test]
+    fn test_roll_up_unmatched_without_ancestor() {
+        let mut data = ProfileData::default();
+        data.frontend_costs.insert(
+            "my_crate::main::INIT_FILE".to_string(),
+            HashMap::from([(
+                "const_eval".to_string(),
+                Duration::from_millis(7),
+            )]),
+        );
+
+        let symbol_paths = HashSet::new();
+        let module_paths = HashSet::from(["my_crate::main".to_string()]);
+        let summary = data.roll_up_unmatched_frontend_costs(
+            &symbol_paths,
+            &module_paths,
+            "my_crate::",
+        );
+
+        assert!(data.frontend_costs.is_empty());
+        let ms = summary
+            .totals_by_label
+            .get("const_eval")
+            .copied()
+            .unwrap_or(0.0);
+        assert!((ms - 7.0).abs() < 1e-6, "ms={ms}");
+    }
+
+    #[test]
+    fn test_roll_up_module_path_counts_as_unmatched_total() {
+        let mut data = ProfileData::default();
+        data.frontend_costs.insert(
+            "my_crate::cargo_command".to_string(),
+            HashMap::from([(
+                "typeck".to_string(),
+                Duration::from_millis(9),
+            )]),
+        );
+
+        let symbol_paths = HashSet::new();
+        let module_paths = HashSet::from(["my_crate::cargo_command".to_string()]);
+        let summary = data.roll_up_unmatched_frontend_costs(
+            &symbol_paths,
+            &module_paths,
+            "my_crate::",
+        );
+
+        let ms = summary
+            .totals_by_label
+            .get("typeck")
+            .copied()
+            .unwrap_or(0.0);
+        assert!((ms - 9.0).abs() < 1e-6, "ms={ms}");
+        assert!(summary.unmatched_paths.is_empty());
+        assert_eq!(summary.module_paths.len(), 1);
+        assert!(data.frontend_costs.is_empty());
+    }
+
+    #[test]
     fn test_normalize_frontend_path_aggregates_to_impl() {
         // Method inside impl -> aggregate to impl.
         assert_eq!(
@@ -612,7 +1014,7 @@ mod tests {
             normalize_frontend_path(
                 "my_crate::module::_[7]::{{impl}}::deserialize"
             ),
-            "my_crate::module::_[7]::{{impl}}"
+            "my_crate::module"
         );
 
         // Numbered impl (multiple impls on same type).
@@ -658,6 +1060,24 @@ mod tests {
                 "my_crate::Type::{{impl}}::method::{{closure}}"
             ),
             "my_crate::Type::{{impl}}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_anonymous_impl_to_parent() {
+        assert_eq!(
+            normalize_frontend_path("my_crate::types::_[1]::{{impl}}"),
+            "my_crate::types"
+        );
+        assert_eq!(
+            normalize_frontend_path(
+                "my_crate::types::_[2]::{{impl}}::deserialize::{{impl}}[3]"
+            ),
+            "my_crate::types"
+        );
+        assert_eq!(
+            normalize_frontend_path("my_crate::types::_[2]::_serde"),
+            "my_crate::types"
         );
     }
 
@@ -811,7 +1231,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -835,7 +1255,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -869,7 +1289,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -914,7 +1334,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -960,7 +1380,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -1006,7 +1426,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -1047,7 +1467,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -1084,7 +1504,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -1134,8 +1554,15 @@ mod tests {
             }),
         };
 
-        let result =
-            data.record_event(&event, Duration::from_millis(10), "my_crate");
+        let local_path = local_path_for_event(&event, "my_crate::");
+        let result = data.record_event(
+            &event,
+            Duration::from_millis(10),
+            "my_crate",
+            local_path.as_deref(),
+            None,
+            None,
+        );
 
         // Should be attributed to a symbol (returns Some).
         assert!(result.is_some(), "event with DefPath should be attributed");
@@ -1163,6 +1590,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_record_event_prefers_symbol_ancestor_over_module_path() {
+        use std::borrow::Cow;
+        use std::collections::HashSet;
+
+        let mut data = ProfileData::default();
+        let symbol_path = "my_crate::foo::bar".to_string();
+        let symbol_paths: HashSet<String> =
+            [symbol_path.clone()].into_iter().collect();
+
+        let event = Event {
+            event_kind: Cow::Borrowed("Query"),
+            label: Cow::Borrowed("typeck"),
+            additional_data: vec![Cow::Borrowed("my_crate::mod")],
+            thread_id: 0,
+            payload: EventPayload::Timestamp(Timestamp::Interval {
+                start: SystemTime::UNIX_EPOCH,
+                end: SystemTime::UNIX_EPOCH + Duration::from_millis(10),
+            }),
+        };
+
+        let result = data.record_event(
+            &event,
+            Duration::from_millis(10),
+            "my_crate",
+            Some("my_crate::mod"),
+            Some(&symbol_path),
+            Some(&symbol_paths),
+        );
+
+        assert!(result.is_some(), "event should be attributed");
+        assert!(
+            data.get_event_times_ms("my_crate::mod").is_none(),
+            "module path should not receive attribution when symbol ancestor exists",
+        );
+        assert!(
+            data.get_event_times_ms(&symbol_path).is_some(),
+            "symbol ancestor should receive attribution",
+        );
+    }
+
     /// Multiple events with the same label accumulate in `event_times_ms`.
     #[test]
     fn test_event_times_ms_accumulate_same_label() {
@@ -1177,7 +1645,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
@@ -1214,7 +1682,15 @@ mod tests {
                 end: SystemTime::UNIX_EPOCH + Duration::from_millis(10),
             }),
         };
-        data.record_event(&typeck_event, Duration::from_millis(10), "my_crate");
+        let local_path = local_path_for_event(&typeck_event, "my_crate::");
+        data.record_event(
+            &typeck_event,
+            Duration::from_millis(10),
+            "my_crate",
+            local_path.as_deref(),
+            None,
+            None,
+        );
 
         // Unattributed event: metadata with no DefPath -> goes to
         // event_times_ms.
@@ -1232,6 +1708,9 @@ mod tests {
             &metadata_event,
             Duration::from_millis(15),
             "my_crate",
+            None,
+            None,
+            None,
         );
 
         // Unattributed event: LLVM with no DefPath -> goes to
@@ -1246,7 +1725,14 @@ mod tests {
                 end: SystemTime::UNIX_EPOCH + Duration::from_millis(60),
             }),
         };
-        data.record_event(&llvm_event, Duration::from_millis(30), "my_crate");
+        data.record_event(
+            &llvm_event,
+            Duration::from_millis(30),
+            "my_crate",
+            None,
+            None,
+            None,
+        );
 
         // Sum target-level event_times_ms (unattributed only).
         let target_sum: f64 = data
@@ -1293,7 +1779,7 @@ mod tests {
 
         let profile = builder.into_profiling_data();
         let mut data = ProfileData::default();
-        data.aggregate_profile(&profile, "test_crate");
+        data.aggregate_profile(&profile, "test_crate", None);
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");

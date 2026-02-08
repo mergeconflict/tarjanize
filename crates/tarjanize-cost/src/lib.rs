@@ -50,6 +50,7 @@ use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
 use tarjanize_schemas::{Module, SymbolGraph, TargetTimings, sum_event_times};
+use tarjanize_magsac::{fit_two_var_magsac, r_squared_no_intercept_inliers};
 
 /// Details about a single target on the critical path.
 #[derive(Debug, Clone)]
@@ -110,11 +111,29 @@ pub struct CriticalPathResult {
     pub symbol_count: usize,
 }
 
+/// Configuration options for cost reporting.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CostOptions {
+    /// Fit the two-variable model using lib targets only.
+    pub fit_libs_only: bool,
+}
+
 impl CriticalPathResult {
     /// Writes a human-readable report to the given writer.
     ///
     /// The report includes summary statistics and timing tables for all targets.
     pub fn write_report(&self, mut w: impl Write) -> std::io::Result<()> {
+        self.write_report_with_options(&mut w, CostOptions::default())
+    }
+
+    /// Writes a human-readable report to the given writer with custom options.
+    ///
+    /// The report includes summary statistics and timing tables for all targets.
+    pub fn write_report_with_options(
+        &self,
+        mut w: impl Write,
+        options: CostOptions,
+    ) -> std::io::Result<()> {
         // Summary statistics.
         writeln!(
             w,
@@ -167,7 +186,7 @@ impl CriticalPathResult {
             }
         }
 
-        self.write_validation_table(&mut w)?;
+        self.write_validation_table(&mut w, options.fit_libs_only)?;
 
         Ok(())
     }
@@ -177,18 +196,22 @@ impl CriticalPathResult {
     ///
     /// Only emitted when at least one target has non-zero wall-clock data
     /// from profiling. Fits the two-variable model (`wall = a·attr + b·meta`)
-    /// on lib targets only (cleaner signal — no recompilation noise from test
-    /// targets), then shows per-target predictions and percentage errors for
-    /// all targets. Sorted by absolute error descending so the worst
+    /// on either all targets with profiling data or lib targets only,
+    /// depending on `fit_libs_only`, then shows per-target predictions and
+    /// percentage errors. Sorted by absolute error descending so the worst
     /// predictions appear first.
     ///
-    /// Falls back to showing just Target + Actual when fewer than 3 lib
-    /// targets are available (insufficient for model fitting).
+    /// Falls back to showing just Target + Actual when fewer than 3 fit targets
+    /// are available (insufficient for model fitting).
     #[expect(
         clippy::too_many_lines,
         reason = "formatting-heavy table output, splitting would scatter layout logic"
     )]
-    fn write_validation_table(&self, mut w: impl Write) -> std::io::Result<()> {
+    fn write_validation_table(
+        &self,
+        mut w: impl Write,
+        fit_libs_only: bool,
+    ) -> std::io::Result<()> {
         // Collect targets that have wall-clock profiling data.
         let validated: Vec<&TargetOnPath> = self
             .all_targets
@@ -217,20 +240,25 @@ impl CriticalPathResult {
             })
             .collect();
 
-        // Fit on lib targets only — lib targets have cleaner signal because
-        // test targets include recompiled lib code, which skews the model.
-        let lib_regression_data: Vec<(f64, f64, f64)> = validated
-            .iter()
-            .zip(&regression_data)
-            .filter(|(t, _)| t.name.ends_with("/lib"))
-            .map(|(_, &data)| data)
-            .collect();
+        let mut lib_count = 0;
+        let mut other_count = 0;
+        let fit_data = if fit_libs_only {
+            let lib_regression_data: Vec<(f64, f64, f64)> = validated
+                .iter()
+                .zip(&regression_data)
+                .filter(|(t, _)| t.name.ends_with("/lib"))
+                .map(|(_, &data)| data)
+                .collect();
+            lib_count = lib_regression_data.len();
+            other_count = validated.len() - lib_count;
+            lib_regression_data
+        } else {
+            regression_data.clone()
+        };
 
-        let lib_count = lib_regression_data.len();
-        let other_count = validated.len() - lib_count;
-        let fit = two_var_fit(&lib_regression_data);
+        let fit = two_var_fit(&fit_data);
 
-        if fit.is_some() {
+        if fit_libs_only {
             writeln!(
                 w,
                 "\nModel validation ({} targets with profiling, \
@@ -242,13 +270,13 @@ impl CriticalPathResult {
             writeln!(
                 w,
                 "\nModel validation ({} targets with profiling):\n",
-                validated.len()
+                validated.len(),
             )?;
         }
 
         if let Some(ref fit) = fit {
             // Build rows with predictions and sort by absolute error.
-            // Predictions use the lib-fitted model for all targets.
+            // Predictions use the fitted model for all targets.
             let mut rows: Vec<(&str, f64, f64, f64, f64)> = validated
                 .iter()
                 .zip(&regression_data)
@@ -286,7 +314,7 @@ impl CriticalPathResult {
                 )?;
             }
         } else {
-            // Fewer than 3 lib targets — can't fit the model. Show actuals.
+            // Fewer than 3 targets — can't fit the model. Show actuals.
             writeln!(w, "{:<35} {:>9}", "Target", "Actual")?;
             writeln!(w, "{}", "-".repeat(46))?;
 
@@ -302,13 +330,17 @@ impl CriticalPathResult {
 
         // Summary statistics.
         writeln!(w)?;
-        writeln!(
-            w,
-            "Targets compared:    {} ({} lib, {} other)",
-            validated.len(),
-            lib_count,
-            other_count,
-        )?;
+        if fit_libs_only {
+            writeln!(
+                w,
+                "Targets compared:    {} ({} lib, {} other)",
+                validated.len(),
+                lib_count,
+                other_count,
+            )?;
+        } else {
+            writeln!(w, "Targets compared:    {}", validated.len(),)?;
+        }
 
         if let Some(ref fit) = fit {
             writeln!(
@@ -391,86 +423,35 @@ pub struct TwoVarFit {
     pub r_squared: f64,
 }
 
-/// Fits `y = a * x1 + b * x2` (no intercept) via ordinary least squares.
+/// Fits `y = a * x1 + b * x2` (no intercept) using MAGSAC++ for robustness.
 ///
 /// The no-intercept constraint is physically motivated: zero code plus zero
 /// dependencies should produce zero compilation time.
 ///
-/// Solves the normal equations `(X^T X) β = X^T y` where X is the n×2
-/// matrix of predictors and β = [a, b]^T.
-///
-/// Returns `None` if fewer than 3 data points or if the predictor matrix
-/// is singular (collinear or all-zero predictors).
+/// Returns `None` if fewer than 3 data points or if the robust estimator
+/// cannot produce a stable model.
 ///
 /// # Arguments
 ///
 /// * `data` - Slice of `(x1, x2, y)` triples: (symbol attribution sum,
 ///   metadata decode sum, wall time).
-// TODO: consider moving this to a dedicated numerical crate or using an
-// existing OLS crate from the ecosystem.
 pub fn two_var_fit(data: &[(f64, f64, f64)]) -> Option<TwoVarFit> {
-    // Need at least 3 data points for a meaningful R² statistic.
     if data.len() < 3 {
         return None;
     }
 
-    // Compute X^T X (2×2 symmetric matrix) and X^T y (2×1 vector).
-    // X^T X = [[Σx1², Σx1·x2], [Σx1·x2, Σx2²]]
-    // X^T y = [Σx1·y, Σx2·y]
-    let mut s11 = 0.0; // Σx1²
-    let mut s12 = 0.0; // Σx1·x2
-    let mut s22 = 0.0; // Σx2²
-    let mut sy1 = 0.0; // Σx1·y
-    let mut sy2 = 0.0; // Σx2·y
+    let result = fit_two_var_magsac(data)?;
+    let r_squared = r_squared_no_intercept_inliers(
+        data,
+        result.model,
+        result.inlier_threshold,
+    );
 
-    for &(x1, x2, y) in data {
-        s11 += x1 * x1;
-        s12 += x1 * x2;
-        s22 += x2 * x2;
-        sy1 += x1 * y;
-        sy2 += x2 * y;
-    }
-
-    // Solve 2×2 system via Cramer's rule.
-    // det(X^T X) = s11 * s22 - s12²
-    let det = s11 * s22 - s12 * s12;
-
-    let (a, b) = if det.abs() < 1e-15 {
-        // Singular matrix — handle degenerate cases where one predictor
-        // is all zeros (degenerates to single-variable regression).
-        if s11 > 1e-15 && s22.abs() < 1e-15 {
-            // Only x1 has variance: y = a * x1
-            (sy1 / s11, 0.0)
-        } else if s22 > 1e-15 && s11.abs() < 1e-15 {
-            // Only x2 has variance: y = b * x2
-            (0.0, sy2 / s22)
-        } else {
-            // Both zero or truly collinear — can't fit.
-            return None;
-        }
-    } else {
-        let a = (s22 * sy1 - s12 * sy2) / det;
-        let b = (s11 * sy2 - s12 * sy1) / det;
-        (a, b)
-    };
-
-    // R² for no-intercept model: R² = 1 - SS_res / SS_tot
-    // where SS_tot = Σy² (NOT centered, since there's no intercept).
-    let mut ss_res = 0.0;
-    let mut ss_tot = 0.0;
-    for &(x1, x2, y) in data {
-        let predicted = a * x1 + b * x2;
-        ss_res += (y - predicted).powi(2);
-        ss_tot += y * y;
-    }
-
-    let r_squared = if ss_tot == 0.0 {
-        1.0
-    } else {
-        1.0 - ss_res / ss_tot
-    };
-
-    Some(TwoVarFit { a, b, r_squared })
+    Some(TwoVarFit {
+        a: result.model.a,
+        b: result.model.b,
+        r_squared,
+    })
 }
 
 /// Computes the critical path of a symbol graph at the target level.
@@ -660,7 +641,17 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
 ///
 /// This is the main entry point for the cost analysis phase. It mirrors the
 /// API of `tarjanize_condense::run` for consistency.
-pub fn run(mut input: impl Read, output: impl Write) -> std::io::Result<()> {
+pub fn run(input: impl Read, output: impl Write) -> std::io::Result<()> {
+    run_with_options(input, output, CostOptions::default())
+}
+
+/// Reads a symbol graph, computes critical path, and writes a report with
+/// custom options.
+pub fn run_with_options(
+    mut input: impl Read,
+    output: impl Write,
+    options: CostOptions,
+) -> std::io::Result<()> {
     let mut json = String::new();
     input.read_to_string(&mut json)?;
 
@@ -668,7 +659,7 @@ pub fn run(mut input: impl Read, output: impl Write) -> std::io::Result<()> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let result = critical_path(&symbol_graph);
-    result.write_report(output)
+    result.write_report_with_options(output, options)
 }
 
 /// Convenience function to compute critical path from JSON input.
@@ -2267,7 +2258,14 @@ mod tests {
         let result = critical_path(&graph);
 
         let mut output = Vec::new();
-        result.write_report(&mut output).unwrap();
+        result
+            .write_report_with_options(
+                &mut output,
+                CostOptions {
+                    fit_libs_only: true,
+                },
+            )
+            .unwrap();
         let report = String::from_utf8(output).unwrap();
 
         // Header should show lib target count.

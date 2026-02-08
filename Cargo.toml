@@ -6,6 +6,7 @@ resolver = "3"
 # Internal crates
 tarjanize-condense = { path = "crates/tarjanize-condense" }
 tarjanize-cost = { path = "crates/tarjanize-cost" }
+tarjanize-magsac = { path = "crates/tarjanize-magsac" }
 tarjanize-schemas = { path = "crates/tarjanize-schemas" }
 
 # Serialization
@@ -73,7 +74,7 @@ suspicious = { level = "warn", priority = -1 }
 # These lints are from the `restriction` lint group and prevent specific
 # constructs being used in source code in order to drive up consistency,
 # quality, and brevity
-allow_attributes_without_reason = "warn"
+allow_attributes = "warn"
 as_pointer_underscore = "warn"
 assertions_on_result_states = "warn"
 clone_on_ref_ptr = "warn"
@@ -103,4 +104,3 @@ missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 must_use_candidate = "allow"
 multiple_crate_versions = "allow"
-

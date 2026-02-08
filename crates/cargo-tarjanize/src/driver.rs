@@ -13,11 +13,12 @@
 //! per-event timing breakdowns, assembles a complete `Crate`, and deletes
 //! the raw profile files to avoid disk space exhaustion.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::io::Write;
 use std::sync::Mutex;
-use std::{env, fs};
+use std::{env, fs, io};
 
 use rustc_driver::{Callbacks, Compilation, run_compiler};
 use rustc_interface::interface::Compiler;
@@ -449,14 +450,15 @@ impl Callbacks for TarjanizeCallbacks {
         tcx: TyCtxt<'_>,
     ) -> Compilation {
         // Extract symbols from this crate.
-        // For test targets (is_test=true), only extract #[cfg(test)] items
-        // to avoid duplicating symbols from the lib target.
+        // For test targets we now extract all items (not just #[cfg(test)])
+        // so test target costs can be modeled without gaps, even if that
+        // duplicates symbols across lib and test targets.
         info!(crate_name = %self.crate_name, is_test = self.is_test, "extracting symbols");
         let extraction = extract::extract_crate(
             tcx,
             &self.crate_name,
             &self.config.workspace_crates,
-            self.is_test,
+            false,
         );
 
         let symbol_count = count_symbols(&extraction.module);
@@ -552,8 +554,15 @@ fn process_and_write_crate(
     )
     .entered();
 
+    // Collect all symbol paths up front so nested frontend paths can be
+    // rolled up to their nearest enclosing symbol before attribution.
+    let mut symbol_paths = HashSet::new();
+    collect_symbol_paths(&module, crate_name, &mut symbol_paths);
+    let mut module_paths = HashSet::new();
+    collect_module_paths(&module, crate_name, &mut module_paths);
+
     // Load profile data from this target's dedicated profile directory.
-    let profile_data = {
+    let mut profile_data = {
         let _span = tracing::info_span!(
             "load_profile",
             package = %package_name,
@@ -561,20 +570,48 @@ fn process_and_write_crate(
             crate_name = %crate_name,
         )
         .entered();
-        ProfileData::load_from_dir(profile_dir)
+        ProfileData::load_from_dir_with_symbols(profile_dir, Some(&symbol_paths))
     };
+
+    // Get target timings (wall-clock time and unattributed event times).
+    // Also uses crate_name since profile data is keyed by rustc crate name.
+    let mut timings = profile_data
+        .get_target_timings(crate_name)
+        .cloned()
+        .unwrap_or_default();
+    let crate_prefix = format!("{crate_name}::");
+    let summary = profile_data.roll_up_unmatched_frontend_costs(
+        &symbol_paths,
+        &module_paths,
+        &crate_prefix,
+    );
 
     // Apply per-event timing breakdowns to the module's symbols.
     // Use crate_name for profile lookups since profile data is keyed by rustc
     // crate name (e.g., "sync_mpsc"), not cargo package name (e.g., "tokio").
     apply_event_times(&mut module, crate_name, &profile_data);
+    for (label, ms) in &summary.totals_by_label {
+        *timings.event_times_ms.entry(label.clone()).or_default() += ms;
+    }
+    if summary.total_unmatched_ms > 0.0 {
+        *timings
+            .event_times_ms
+            .entry("unmatched".to_string())
+            .or_default() += summary.total_unmatched_ms;
+    }
 
-    // Get target timings (wall-clock time and unattributed event times).
-    // Also uses crate_name since profile data is keyed by rustc crate name.
-    let timings = profile_data
-        .get_target_timings(crate_name)
-        .cloned()
-        .unwrap_or_default();
+    if let Err(error) = append_unmatched_paths(
+        &unmatched_output_path(config),
+        package_name,
+        crate_name,
+        target_key,
+        &summary,
+    ) {
+        warn!(
+            error = %error,
+            "failed to append unmatched frontend paths"
+        );
+    }
 
     // Build the complete Target.
     // Dependencies are populated later by the orchestrator from cargo metadata.
@@ -639,6 +676,89 @@ fn apply_event_times(
     for (submod_name, submodule) in &mut module.submodules {
         let submod_path = format!("{path_prefix}::{submod_name}");
         apply_event_times(submodule, &submod_path, profile_data);
+    }
+}
+
+fn unmatched_output_path(config: &DriverConfig) -> PathBuf {
+    if let Ok(path) = env::var("TARJANIZE_UNMATCHED_PATH") {
+        PathBuf::from(path)
+    } else {
+        config.output_dir.join("unmatched_paths.tsv")
+    }
+}
+
+fn append_unmatched_paths(
+    output_path: &Path,
+    package_name: &str,
+    crate_name: &str,
+    target_key: &str,
+    summary: &crate::profile::RollupSummary,
+) -> io::Result<()> {
+    if summary.unmatched_paths.is_empty() && summary.module_paths.is_empty() {
+        return Ok(());
+    }
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output_path)?;
+    if file.metadata()?.len() == 0 {
+        writeln!(file, "package\ttarget\tcrate\tkind\tpath\ttotal_ms")?;
+    }
+
+    for (path, ms) in &summary.unmatched_paths {
+        let path = path.replace(['\t', '\n'], " ");
+        writeln!(
+            file,
+            "{package_name}\t{target_key}\t{crate_name}\tunmatched\t{path}\t{ms:.6}"
+        )?;
+    }
+    for (path, ms) in &summary.module_paths {
+        let path = path.replace(['\t', '\n'], " ");
+        writeln!(
+            file,
+            "{package_name}\t{target_key}\t{crate_name}\tmodule\t{path}\t{ms:.6}"
+        )?;
+    }
+
+    Ok(())
+}
+
+/// Collect all symbol paths into `symbol_paths`.
+///
+/// Paths are normalized to underscore crate names to match profile keys.
+fn collect_symbol_paths(
+    module: &Module,
+    path_prefix: &str,
+    symbol_paths: &mut HashSet<String>,
+) {
+    for name in module.symbols.keys() {
+        let full_path = format!("{path_prefix}::{name}").replace('-', "_");
+        symbol_paths.insert(full_path);
+    }
+
+    for (submod_name, submodule) in &module.submodules {
+        let submod_path = format!("{path_prefix}::{submod_name}");
+        collect_symbol_paths(submodule, &submod_path, symbol_paths);
+    }
+}
+
+/// Collect all module paths into `module_paths`.
+///
+/// These paths correspond to module `DefPaths`, which aren't extracted as symbols.
+fn collect_module_paths(
+    module: &Module,
+    path_prefix: &str,
+    module_paths: &mut HashSet<String>,
+) {
+    for (submod_name, submodule) in &module.submodules {
+        let submod_path = format!("{path_prefix}::{submod_name}").replace('-', "_");
+        module_paths.insert(submod_path.clone());
+        collect_module_paths(submodule, &submod_path, module_paths);
     }
 }
 

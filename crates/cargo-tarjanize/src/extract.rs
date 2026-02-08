@@ -15,6 +15,7 @@
 //!
 //! We use `-Zno-steal-thir` to preserve THIR after MIR is built.
 
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use rustc_hir::Attribute;
@@ -76,6 +77,9 @@ struct Extractor<'tcx> {
     /// Keys use rustc's `DefPath` format (e.g., `crate::module::{{impl}}[1]`)
     /// which matches `-Zself-profile` output for direct cost lookup.
     symbols: HashMap<String, Symbol>,
+    /// Cache for raw `DefPath` strings to avoid repeated query lookups and
+    /// string allocations in hot paths.
+    raw_def_path_cache: RefCell<HashMap<DefId, String>>,
 }
 
 impl<'tcx> Extractor<'tcx> {
@@ -98,6 +102,7 @@ impl<'tcx> Extractor<'tcx> {
             workspace_crates,
             test_only,
             symbols: HashMap::new(),
+            raw_def_path_cache: RefCell::new(HashMap::new()),
         }
     }
 
@@ -1768,81 +1773,129 @@ impl<'tcx> Extractor<'tcx> {
     /// - `{{impl}}` or `{{impl}}[N]` for impl blocks
     /// - `_` or `_[N]` for anonymous items (from derive macros)
     /// - Double braces `{{...}}` for anonymous/generated items
+    #[expect(
+        clippy::too_many_lines,
+        reason = "formatting-heavy symbol path assembly is easiest to keep in one place"
+    )]
     fn raw_def_path(&self, def_id: DefId) -> String {
         use rustc_hir::definitions::DefPathData;
+        use std::fmt::Write as _;
+
+        // Hot path: cache DefPath strings to avoid repeated query work.
+        if let Some(cached) =
+            self.raw_def_path_cache.borrow().get(&def_id)
+        {
+            return cached.clone();
+        }
 
         let def_path = self.tcx.def_path(def_id);
-        let mut segments = Vec::new();
-
-        // Add crate name as first segment.
-        let crate_name = if def_id.is_local() {
-            self.crate_name.clone()
+        let crate_name_symbol = if def_id.is_local() {
+            None
         } else {
-            self.tcx.crate_name(def_id.krate).to_string()
+            Some(self.tcx.crate_name(def_id.krate))
         };
-        segments.push(crate_name);
+        let crate_name = crate_name_symbol
+            .as_ref()
+            .map_or(self.crate_name.as_str(), |sym| sym.as_str());
 
-        // Add each path segment in profile-compatible format.
+        // Build directly into one buffer to avoid per-segment allocations.
+        let mut out = String::with_capacity(
+            crate_name.len() + def_path.data.len() * 8,
+        );
+        out.push_str(crate_name);
+
         for disambiguated in &def_path.data {
             let disambiguator = disambiguated.disambiguator;
-            let segment = match &disambiguated.data {
-                DefPathData::CrateRoot => continue, // Skip, we added crate name
+            match &disambiguated.data {
+                DefPathData::CrateRoot => { /* Skip, we added crate name */ }
                 DefPathData::TypeNs(sym)
                 | DefPathData::ValueNs(sym)
                 | DefPathData::MacroNs(sym)
-                | DefPathData::LifetimeNs(sym) => sym.to_string(),
+                | DefPathData::LifetimeNs(sym) => {
+                    out.push_str("::");
+                    if disambiguator == 0 {
+                        out.push_str(sym.as_str());
+                    } else {
+                        let _ = write!(
+                            out,
+                            "{}[{}]",
+                            sym.as_str(),
+                            disambiguator
+                        );
+                    }
+                }
                 DefPathData::Impl => {
-                    // Format as {{impl}} or {{impl}}[N] for disambiguation.
+                    out.push_str("::");
                     if disambiguator == 0 {
-                        "{{impl}}".to_string()
+                        out.push_str("{{impl}}");
                     } else {
-                        format!("{{{{impl}}}}[{disambiguator}]")
+                        let _ = write!(out, "{{{{impl}}}}[{disambiguator}]");
                     }
                 }
-                DefPathData::ForeignMod => "{{extern}}".to_string(),
-                DefPathData::Use => "{{use}}".to_string(),
-                DefPathData::GlobalAsm => "{{global_asm}}".to_string(),
+                DefPathData::ForeignMod => {
+                    out.push_str("::{{extern}}");
+                }
+                DefPathData::Use => {
+                    out.push_str("::{{use}}");
+                }
+                DefPathData::GlobalAsm => {
+                    out.push_str("::{{global_asm}}");
+                }
                 DefPathData::Closure => {
+                    out.push_str("::");
                     if disambiguator == 0 {
-                        "{{closure}}".to_string()
+                        out.push_str("{{closure}}");
                     } else {
-                        format!("{{{{closure}}}}[{disambiguator}]")
+                        let _ =
+                            write!(out, "{{{{closure}}}}[{disambiguator}]");
                     }
                 }
-                DefPathData::Ctor => "{{constructor}}".to_string(),
+                DefPathData::Ctor => {
+                    out.push_str("::{{constructor}}");
+                }
                 DefPathData::AnonConst | DefPathData::LateAnonConst => {
-                    // Anonymous constants use _ or _[N] format in profiles.
+                    out.push_str("::");
                     if disambiguator == 0 {
-                        "_".to_string()
+                        out.push('_');
                     } else {
-                        format!("_[{disambiguator}]")
+                        let _ = write!(out, "_[{disambiguator}]");
                     }
                 }
                 DefPathData::OpaqueTy => {
+                    out.push_str("::");
                     if disambiguator == 0 {
-                        "{{opaque}}".to_string()
+                        out.push_str("{{opaque}}");
                     } else {
-                        format!("{{{{opaque}}}}[{disambiguator}]")
+                        let _ =
+                            write!(out, "{{{{opaque}}}}[{disambiguator}]");
                     }
                 }
                 DefPathData::AnonAssocTy(sym) => {
-                    format!("{{{{assoc_ty:{sym}}}}}")
+                    out.push_str("::{{assoc_ty:");
+                    out.push_str(sym.as_str());
+                    out.push_str("}}");
                 }
                 DefPathData::SyntheticCoroutineBody => {
-                    "{{coroutine}}".to_string()
+                    out.push_str("::{{coroutine}}");
                 }
-                DefPathData::NestedStatic => "{{nested_static}}".to_string(),
+                DefPathData::NestedStatic => {
+                    out.push_str("::{{nested_static}}");
+                }
                 DefPathData::OpaqueLifetime(sym) => {
-                    format!("{{{{lifetime:{sym}}}}}")
+                    out.push_str("::{{lifetime:");
+                    out.push_str(sym.as_str());
+                    out.push_str("}}");
                 }
                 DefPathData::DesugaredAnonymousLifetime => {
-                    "{{anon_lifetime}}".to_string()
+                    out.push_str("::{{anon_lifetime}}");
                 }
-            };
-            segments.push(segment);
+            }
         }
 
-        segments.join("::")
+        self.raw_def_path_cache
+            .borrow_mut()
+            .insert(def_id, out.clone());
+        out
     }
 
     /// Get a simple type/trait name without module path.

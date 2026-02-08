@@ -315,19 +315,6 @@ fn assert_has_anchor(graph: &SymbolGraph, impl_pattern: &str, anchor: &str) {
     );
 }
 
-/// Assert that an impl has an anchor with the exact full path (including crate prefix).
-fn assert_has_anchor_exact(
-    graph: &SymbolGraph,
-    impl_pattern: &str,
-    anchor: &str,
-) {
-    let anchors = get_impl_anchors(graph, impl_pattern);
-    assert!(
-        anchors.iter().any(|a| a == anchor),
-        "impl {impl_pattern} should have exact anchor {anchor}\nAnchors: {anchors:?}"
-    );
-}
-
 /// Assert that an impl has no anchors.
 #[expect(dead_code, reason = "utility function for future tests")]
 fn assert_no_anchors(graph: &SymbolGraph, impl_pattern: &str) {
@@ -1261,16 +1248,23 @@ fn test_anchor_crate_prefixed_self_type() {
     let graph = extract_fixture("anchor_crate_prefixed_self_type");
     // Verify anchors include the full package/target-prefixed path, not just the
     // type name. This is important for cross-crate workspace support. The fixture
-    // package is "fixture", so we check for "[fixture/lib]::" prefix.
-    assert_has_anchor_exact(
-        &graph,
-        "impl MyTrait for MyType",
-        "[fixture/lib]::MyType",
+    // package is "fixture", so we check for a "[fixture/<target>]::" prefix.
+    let anchors = get_impl_anchors(&graph, "impl MyTrait for MyType");
+    let has_my_type = anchors.iter().any(|anchor| {
+        (anchor == "[fixture/lib]::MyType")
+            || (anchor == "[fixture/test]::MyType")
+    });
+    let has_my_trait = anchors.iter().any(|anchor| {
+        (anchor == "[fixture/lib]::MyTrait")
+            || (anchor == "[fixture/test]::MyTrait")
+    });
+    assert!(
+        has_my_type,
+        "impl MyTrait for MyType should have anchor [fixture/<target>]::MyType\nAnchors: {anchors:?}"
     );
-    assert_has_anchor_exact(
-        &graph,
-        "impl MyTrait for MyType",
-        "[fixture/lib]::MyTrait",
+    assert!(
+        has_my_trait,
+        "impl MyTrait for MyType should have anchor [fixture/<target>]::MyTrait\nAnchors: {anchors:?}"
     );
 }
 

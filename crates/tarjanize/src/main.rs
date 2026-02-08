@@ -86,6 +86,10 @@ enum Commands {
     Cost {
         #[command(flatten)]
         io: IoArgs,
+
+        /// Fit the cost model using lib targets only.
+        #[arg(long)]
+        fit_libs_only: bool,
     },
 }
 
@@ -107,6 +111,15 @@ fn main() -> Result<()> {
         Commands::Condense { io } => {
             io.run(|r, w| Ok(tarjanize_condense::run(r, w)?))
         }
-        Commands::Cost { io } => io.run(|r, w| Ok(tarjanize_cost::run(r, w)?)),
+        Commands::Cost {
+            io,
+            fit_libs_only,
+        } => io.run(|r, w| {
+            Ok(tarjanize_cost::run_with_options(
+                r,
+                w,
+                tarjanize_cost::CostOptions { fit_libs_only },
+            )?)
+        }),
     }
 }

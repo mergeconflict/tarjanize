@@ -14,6 +14,7 @@ workspace = true
 
 [dependencies]
 tarjanize-schemas.workspace = true
+tarjanize-magsac.workspace = true
 indexmap.workspace = true
 jiff.workspace = true
 petgraph.workspace = true

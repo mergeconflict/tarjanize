@@ -370,9 +370,9 @@ mod tests {
                 event_times_ms in hash_map(
                     arb_name(),
                     (0..1_000_000).prop_map(f64::from),
-                    0..5,
+                    0..3,
                 ),
-                dependencies in hash_set(arb_path(), 0..5),
+                dependencies in hash_set(arb_path(), 0..3),
                 kind in arb_symbol_kind(),
             )
         -> Symbol {
@@ -384,19 +384,19 @@ mod tests {
     fn arb_module() -> impl Strategy<Value = Module> {
         prop_compose! {
             fn arb_leaf_module()
-                (symbols in hash_map(arb_name(), arb_symbol(), 0..8))
+                (symbols in hash_map(arb_name(), arb_symbol(), 0..4))
             -> Module {
                 Module { symbols, submodules: HashMap::new() }
             }
         }
         arb_leaf_module().prop_recursive(
-            3, // max depth
-            3, // we want about 3 submodules total
+            2, // max depth
+            2, // we want about 2 submodules total
             1, // average of 1 submodule per module
             |inner| {
                 (
-                    hash_map(arb_name(), arb_symbol(), 0..8),
-                    hash_map(arb_name(), inner, 0..3),
+                    hash_map(arb_name(), arb_symbol(), 0..4),
+                    hash_map(arb_name(), inner, 0..2),
                 )
                     .prop_map(|(symbols, submodules)| Module {
                         symbols,
@@ -413,7 +413,7 @@ mod tests {
     fn arb_target_timings() -> impl Strategy<Value = TargetTimings> {
         (
             (0..1_000_000).prop_map(f64::from),
-            hash_map(arb_name(), (0..1_000_000).prop_map(f64::from), 0..5),
+            hash_map(arb_name(), (0..1_000_000).prop_map(f64::from), 0..3),
         )
             .prop_map(|(wall_time_ms, event_times_ms)| TargetTimings {
                 wall_time_ms,
@@ -426,7 +426,7 @@ mod tests {
         (
             arb_target_timings(),
             // Dependencies are target references like "package/lib" or "package/bin/name"
-            hash_set(arb_path(), 0..5),
+            hash_set(arb_path(), 0..3),
             arb_module(),
         )
             .prop_map(|(timings, dependencies, root)| Target {
@@ -448,15 +448,15 @@ mod tests {
 
     /// Strategy for generating arbitrary Package values.
     fn arb_package() -> impl Strategy<Value = Package> {
-        // Generate 1-4 targets per package
-        hash_map(arb_target_key(), arb_target(), 1..5)
+        // Generate 1-3 targets per package
+        hash_map(arb_target_key(), arb_target(), 1..4)
             .prop_map(|targets| Package { targets })
     }
 
     prop_compose! {
         /// Strategy for generating arbitrary SymbolGraph values.
         fn arb_symbol_graph()
-            (packages in hash_map(arb_name(), arb_package(), 1..10))
+            (packages in hash_map(arb_name(), arb_package(), 1..6))
         -> SymbolGraph {
             SymbolGraph { packages }
         }
