@@ -14,9 +14,9 @@
 //! the raw profile files to avoid disk space exhaustion.
 
 use std::collections::{HashMap, HashSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::io::Write;
 use std::sync::Mutex;
 use std::{env, fs, io};
 
@@ -36,20 +36,42 @@ use crate::profile::ProfileData;
 /// Run the driver: act as a rustc wrapper.
 ///
 /// Arguments should be `["/path/to/rustc", ...actual_rustc_args]`.
+#[expect(
+    clippy::too_many_lines,
+    reason = "main driver dispatch: env parsing, arg mangling, callback setup, profile loading"
+)]
 pub fn run(args: &[String]) -> ExitCode {
     // Parse environment to determine if we should extract.
     // Environment not set up means just run rustc normally.
     // This can happen during initial cargo probing.
     let Some(config) = DriverConfig::from_env() else {
         trace!("no tarjanize config, passing through to rustc");
-        return run_via_rustc_driver(args, &mut NoOpCallbacks);
+        return run_rustc_with_span(
+            args,
+            &mut NoOpCallbacks,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     };
 
     // Determine the crate name from rustc arguments.
     // Can't determine crate name means pass through to rustc.
     let Some(crate_name) = find_crate_name(args) else {
         trace!("no crate name in args, passing through to rustc");
-        return run_via_rustc_driver(args, &mut NoOpCallbacks);
+        return run_rustc_with_span(
+            args,
+            &mut NoOpCallbacks,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     };
 
     // Check if this is a workspace crate we should analyze.
@@ -83,7 +105,16 @@ pub fn run(args: &[String]) -> ExitCode {
                 source_file = %source_file.display(),
                 "source not in workspace, compiling without extraction"
             );
-            return run_via_rustc_driver(args, &mut NoOpCallbacks);
+            return run_rustc_with_span(
+                args,
+                &mut NoOpCallbacks,
+                Some(&crate_name),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
         }
     } else {
         // No direct match and can't find source file - external crate.
@@ -91,7 +122,16 @@ pub fn run(args: &[String]) -> ExitCode {
             crate_name,
             "not a workspace crate, compiling without extraction"
         );
-        return run_via_rustc_driver(args, &mut NoOpCallbacks);
+        return run_rustc_with_span(
+            args,
+            &mut NoOpCallbacks,
+            Some(&crate_name),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
     };
 
     // Determine target kind from rustc args.
@@ -103,6 +143,81 @@ pub fn run(args: &[String]) -> ExitCode {
         is_integration_test,
     );
 
+    // Only record profiles from metadata-only invocations to avoid duplicate
+    // profile files for targets that build multiple times under cargo check.
+    let emit = extract_flag_value(args, "--emit");
+    let emit_str = emit.as_deref().unwrap_or("");
+    let emit_set: HashSet<&str> = emit_str
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    let allowed_emits = ["metadata", "dep-info"];
+    let metadata_only = emit_set.contains("metadata")
+        && emit_set.iter().all(|emit| allowed_emits.contains(emit));
+
+    log_rustc_invocation(
+        args,
+        &crate_name,
+        &package_name,
+        &target_key,
+        is_test,
+        is_integration_test,
+    );
+
+    if !metadata_only {
+        info!(
+            crate_name,
+            package_name,
+            target_key,
+            emit = %emit_str,
+            "skipping non-metadata invocation"
+        );
+        return run_rustc_with_span(
+            args,
+            &mut NoOpCallbacks,
+            Some(&crate_name),
+            Some(&package_name),
+            Some(&target_key),
+            Some(emit_str),
+            Some(is_test),
+            Some(is_integration_test),
+        );
+    }
+
+    let target_profile_dir = if config.skip_profile {
+        None
+    } else {
+        Some(config.profile_dir.join(format!(
+            "{}_{}",
+            package_name,
+            target_key.replace('/', "_")
+        )))
+    };
+
+    if let Some(dir) = &target_profile_dir
+        && profile_dir_has_profile(dir)
+    {
+        info!(
+            crate_name,
+            package_name,
+            target_key,
+            emit = %emit_str,
+            dir = %dir.display(),
+            "skipping duplicate metadata invocation"
+        );
+        return run_rustc_with_span(
+            args,
+            &mut NoOpCallbacks,
+            Some(&crate_name),
+            Some(&package_name),
+            Some(&target_key),
+            Some(emit_str),
+            Some(is_test),
+            Some(is_integration_test),
+        );
+    }
+
     debug!(
         crate_name,
         package_name,
@@ -113,6 +228,8 @@ pub fn run(args: &[String]) -> ExitCode {
     );
 
     // This is a workspace crate - run with our extraction callbacks.
+    let crate_name_for_span = crate_name.clone();
+    let package_name_for_span = package_name.clone();
     let mut callbacks = TarjanizeCallbacks {
         config,
         crate_name,
@@ -142,19 +259,25 @@ pub fn run(args: &[String]) -> ExitCode {
         // Each target (lib, test, bin) gets its own profile subdirectory so they can
         // clean up independently without interfering with concurrent targets.
         // Use underscore-separated key for filesystem safety (bin/foo → bin_foo).
-        let dir = callbacks.config.profile_dir.join(format!(
-            "{}_{}",
-            callbacks.package_name,
-            callbacks.target_key.replace('/', "_")
-        ));
-        fs::create_dir_all(&dir)
-            .expect("failed to create profile subdirectory");
+        let dir = target_profile_dir
+            .as_ref()
+            .expect("profile dir required for metadata-only invocation");
+        fs::create_dir_all(dir).expect("failed to create profile subdirectory");
         compiler_args.push(format!("-Zself-profile={}", dir.display()));
         compiler_args.push("-Zself-profile-events=default,args".to_string());
-        Some(dir)
+        Some(dir.clone())
     };
 
-    let exit_code = run_via_rustc_driver(&compiler_args, &mut callbacks);
+    let exit_code = run_rustc_with_span(
+        &compiler_args,
+        &mut callbacks,
+        Some(crate_name_for_span.as_str()),
+        Some(package_name_for_span.as_str()),
+        Some(&target_key),
+        Some(emit_str),
+        Some(is_test),
+        Some(is_integration_test),
+    );
 
     // After rustc completes (including codegen), write the results.
     // In single-pass mode: apply costs from profile data, then delete profile files.
@@ -185,6 +308,136 @@ pub fn run(args: &[String]) -> ExitCode {
     }
 
     exit_code
+}
+
+fn log_rustc_invocation(
+    args: &[String],
+    crate_name: &str,
+    package_name: &str,
+    target_key: &str,
+    is_test: bool,
+    is_integration_test: bool,
+) {
+    let emit = extract_flag_value(args, "--emit");
+    let mut crate_types = Vec::new();
+    collect_flag_values(args, "--crate-type", &mut crate_types);
+    let metadata = extract_codegen_value(args, "metadata");
+    let extra_filename = extract_codegen_value(args, "extra-filename");
+    let target = extract_flag_value(args, "--target");
+
+    let emit_str = emit.as_deref().unwrap_or("");
+    let metadata_only = emit_str.contains("metadata")
+        && !emit_str.contains("link")
+        && !emit_str.contains("obj")
+        && !emit_str.contains("assembly");
+
+    info!(
+        crate_name,
+        package_name,
+        target_key,
+        is_test,
+        is_integration_test,
+        emit = %emit_str,
+        crate_types = ?crate_types,
+        target = %target.as_deref().unwrap_or(""),
+        metadata = %metadata.as_deref().unwrap_or(""),
+        extra_filename = %extra_filename.as_deref().unwrap_or(""),
+        metadata_only,
+        "rustc invocation"
+    );
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tracing span fields mirror driver context; bundling into a struct adds indirection for no benefit"
+)]
+fn run_rustc_with_span<C: Callbacks + Send>(
+    args: &[String],
+    callbacks: &mut C,
+    crate_name: Option<&str>,
+    package_name: Option<&str>,
+    target_key: Option<&str>,
+    emit: Option<&str>,
+    is_test: Option<bool>,
+    is_integration_test: Option<bool>,
+) -> ExitCode {
+    let span = tracing::info_span!(
+        "rustc_invocation",
+        crate_name = crate_name.unwrap_or("<unknown>"),
+        package_name = package_name.unwrap_or("<unknown>"),
+        target_key = target_key.unwrap_or("<unknown>"),
+        emit = emit.unwrap_or(""),
+        is_test = is_test.unwrap_or(false),
+        is_integration_test = is_integration_test.unwrap_or(false),
+    );
+    let _enter = span.enter();
+    run_via_rustc_driver(args, callbacks)
+}
+
+fn extract_flag_value(args: &[String], flag: &str) -> Option<String> {
+    let flag_eq = format!("{flag}=");
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if let Some(value) = iter.next() {
+                return Some(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix(&flag_eq) {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn collect_flag_values(args: &[String], flag: &str, out: &mut Vec<String>) {
+    let flag_eq = format!("{flag}=");
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == flag {
+            if let Some(value) = iter.next() {
+                out.push(value.clone());
+            }
+        } else if let Some(value) = arg.strip_prefix(&flag_eq) {
+            out.push(value.to_string());
+        }
+    }
+}
+
+fn extract_codegen_value(args: &[String], key: &str) -> Option<String> {
+    let key_eq = format!("{key}=");
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "-C"
+            && let Some(value) = iter.next()
+            && let Some(rest) = value.strip_prefix(&key_eq)
+        {
+            return Some(rest.to_string());
+        } else if let Some(rest) = arg.strip_prefix("-C")
+            && let Some(value) = rest.strip_prefix(&key_eq)
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
+}
+
+fn profile_dir_has_profile(dir: &Path) -> bool {
+    if !dir.exists() {
+        return false;
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("mm_profdata")
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// Run the compiler via `rustc_driver` with the given callbacks.
@@ -537,6 +790,10 @@ fn write_crate_without_costs(
 /// The `package_name` is the cargo package this target belongs to (e.g., "tokio").
 /// For lib targets, these are the same (modulo hyphen/underscore normalization).
 /// For integration tests/benches/examples, they differ.
+#[expect(
+    clippy::too_many_lines,
+    reason = "sequential pipeline: collect paths, load profiles, roll up, attribute, write"
+)]
 fn process_and_write_crate(
     config: &DriverConfig,
     crate_name: &str,
@@ -557,9 +814,25 @@ fn process_and_write_crate(
     // Collect all symbol paths up front so nested frontend paths can be
     // rolled up to their nearest enclosing symbol before attribution.
     let mut symbol_paths = HashSet::new();
-    collect_symbol_paths(&module, crate_name, &mut symbol_paths);
+    tracing::info_span!(
+        "collect_symbol_paths",
+        crate_name,
+        package_name,
+        target_key
+    )
+    .in_scope(|| {
+        collect_symbol_paths(&module, crate_name, &mut symbol_paths);
+    });
     let mut module_paths = HashSet::new();
-    collect_module_paths(&module, crate_name, &mut module_paths);
+    tracing::info_span!(
+        "collect_module_paths",
+        crate_name,
+        package_name,
+        target_key
+    )
+    .in_scope(|| {
+        collect_module_paths(&module, crate_name, &mut module_paths);
+    });
 
     // Load profile data from this target's dedicated profile directory.
     let mut profile_data = {
@@ -570,7 +843,10 @@ fn process_and_write_crate(
             crate_name = %crate_name,
         )
         .entered();
-        ProfileData::load_from_dir_with_symbols(profile_dir, Some(&symbol_paths))
+        ProfileData::load_from_dir_with_symbols(
+            profile_dir,
+            Some(&symbol_paths),
+        )
     };
 
     // Get target timings (wall-clock time and unattributed event times).
@@ -580,16 +856,32 @@ fn process_and_write_crate(
         .cloned()
         .unwrap_or_default();
     let crate_prefix = format!("{crate_name}::");
-    let summary = profile_data.roll_up_unmatched_frontend_costs(
-        &symbol_paths,
-        &module_paths,
-        &crate_prefix,
-    );
+    let summary = tracing::info_span!(
+        "roll_up_unmatched_frontend_costs",
+        crate_name,
+        package_name,
+        target_key
+    )
+    .in_scope(|| {
+        profile_data.roll_up_unmatched_frontend_costs(
+            &symbol_paths,
+            &module_paths,
+            &crate_prefix,
+        )
+    });
 
     // Apply per-event timing breakdowns to the module's symbols.
     // Use crate_name for profile lookups since profile data is keyed by rustc
     // crate name (e.g., "sync_mpsc"), not cargo package name (e.g., "tokio").
-    apply_event_times(&mut module, crate_name, &profile_data);
+    tracing::info_span!(
+        "apply_event_times",
+        crate_name,
+        package_name,
+        target_key
+    )
+    .in_scope(|| {
+        apply_event_times(&mut module, crate_name, &profile_data);
+    });
     for (label, ms) in &summary.totals_by_label {
         *timings.event_times_ms.entry(label.clone()).or_default() += ms;
     }
@@ -600,18 +892,26 @@ fn process_and_write_crate(
             .or_default() += summary.total_unmatched_ms;
     }
 
-    if let Err(error) = append_unmatched_paths(
-        &unmatched_output_path(config),
-        package_name,
+    tracing::info_span!(
+        "append_unmatched_paths",
         crate_name,
-        target_key,
-        &summary,
-    ) {
-        warn!(
-            error = %error,
-            "failed to append unmatched frontend paths"
-        );
-    }
+        package_name,
+        target_key
+    )
+    .in_scope(|| {
+        if let Err(error) = append_unmatched_paths(
+            &unmatched_output_path(config),
+            package_name,
+            crate_name,
+            target_key,
+            &summary,
+        ) {
+            warn!(
+                error = %error,
+                "failed to append unmatched frontend paths"
+            );
+        }
+    });
 
     // Build the complete Target.
     // Dependencies are populated later by the orchestrator from cargo metadata.
@@ -756,7 +1056,8 @@ fn collect_module_paths(
     module_paths: &mut HashSet<String>,
 ) {
     for (submod_name, submodule) in &module.submodules {
-        let submod_path = format!("{path_prefix}::{submod_name}").replace('-', "_");
+        let submod_path =
+            format!("{path_prefix}::{submod_name}").replace('-', "_");
         module_paths.insert(submod_path.clone());
         collect_module_paths(submodule, &submod_path, module_paths);
     }

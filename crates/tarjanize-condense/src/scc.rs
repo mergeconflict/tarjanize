@@ -12,7 +12,7 @@ use indexmap::IndexSet;
 use petgraph::algo::condensation;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::unionfind::UnionFind;
-use tarjanize_cost::{TwoVarFit, two_var_fit};
+use tarjanize_cost::{CostModel, ModelFit, model_fit};
 use tarjanize_schemas::{
     Crate, Module, Package, Symbol, SymbolGraph, SymbolKind, TargetTimings,
     sum_event_times,
@@ -195,6 +195,7 @@ impl<'a> SymbolIndex<'a> {
 )]
 pub(crate) fn condense_and_partition(
     symbol_graph: &SymbolGraph,
+    cost_model: Option<&CostModel>,
 ) -> SymbolGraph {
     // Handle empty graph case.
     if symbol_graph.packages.is_empty() {
@@ -492,7 +493,7 @@ pub(crate) fn condense_and_partition(
     );
 
     // Step 9: Build output SymbolGraph.
-    build_output_graph(&index, set_to_symbols, symbol_graph)
+    build_output_graph(&index, set_to_symbols, symbol_graph, cost_model)
 }
 
 /// Builds the output `SymbolGraph` from grouped symbols.
@@ -500,10 +501,15 @@ pub(crate) fn condense_and_partition(
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
+#[expect(
+    clippy::too_many_lines,
+    reason = "three-variable model setup adds unavoidable per-target computation"
+)]
 fn build_output_graph(
     index: &SymbolIndex<'_>,
     set_to_symbols: HashMap<u32, Vec<usize>>,
     original_graph: &SymbolGraph,
+    cost_model: Option<&CostModel>,
 ) -> SymbolGraph {
     // Sort sets by ID for deterministic output.
     let mut sets: Vec<_> = set_to_symbols.into_iter().collect();
@@ -541,11 +547,24 @@ fn build_output_graph(
         .collect();
     let path_mapping = compute_path_mapping(index, &set_crate_names);
 
-    // Fit the two-variable regression model on original targets so we can
-    // predict wall times for synthetic targets. The model is:
-    //   wall_time = a · Σ(symbol_attr) + b · Σ(metadata_decode_*)
+    // Build mapping from symbol index → synthetic target name.
+    // Used to derive synthetic target dependencies from symbol-level edges.
     //
-    // Pre-compute per-target metadata decode sums from the original graph.
+    // We derive deps from the symbol graph (which is acyclic after SCC
+    // condensation) rather than the original target-level deps. The original
+    // target deps include dev-dependency edges (test→lib) that create cycles
+    // when condensation cross-partitions test and lib symbols from different
+    // packages.
+    let mut symbol_to_synthetic: Vec<String> = vec![String::new(); index.len()];
+    for (_set_id, crate_name, symbol_indices) in &set_crate_data {
+        let target_name = format!("{crate_name}/synthetic");
+        for &sym_idx in symbol_indices {
+            symbol_to_synthetic[sym_idx].clone_from(&target_name);
+        }
+    }
+
+    // Pre-compute per-target metadata and other (non-metadata) event sums.
+    // Used by both the external CostModel path and the internal fallback.
     let target_meta: HashMap<String, f64> = original_graph
         .packages
         .iter()
@@ -564,22 +583,46 @@ fn build_output_graph(
         })
         .collect();
 
-    // Build regression data from targets that have wall-clock profiling data.
-    let mut regression_data: Vec<(f64, f64, f64)> = Vec::new();
-    for (pkg, p) in &original_graph.packages {
-        for (tgt, crate_data) in &p.targets {
-            let wall = crate_data.timings.wall_time_ms;
-            if wall <= 0.0 {
-                continue;
-            }
-            let target_id = format!("{pkg}/{tgt}");
-            let attr = collect_symbol_attr(&crate_data.root);
-            let meta = target_meta.get(&target_id).copied().unwrap_or(0.0);
-            regression_data.push((attr, meta, wall));
-        }
-    }
+    let target_other: HashMap<String, f64> = original_graph
+        .packages
+        .iter()
+        .flat_map(|(pkg, p)| {
+            p.targets.iter().map(move |(tgt, crate_data)| {
+                let target_id = format!("{pkg}/{tgt}");
+                let other: f64 = crate_data
+                    .timings
+                    .event_times_ms
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("metadata_decode_"))
+                    .map(|(_, v)| v)
+                    .sum();
+                (target_id, other)
+            })
+        })
+        .collect();
 
-    let model = two_var_fit(&regression_data);
+    // Internal model fitting (only used when no external CostModel is
+    // provided). Kept as the backward-compatible fallback path.
+    let model = if cost_model.is_none() {
+        let mut regression_data: Vec<Vec<f64>> = Vec::new();
+        for (pkg, p) in &original_graph.packages {
+            for (tgt, crate_data) in &p.targets {
+                let wall = crate_data.timings.wall_time_ms;
+                if wall <= 0.0 {
+                    continue;
+                }
+                let target_id = format!("{pkg}/{tgt}");
+                let attr = collect_symbol_attr(&crate_data.root);
+                let meta = target_meta.get(&target_id).copied().unwrap_or(0.0);
+                let other =
+                    target_other.get(&target_id).copied().unwrap_or(0.0);
+                regression_data.push(vec![attr, meta, other, wall]);
+            }
+        }
+        model_fit(&regression_data)
+    } else {
+        None
+    };
 
     // Pass 2: Build output graph using the mapping.
     // Each partition becomes a separate package. The target type is determined
@@ -596,24 +639,55 @@ fn build_output_graph(
             .map(|&i| sum_event_times(&index.get_symbol(i).event_times_ms))
             .sum();
 
-        // Max metadata decode cost from constituent original targets.
-        // A synthetic target inherits the dependencies of all its
-        // constituents, so its metadata cost is at least as large as the
-        // largest constituent.
+        // Collect constituent original targets for this partition.
         let constituent_targets: HashSet<&str> = symbol_indices
             .iter()
             .map(|&i| index.get_original_target(i))
             .collect();
+
+        // Derive synthetic target dependencies from symbol-level edges.
+        // For each symbol in this partition, check its dependencies — if any
+        // point to symbols in a different partition, that partition's synthetic
+        // target becomes a dependency. This is cycle-free by construction
+        // because the symbol graph is a DAG after SCC condensation.
+        //
+        // External deps (symbols not in the index, e.g., std) are ignored
+        // since they're outside the workspace and not in our graph.
+        let my_target = format!("{crate_name}/synthetic");
+        let synthetic_deps: HashSet<String> = symbol_indices
+            .iter()
+            .flat_map(|&sym_idx| {
+                index.get_symbol(sym_idx).dependencies.iter()
+            })
+            .filter_map(|dep_path| {
+                let dep_idx = index.get_index(dep_path)?;
+                let dep_target = &symbol_to_synthetic[dep_idx];
+                (dep_target != &my_target).then(|| dep_target.clone())
+            })
+            .collect();
+
+        // Estimate meta/other for the synthetic crate using the
+        // max-constituent heuristic: a synthetic crate inherits at least
+        // as much metadata/other overhead as its largest constituent.
         let meta: f64 = constituent_targets
             .iter()
             .filter_map(|t| target_meta.get(*t))
             .copied()
             .fold(0.0_f64, f64::max);
+        let other: f64 = constituent_targets
+            .iter()
+            .filter_map(|t| target_other.get(*t))
+            .copied()
+            .fold(0.0_f64, f64::max);
 
-        // Apply the fitted model to predict wall time. If the model
-        // couldn't be fitted (insufficient profiling data), fall back
-        // to the raw symbol attribution sum.
-        let wall_time_ms = predict_wall_time(model.as_ref(), attr, meta);
+        // Predict wall time: external CostModel coefficients if provided,
+        // otherwise internally fitted regression (or raw attr fallback).
+        let wall_time_ms = if let Some(cm) = cost_model {
+            cm.predict(attr, meta, other)
+        } else {
+            predict_wall_time(model.as_ref(), attr, meta, other)
+        };
+        let dependencies = synthetic_deps;
 
         let crate_data = Crate {
             timings: TargetTimings {
@@ -621,9 +695,7 @@ fn build_output_graph(
                 ..Default::default()
             },
             root: root_module,
-            // Dependencies for synthetic crates would need to be computed
-            // from symbol dependencies if needed for downstream analysis.
-            ..Default::default()
+            dependencies,
         };
 
         let mut targets = HashMap::new();
@@ -649,13 +721,18 @@ fn collect_symbol_attr(module: &Module) -> f64 {
     total
 }
 
-/// Predicts wall time using the fitted two-variable model.
+/// Predicts wall time using the fitted regression model.
 ///
 /// Falls back to the raw symbol attribution sum when no model is available
 /// (e.g., insufficient profiling data for regression).
-fn predict_wall_time(model: Option<&TwoVarFit>, attr: f64, meta: f64) -> f64 {
+fn predict_wall_time(
+    model: Option<&ModelFit>,
+    attr: f64,
+    meta: f64,
+    other: f64,
+) -> f64 {
     match model {
-        Some(fit) => fit.a * attr + fit.b * meta,
+        Some(fit) => fit.model.predict(&[attr, meta, other]),
         None => attr,
     }
 }
@@ -992,7 +1069,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Single symbol stays in its original crate.
         assert_eq!(result.packages.len(), 1);
@@ -1012,7 +1089,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Chain should merge into one crate.
         assert_eq!(result.packages.len(), 1);
@@ -1038,7 +1115,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Should have 3 crates: {A}, {B}, {C, D}.
         assert_eq!(result.packages.len(), 3);
@@ -1069,7 +1146,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Diamond should merge into one crate.
         assert_eq!(result.packages.len(), 1);
@@ -1096,7 +1173,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Cycle = one SCC = one crate.
         assert_eq!(result.packages.len(), 1);
@@ -1111,7 +1188,7 @@ mod tests {
             packages: HashMap::new(),
         };
 
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         assert!(result.packages.is_empty());
     }
@@ -1135,7 +1212,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Should have 3 crates: {A, B, C}, {D}, {E}.
         assert_eq!(result.packages.len(), 3);
@@ -1155,7 +1232,7 @@ mod tests {
         crates.insert("my_crate".to_string(), make_crate(symbols));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Should have 3 crates.
         assert_eq!(result.packages.len(), 3);
@@ -1195,7 +1272,7 @@ mod tests {
         crates.insert("crate_b".to_string(), make_crate(symbols_b));
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Should merge into one crate since it's a simple chain.
         assert_eq!(result.packages.len(), 1);
@@ -1266,7 +1343,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = condense_and_partition(&graph);
+        let result = condense_and_partition(&graph, None);
 
         // Expected: {A}, {B}, {C, D}
         let mut partitions: Vec<Vec<&str>> = result
@@ -1354,7 +1431,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = condense_and_partition(&graph);
+        let result = condense_and_partition(&graph, None);
 
         // Expected: {A, E}, {B}, {C, D} — 3 partitions
         let mut partitions: Vec<Vec<&str>> = result
@@ -1417,7 +1494,7 @@ mod tests {
             }
         }"#).unwrap();
 
-        let result = condense_and_partition(&graph);
+        let result = condense_and_partition(&graph, None);
 
         assert_eq!(
             result
@@ -1497,7 +1574,7 @@ mod tests {
         );
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Chain merges into one crate.
         assert_eq!(result.packages.len(), 1);
@@ -1571,7 +1648,7 @@ mod tests {
         );
 
         let symbol_graph = make_graph(crates);
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
         // Three crates: {a}, {b}, {c}.
         assert_eq!(result.packages.len(), 3);
@@ -1597,20 +1674,20 @@ mod tests {
     #[test]
     #[expect(
         clippy::too_many_lines,
-        reason = "test requires 4 packages with profiling data for regression"
+        reason = "test requires 5 packages with profiling data for regression"
     )]
     fn test_model_based_prediction_for_merged_crate() {
         // Verify that when enough original targets have wall-clock profiling
-        // data (wall_time_ms > 0 and metadata_decode_* entries), the
-        // two-variable regression model is fitted and used to predict
-        // synthetic target wall times — not just raw symbol attribution sums.
+        // data, the three-variable regression model is fitted and used to
+        // predict synthetic target wall times — not just raw symbol
+        // attribution sums.
         //
-        // Setup: 4 packages with a single lib target each.
+        // Setup: 5 packages with a single lib target each.
         //   - pkg_a has symbols `a → b` (chain, will merge into one crate)
-        //   - pkg_b, pkg_c, pkg_d each have one independent symbol
+        //   - pkg_b, pkg_c, pkg_d, pkg_e each have one independent symbol
         //
         // All packages have profiling data that perfectly fits:
-        //   wall_time = 2.0 * attr + 3.0 * meta
+        //   wall_time = 2.0 * attr + 3.0 * meta + 1.5 * other
         //
         // After merge, the synthetic crate containing {a, b} should have
         // its wall_time_ms predicted by the model, not just attr sum.
@@ -1620,9 +1697,10 @@ mod tests {
             symbol_name: &str,
             symbol_attr: f64,
             meta: f64,
+            other: f64,
             deps: HashSet<String>,
         ) -> Package {
-            let wall = 2.0 * symbol_attr + 3.0 * meta;
+            let wall = 2.0 * symbol_attr + 3.0 * meta + 1.5 * other;
             let mut symbols = HashMap::new();
             symbols.insert(
                 symbol_name.to_string(),
@@ -1642,10 +1720,10 @@ mod tests {
             let crate_data = Crate {
                 timings: TargetTimings {
                     wall_time_ms: wall,
-                    event_times_ms: HashMap::from([(
-                        "metadata_decode_entry_foo".to_string(),
-                        meta,
-                    )]),
+                    event_times_ms: HashMap::from([
+                        ("metadata_decode_entry_foo".to_string(), meta),
+                        ("check_mod_type_wf".to_string(), other),
+                    ]),
                 },
                 root: Module {
                     symbols,
@@ -1686,13 +1764,13 @@ mod tests {
         );
         let pkg_a_crate = Crate {
             timings: TargetTimings {
-                // attr = 100 + 50 = 150, meta = 20
-                // wall = 2*150 + 3*20 = 360
-                wall_time_ms: 360.0,
-                event_times_ms: HashMap::from([(
-                    "metadata_decode_entry_foo".to_string(),
-                    20.0,
-                )]),
+                // attr = 100 + 50 = 150, meta = 20, other = 10
+                // wall = 2*150 + 3*20 + 1.5*10 = 375
+                wall_time_ms: 375.0,
+                event_times_ms: HashMap::from([
+                    ("metadata_decode_entry_foo".to_string(), 20.0),
+                    ("check_mod_type_wf".to_string(), 10.0),
+                ]),
             },
             root: Module {
                 symbols: pkg_a_symbols,
@@ -1707,22 +1785,28 @@ mod tests {
         };
 
         // Independent packages that provide regression data points.
-        let pkg_b = make_profiled_package("x", 200.0, 10.0, HashSet::new());
-        let pkg_c = make_profiled_package("y", 80.0, 30.0, HashSet::new());
-        let pkg_d = make_profiled_package("z", 300.0, 5.0, HashSet::new());
+        let pkg_b =
+            make_profiled_package("x", 200.0, 10.0, 40.0, HashSet::new());
+        let pkg_c =
+            make_profiled_package("y", 80.0, 30.0, 20.0, HashSet::new());
+        let pkg_d =
+            make_profiled_package("z", 300.0, 5.0, 50.0, HashSet::new());
+        let pkg_e =
+            make_profiled_package("w", 120.0, 25.0, 30.0, HashSet::new());
 
         let mut packages = HashMap::new();
         packages.insert("pkg_a".to_string(), pkg_a);
         packages.insert("pkg_b".to_string(), pkg_b);
         packages.insert("pkg_c".to_string(), pkg_c);
         packages.insert("pkg_d".to_string(), pkg_d);
+        packages.insert("pkg_e".to_string(), pkg_e);
 
         let symbol_graph = SymbolGraph { packages };
-        let result = condense_and_partition(&symbol_graph);
+        let result = condense_and_partition(&symbol_graph, None);
 
-        // pkg_a's two symbols merge into one crate; the other three stay
-        // separate. Total = 4 packages in output.
-        assert_eq!(result.packages.len(), 4);
+        // pkg_a's two symbols merge into one crate; the other four stay
+        // separate. Total = 5 packages in output.
+        assert_eq!(result.packages.len(), 5);
 
         // Find the merged crate (contains both a and b).
         let merged = result
@@ -1736,9 +1820,10 @@ mod tests {
 
         let timings = &get_synthetic(merged).timings;
 
-        // The model fits wall = 2*attr + 3*meta perfectly.
-        // Merged crate: attr = 100 + 50 = 150, meta = max(20) = 20
-        // Predicted wall = 2*150 + 3*20 = 360
+        // The model fits wall = 2*attr + 3*meta + 1.5*other perfectly.
+        // Merged crate: attr = 100 + 50 = 150, meta = max(20) = 20,
+        //               other = max(10) = 10
+        // Predicted wall = 2*150 + 3*20 + 1.5*10 = 375
         //
         // Without the model, wall would just be attr = 150. Verify we get
         // the model-based prediction instead.
@@ -1749,9 +1834,234 @@ mod tests {
             timings.wall_time_ms
         );
         assert!(
-            (timings.wall_time_ms - 360.0).abs() < 1.0,
-            "Expected wall_time_ms ~360 from model (2*150 + 3*20), got {}",
+            (timings.wall_time_ms - 375.0).abs() < 1.0,
+            "Expected wall_time_ms ~375 from model \
+             (2*150 + 3*20 + 1.5*10), got {}",
             timings.wall_time_ms
         );
+    }
+
+    #[test]
+    fn test_cost_model_based_prediction() {
+        // When an external CostModel is provided, synthetic crate wall
+        // times should use CostModel.predict(attr, meta, other) with
+        // the max-constituent heuristic for meta/other.
+        //
+        // Setup: fork graph where A and B both depend on C.
+        // A → C, B → C. Result: {A}, {B}, {C} — three crates.
+        //
+        // CostModel: wall = 2·attr + 3·meta + 1·other
+        //
+        // For crate {C} (attr=30, meta=0, other=0 — no profiling data):
+        //   wall = 2*30 + 3*0 + 1*0 = 60
+        let model = CostModel {
+            coeff_attr: 2.0,
+            coeff_meta: 3.0,
+            coeff_other: 1.0,
+            r_squared: 0.99,
+            inlier_threshold: 500.0,
+        };
+
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "a".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                dependencies: [path("my_crate", "c")].into_iter().collect(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        symbols.insert(
+            "b".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 80.0)]),
+                dependencies: [path("my_crate", "c")].into_iter().collect(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        symbols.insert(
+            "c".to_string(),
+            Symbol {
+                file: "test.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 30.0)]),
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my_crate".to_string(),
+            Crate {
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            },
+        );
+
+        let symbol_graph = make_graph(crates);
+        let result = condense_and_partition(&symbol_graph, Some(&model));
+
+        // Three crates: {a}, {b}, {c}.
+        assert_eq!(result.packages.len(), 3);
+
+        // Find the crate containing 'c' and check its predicted wall time.
+        // c has attr=30, meta=0, other=0 (no profiling data on test targets).
+        // wall = 2*30 + 3*0 + 1*0 = 60
+        for pkg in result.packages.values() {
+            let root = get_root(pkg);
+            if root.symbols.contains_key("c") {
+                let timings = &get_synthetic(pkg).timings;
+                assert!(
+                    (timings.wall_time_ms - 60.0).abs() < 1.0,
+                    "Expected wall_time_ms ~60 from CostModel, got {}",
+                    timings.wall_time_ms
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_synthetic_deps_from_symbol_edges() {
+        // Verify that synthetic target dependencies are derived from
+        // symbol-level edges, not original target-level deps.
+        //
+        // Fork: pkg_a and pkg_b both depend on pkg_c (three crates).
+        // pkg_a also has a target-level dep on "ext-pkg/lib" which is NOT
+        // backed by any symbol edge. It should NOT appear in synthetic deps.
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "pkg_a": { "targets": { "lib": {
+                    "timings": {},
+                    "dependencies": ["pkg_c/lib", "ext-pkg/lib"],
+                    "root": { "symbols": {
+                        "a": { "file": "", "event_times_ms": {"typeck": 50.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg_c/lib]::c"] }
+                    }}
+                }}},
+                "pkg_b": { "targets": { "lib": {
+                    "timings": {},
+                    "dependencies": ["pkg_c/lib"],
+                    "root": { "symbols": {
+                        "b": { "file": "", "event_times_ms": {"typeck": 40.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg_c/lib]::c"] }
+                    }}
+                }}},
+                "pkg_c": { "targets": { "lib": {
+                    "timings": {},
+                    "root": { "symbols": {
+                        "c": { "file": "", "event_times_ms": {"typeck": 30.0},
+                               "module_def": {"kind": "Function"} }
+                    }}
+                }}}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Fork: {a}, {b}, {c} — three crates.
+        assert_eq!(result.packages.len(), 3);
+
+        for (pkg_name, pkg) in &result.packages {
+            if get_root(pkg).symbols.contains_key("a") {
+                let deps = &get_synthetic(pkg).dependencies;
+                // Symbol-level dep on [pkg_c/lib]::c → pkg_c/synthetic.
+                assert!(
+                    deps.contains("pkg_c/synthetic"),
+                    "Should have dep on pkg_c/synthetic. \
+                     Package {pkg_name} has deps: {deps:?}",
+                );
+                // External target dep (ext-pkg/lib) should NOT appear —
+                // no symbol edge backs it.
+                assert!(
+                    !deps.contains("ext-pkg/lib"),
+                    "External dep without symbol edge should not appear. \
+                     Package {pkg_name} has deps: {deps:?}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_synthetic_deps_remapped_to_new_target_ids() {
+        // Verify that dependencies between synthetic crates use new target
+        // IDs ("pkg_b/synthetic"), not original ones ("pkg_b/lib").
+        //
+        // Three packages: pkg_a and pkg_d both depend on pkg_b (fork).
+        // Result: {a}, {d}, {c} — three separate crates.
+        // pkg_a's synthetic target should depend on "pkg_b/synthetic".
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "pkg_a": { "targets": { "lib": {
+                    "timings": {},
+                    "dependencies": ["pkg_b/lib"],
+                    "root": { "symbols": {
+                        "a": { "file": "", "event_times_ms": {"typeck": 50.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg_b/lib]::c"] }
+                    }}
+                }}},
+                "pkg_b": { "targets": { "lib": {
+                    "timings": {},
+                    "root": { "symbols": {
+                        "c": { "file": "", "event_times_ms": {"typeck": 30.0},
+                               "module_def": {"kind": "Function"} }
+                    }}
+                }}},
+                "pkg_d": { "targets": { "lib": {
+                    "timings": {},
+                    "dependencies": ["pkg_b/lib"],
+                    "root": { "symbols": {
+                        "d": { "file": "", "event_times_ms": {"typeck": 40.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg_b/lib]::c"] }
+                    }}
+                }}}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Fork: {a}, {d}, {c} — three crates.
+        assert_eq!(result.packages.len(), 3);
+
+        // Find the crate containing 'a' and verify its dep uses the new
+        // target ID format.
+        for (pkg_name, pkg) in &result.packages {
+            if get_root(pkg).symbols.contains_key("a") {
+                let deps = &get_synthetic(pkg).dependencies;
+                assert!(
+                    !deps.contains("pkg_b/lib"),
+                    "Dep should be remapped from pkg_b/lib. \
+                     Package {pkg_name} has deps: {deps:?}",
+                );
+                assert!(
+                    deps.contains("pkg_b/synthetic"),
+                    "Dep should be remapped to pkg_b/synthetic. \
+                     Package {pkg_name} has deps: {deps:?}",
+                );
+            }
+        }
     }
 }

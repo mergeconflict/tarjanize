@@ -1778,13 +1778,12 @@ impl<'tcx> Extractor<'tcx> {
         reason = "formatting-heavy symbol path assembly is easiest to keep in one place"
     )]
     fn raw_def_path(&self, def_id: DefId) -> String {
-        use rustc_hir::definitions::DefPathData;
         use std::fmt::Write as _;
 
+        use rustc_hir::definitions::DefPathData;
+
         // Hot path: cache DefPath strings to avoid repeated query work.
-        if let Some(cached) =
-            self.raw_def_path_cache.borrow().get(&def_id)
-        {
+        if let Some(cached) = self.raw_def_path_cache.borrow().get(&def_id) {
             return cached.clone();
         }
 
@@ -1799,9 +1798,8 @@ impl<'tcx> Extractor<'tcx> {
             .map_or(self.crate_name.as_str(), |sym| sym.as_str());
 
         // Build directly into one buffer to avoid per-segment allocations.
-        let mut out = String::with_capacity(
-            crate_name.len() + def_path.data.len() * 8,
-        );
+        let mut out =
+            String::with_capacity(crate_name.len() + def_path.data.len() * 8);
         out.push_str(crate_name);
 
         for disambiguated in &def_path.data {
@@ -1816,12 +1814,8 @@ impl<'tcx> Extractor<'tcx> {
                     if disambiguator == 0 {
                         out.push_str(sym.as_str());
                     } else {
-                        let _ = write!(
-                            out,
-                            "{}[{}]",
-                            sym.as_str(),
-                            disambiguator
-                        );
+                        let _ =
+                            write!(out, "{}[{}]", sym.as_str(), disambiguator);
                     }
                 }
                 DefPathData::Impl => {
@@ -1846,8 +1840,7 @@ impl<'tcx> Extractor<'tcx> {
                     if disambiguator == 0 {
                         out.push_str("{{closure}}");
                     } else {
-                        let _ =
-                            write!(out, "{{{{closure}}}}[{disambiguator}]");
+                        let _ = write!(out, "{{{{closure}}}}[{disambiguator}]");
                     }
                 }
                 DefPathData::Ctor => {
@@ -1866,8 +1859,7 @@ impl<'tcx> Extractor<'tcx> {
                     if disambiguator == 0 {
                         out.push_str("{{opaque}}");
                     } else {
-                        let _ =
-                            write!(out, "{{{{opaque}}}}[{disambiguator}]");
+                        let _ = write!(out, "{{{{opaque}}}}[{disambiguator}]");
                     }
                 }
                 DefPathData::AnonAssocTy(sym) => {

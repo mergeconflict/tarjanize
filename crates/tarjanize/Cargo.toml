@@ -15,9 +15,11 @@ workspace = true
 [dependencies]
 tarjanize-condense.workspace = true
 tarjanize-cost.workspace = true
+tarjanize-schemas.workspace = true
 mimalloc.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 clap-verbosity-flag.workspace = true
+serde_json.workspace = true
 tracing-subscriber.workspace = true
 itertools.workspace = true

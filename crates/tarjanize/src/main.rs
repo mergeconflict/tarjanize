@@ -76,6 +76,12 @@ enum Commands {
     Condense {
         #[command(flatten)]
         io: IoArgs,
+
+        /// Path to a `CostModel` JSON file (from `tarjanize cost --output-model`).
+        /// When provided, uses pre-fitted regression coefficients for synthetic
+        /// crate wall time predictions instead of re-fitting internally.
+        #[arg(long, value_name = "PATH")]
+        model: Option<String>,
     },
 
     /// Compute build costs and critical path of a symbol graph
@@ -90,6 +96,11 @@ enum Commands {
         /// Fit the cost model using lib targets only.
         #[arg(long)]
         fit_libs_only: bool,
+
+        /// Write the fitted `CostModel` as JSON to this path.
+        /// The model can later be consumed by `tarjanize condense --model`.
+        #[arg(long, value_name = "PATH")]
+        output_model: Option<String>,
     },
 }
 
@@ -108,18 +119,53 @@ fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Commands::Condense { io } => {
-            io.run(|r, w| Ok(tarjanize_condense::run(r, w)?))
+        Commands::Condense { io, model } => {
+            // Load the external cost model if a path was provided.
+            let cost_model = model
+                .map(|p| {
+                    tarjanize_cost::load_cost_model(std::path::Path::new(&p))
+                })
+                .transpose()?;
+            io.run(|r, w| {
+                Ok(tarjanize_condense::run(r, w, cost_model.as_ref())?)
+            })
         }
         Commands::Cost {
             io,
             fit_libs_only,
-        } => io.run(|r, w| {
-            Ok(tarjanize_cost::run_with_options(
-                r,
-                w,
-                tarjanize_cost::CostOptions { fit_libs_only },
-            )?)
+            output_model,
+        } => io.run(|mut r, w| {
+            // Read the symbol graph ourselves so we can pass it to
+            // critical_path_with_options.
+            let mut json = String::new();
+            r.read_to_string(&mut json)?;
+            let symbol_graph: tarjanize_schemas::SymbolGraph =
+                serde_json::from_str(&json).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                })?;
+
+            let options = tarjanize_cost::CostOptions { fit_libs_only };
+            let result = tarjanize_cost::critical_path_with_options(
+                &symbol_graph,
+                options,
+            );
+            result.write_report_with_options(w, options)?;
+
+            // Optionally build and write the cost model JSON.
+            if let Some(model_path) = output_model {
+                if let Some(model) = tarjanize_cost::build_cost_model(&result) {
+                    let file = std::fs::File::create(&model_path)?;
+                    let writer = std::io::BufWriter::new(file);
+                    serde_json::to_writer_pretty(writer, &model)
+                        .map_err(std::io::Error::other)?;
+                } else {
+                    eprintln!(
+                        "WARNING: No cost model could be fitted \
+                         (insufficient profiling data)"
+                    );
+                }
+            }
+            Ok(())
         }),
     }
 }

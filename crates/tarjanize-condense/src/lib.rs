@@ -27,7 +27,7 @@
 //!
 //! let input = std::io::stdin().lock();
 //! let mut output = Vec::new();
-//! run(input, &mut output).unwrap();
+//! run(input, &mut output, None).unwrap();
 //! ```
 
 mod error;
@@ -35,6 +35,7 @@ mod scc;
 
 use std::io::{Read, Write};
 
+use tarjanize_cost::CostModel;
 use tarjanize_schemas::SymbolGraph;
 use tracing::debug_span;
 
@@ -47,6 +48,10 @@ use crate::scc::condense_and_partition;
 ///
 /// Reads a `SymbolGraph` from the input, computes SCCs, merges them into
 /// optimal crate groupings, and writes the optimized `SymbolGraph` to output.
+///
+/// When `cost_model` is provided, synthetic crate wall times are predicted
+/// using dep-count-based sub-models instead of the internal max-constituent
+/// heuristic. The model should be produced by `tarjanize cost --output-model`.
 ///
 /// # Errors
 ///
@@ -64,11 +69,12 @@ use crate::scc::condense_and_partition;
 ///
 /// let input = std::fs::File::open("symbol_graph.json").unwrap();
 /// let mut out = stdout().lock();
-/// run(input, &mut out).unwrap();
+/// run(input, &mut out, None).unwrap();
 /// ```
 pub fn run(
     mut input: impl Read,
     mut output: impl Write,
+    cost_model: Option<&CostModel>,
 ) -> Result<(), CondenseError> {
     let _span = debug_span!("run").entered();
 
@@ -81,7 +87,7 @@ pub fn run(
         })?;
 
     // Step 2: Condense and partition the graph.
-    let optimized = condense_and_partition(&symbol_graph);
+    let optimized = condense_and_partition(&symbol_graph, cost_model);
 
     // Step 3: Write output JSON.
     serde_json::to_writer_pretty(&mut output, &optimized)
@@ -155,7 +161,7 @@ mod tests {
         let input_json = serde_json::to_string(&symbol_graph).unwrap();
 
         let mut output = Vec::new();
-        run(input_json.as_bytes(), &mut output).unwrap();
+        run(input_json.as_bytes(), &mut output, None).unwrap();
 
         // Verify output is valid SymbolGraph JSON.
         let optimized: SymbolGraph = serde_json::from_slice(&output)
@@ -168,7 +174,7 @@ mod tests {
     #[test]
     fn test_run_invalid_json() {
         let mut output = Vec::new();
-        let result = run("not valid json".as_bytes(), &mut output);
+        let result = run("not valid json".as_bytes(), &mut output, None);
 
         assert!(result.is_err());
         assert!(result.unwrap_err().is_deserialization());

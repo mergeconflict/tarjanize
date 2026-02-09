@@ -6,7 +6,7 @@ license.workspace = true
 repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
-description = "MAGSAC++ robust estimator for two-variable, no-intercept models"
+description = "MAGSAC++ robust estimator for N-variable, no-intercept models"
 readme = "../../README.md"
 
 [dependencies]

@@ -36,7 +36,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::panic;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use analyzeme::{Event, EventPayload, ProfilingData, Timestamp};
@@ -119,15 +119,13 @@ impl ProfileData {
         };
 
         // Collect all profile files first for logging.
-        let profile_files: Vec<_> = entries
+        let profile_files: Vec<PathBuf> = entries
             .flatten()
             .filter_map(|entry| {
                 let path = entry.path();
-                if path.extension().is_some_and(|ext| ext == "mm_profdata") {
-                    path.file_name().map(|n| n.to_string_lossy().into_owned())
-                } else {
-                    None
-                }
+                path.extension()
+                    .is_some_and(|ext| ext == "mm_profdata")
+                    .then_some(path)
             })
             .collect();
 
@@ -138,91 +136,88 @@ impl ProfileData {
             "found profile files"
         );
 
-        let mut file_count = 0;
-        let mut event_count = 0;
+        if profile_files.is_empty() {
+            info!(dir = %dir.display(), "no profile files found");
+            return data;
+        }
 
-        // Re-read directory to process files (iterator was consumed).
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(
-                    "failed to re-read profile directory {}: {}",
-                    dir.display(),
-                    e
+        if profile_files.len() > 1 {
+            let mut crate_names = Vec::new();
+            for file in &profile_files {
+                let stem = file.file_stem();
+                let name = stem.map_or_else(
+                    || "<unknown>".to_string(),
+                    |s| extract_crate_name(&s.to_string_lossy()),
                 );
-                return data;
+                crate_names.push(name);
             }
+
+            panic!(
+                "multiple profile files in target directory {}; files={:?}; crate_names={:?}",
+                dir.display(),
+                profile_files,
+                crate_names
+            );
+        }
+
+        let path = &profile_files[0];
+        let Some(stem) = path.file_stem() else {
+            warn!("failed to extract profile stem: {}", path.display());
+            return data;
         };
+        let stem_str = stem.to_string_lossy();
+        let stem_path = path.with_file_name(stem);
 
-        for entry in entries.flatten() {
-            let path = entry.path();
+        // Use catch_unwind because decodeme can panic on corrupted
+        // profile data (e.g., truncated string tables).
+        let stem_path_clone = stem_path.clone();
+        let _span = info_span!("load_profile_file", file = %stem_str).entered();
+        let result =
+            panic::catch_unwind(|| ProfilingData::new(&stem_path_clone));
 
-            // Profile files have the .mm_profdata extension.
-            if path.extension().is_some_and(|ext| ext == "mm_profdata") {
-                // The stem is the path we pass to ProfilingData::new.
-                // e.g., "tarjanize_schemas-0060816.mm_profdata" -> "tarjanize_schemas-0060816"
-                if let Some(stem) = path.file_stem() {
-                    let stem_str = stem.to_string_lossy();
-                    let stem_path = dir.join(stem);
+        let file_count = profile_files.len();
+        let mut event_count = 0;
+        match result {
+            Ok(Ok(profile)) => {
+                // Extract crate name from profile filename.
+                // Format: "crate_name-XXXXXXX" where X is hex digits.
+                let crate_name = extract_crate_name(&stem_str);
 
-                    // Use catch_unwind because decodeme can panic on corrupted
-                    // profile data (e.g., truncated string tables).
-                    let stem_path_clone = stem_path.clone();
-                    let result = panic::catch_unwind(|| {
-                        ProfilingData::new(&stem_path_clone)
-                    });
-
-                    match result {
-                        Ok(Ok(profile)) => {
-                            // Extract crate name from profile filename.
-                            // Format: "crate_name-XXXXXXX" where X is hex digits.
-                            let crate_name = extract_crate_name(&stem_str);
-
-                            let _span = info_span!(
-                                "aggregate_profile",
-                                file = %stem_str,
-                                crate_name = %crate_name,
-                                num_events = profile.num_events()
-                            )
-                            .entered();
-
-                            file_count += 1;
-                            let aggregate_result = panic::catch_unwind(
-                                panic::AssertUnwindSafe(|| {
-                                    data.aggregate_profile(
-                                        &profile,
-                                        &crate_name,
-                                        symbol_paths,
-                                    )
-                                }),
-                            );
-                            match aggregate_result {
-                                Ok(count) => {
-                                    event_count += count;
-                                }
-                                Err(_) => {
-                                    warn!(
-                                        "profile data corrupted during aggregation: {}",
-                                        stem_path.display()
-                                    );
-                                }
-                            }
-                        }
-                        Ok(Err(e)) => {
-                            debug!(
-                                "failed to load profile {}: {}",
-                                stem_path.display(),
-                                e
-                            );
-                        }
-                        Err(_) => {
-                            warn!(
-                                "profile data corrupted (parser panic): {}",
-                                stem_path.display()
-                            );
-                        }
+                let _span = info_span!(
+                    "aggregate_profile",
+                    file = %stem_str,
+                    crate_name = %crate_name,
+                    num_events = profile.num_events()
+                )
+                .entered();
+                let aggregate_result =
+                    panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                        data.aggregate_profile(
+                            &profile,
+                            &crate_name,
+                            symbol_paths,
+                        )
+                    }));
+                match aggregate_result {
+                    Ok(count) => {
+                        event_count += count;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "profile data corrupted during aggregation: {}",
+                            stem_path.display()
+                        );
                     }
                 }
+            }
+            Ok(Err(e)) => {
+                debug!("failed to load profile {}: {}", stem_path.display(), e);
+            }
+            Err(_) => {
+                warn!(
+                    "profile data corrupted (parser panic): {}",
+                    stem_path.display()
+                );
             }
         }
 
@@ -311,21 +306,17 @@ impl ProfileData {
 
                 // Top event ended before current event started - finalize it.
                 let entry = thread.stack.pop().expect("stack entry missing");
-                let ancestor_local = nearest_local_ancestor(
-                    &thread.stack,
+                let ancestor_local =
+                    nearest_local_ancestor(&thread.stack, symbol_paths)
+                        .cloned();
+                if let Some(recorded) = self.record_event(
+                    &entry.event,
+                    entry.self_time,
+                    crate_name,
+                    entry.local_path.as_deref(),
+                    ancestor_local.as_deref(),
                     symbol_paths,
-                )
-                .cloned();
-                if let Some(recorded) =
-                    self.record_event(
-                        &entry.event,
-                        entry.self_time,
-                        crate_name,
-                        entry.local_path.as_deref(),
-                        ancestor_local.as_deref(),
-                        symbol_paths,
-                    )
-                {
+                ) {
                     recorded_self_time_sum += recorded;
                 }
                 count += 1;
@@ -338,8 +329,7 @@ impl ProfileData {
 
             // Push current event with initial self-time = full duration.
             // This will be reduced as we encounter its children.
-            let local_path =
-                local_path_for_event(&event, &crate_prefix);
+            let local_path = local_path_for_event(&event, &crate_prefix);
             thread.stack.push(StackEntry {
                 event,
                 self_time: duration,
@@ -353,16 +343,14 @@ impl ProfileData {
             while let Some(entry) = stack.pop() {
                 let ancestor_local =
                     nearest_local_ancestor(&stack, symbol_paths).cloned();
-                if let Some(recorded) =
-                    self.record_event(
-                        &entry.event,
-                        entry.self_time,
-                        crate_name,
-                        entry.local_path.as_deref(),
-                        ancestor_local.as_deref(),
-                        symbol_paths,
-                    )
-                {
+                if let Some(recorded) = self.record_event(
+                    &entry.event,
+                    entry.self_time,
+                    crate_name,
+                    entry.local_path.as_deref(),
+                    ancestor_local.as_deref(),
+                    symbol_paths,
+                ) {
                     recorded_self_time_sum += recorded;
                 }
                 count += 1;
@@ -415,9 +403,12 @@ impl ProfileData {
         let local_matches_symbol = local_path.is_some_and(|path| {
             symbol_paths.is_none_or(|symbols| symbols.contains(path))
         });
-        let selected_path =
-            if local_matches_symbol { local_path } else { None }
-                .or(ancestor_local);
+        let selected_path = if local_matches_symbol {
+            local_path
+        } else {
+            None
+        }
+        .or(ancestor_local);
 
         if let Some(path) = selected_path {
             // TODO: Evaluate whether attribution should prefer the nearest
@@ -486,6 +477,18 @@ impl ProfileData {
     /// attribute the event costs there. This ensures nested items (e.g. consts
     /// inside functions) roll up to their enclosing symbol instead of being
     /// treated as unmatched.
+    ///
+    // TODO: Reduce leaked per-symbol queries. Per-DefId queries like `typeck`,
+    // `mir_borrowck`, `mir_built`, `predicates_of`, `generics_of`, `param_env`,
+    // `layout_of`, etc. that fire with a DefPath should be attributable to
+    // symbols, but ~35% of "other" time in the cost model comes from these
+    // events ending up unattributed. Likely causes: (1) the extraction phase
+    // doesn't emit symbols for all DefIds the profiler sees (e.g. anonymous
+    // consts, compiler-generated items), (2) `normalize_frontend_path` fails
+    // to map certain DefPath formats back to extracted symbols. Investigate
+    // the unmatched paths logged here and improve extraction or normalization
+    // to close the gap. Every ms leaked here is a ms that condense can't
+    // assign to a specific symbol when predicting split crate costs.
     ///
     /// Returns a summary with per-event totals and per-path breakdowns for
     /// any paths that still could not be attributed to a known symbol. These
@@ -670,8 +673,7 @@ fn normalize_frontend_path(path: &str) -> String {
     // If a path contains an anonymous segment (`_` or `_[N]`), attribute it to
     // the parent path. We never extract anonymous items as standalone symbols.
     if let Some(idx) = segments.iter().position(|segment| {
-        *segment == "_"
-            || (segment.starts_with("_[") && segment.ends_with(']'))
+        *segment == "_" || (segment.starts_with("_[") && segment.ends_with(']'))
     }) {
         if idx == 0 {
             return String::new();
@@ -763,10 +765,7 @@ fn normalize_frontend_path(path: &str) -> String {
                 .chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_uppercase())
-                && last
-                    .chars()
-                    .next()
-                    .is_some_and(|c| c.is_ascii_lowercase())
+                && last.chars().next().is_some_and(|c| c.is_ascii_lowercase())
                 && !parent_last.starts_with("{{")
             {
                 normalized = parent.to_string();
@@ -811,7 +810,10 @@ fn is_descendant_segment(segment: &str) -> bool {
     false
 }
 
-fn local_path_for_event(event: &Event<'_>, crate_prefix: &str) -> Option<String> {
+fn local_path_for_event(
+    event: &Event<'_>,
+    crate_prefix: &str,
+) -> Option<String> {
     let raw_path = event.additional_data.first()?;
     let normalized = normalize_frontend_path(raw_path);
     if !normalized.starts_with(crate_prefix) {
@@ -911,8 +913,7 @@ mod tests {
             )]),
         );
 
-        let symbol_paths =
-            HashSet::from(["my_crate::main".to_string()]);
+        let symbol_paths = HashSet::from(["my_crate::main".to_string()]);
         let module_paths = HashSet::new();
         let summary = data.roll_up_unmatched_frontend_costs(
             &symbol_paths,
@@ -922,12 +923,16 @@ mod tests {
 
         assert!(summary.totals_by_label.is_empty());
         assert!(summary.unmatched_paths.is_empty());
-        assert!(!data
-            .frontend_costs
-            .contains_key("my_crate::main::INIT_FILE"));
+        assert!(
+            !data
+                .frontend_costs
+                .contains_key("my_crate::main::INIT_FILE")
+        );
 
-        let events =
-            data.frontend_costs.get("my_crate::main").expect("main events");
+        let events = data
+            .frontend_costs
+            .get("my_crate::main")
+            .expect("main events");
         let ms = events
             .get("const_eval")
             .expect("rolled up event")
@@ -968,14 +973,12 @@ mod tests {
         let mut data = ProfileData::default();
         data.frontend_costs.insert(
             "my_crate::cargo_command".to_string(),
-            HashMap::from([(
-                "typeck".to_string(),
-                Duration::from_millis(9),
-            )]),
+            HashMap::from([("typeck".to_string(), Duration::from_millis(9))]),
         );
 
         let symbol_paths = HashSet::new();
-        let module_paths = HashSet::from(["my_crate::cargo_command".to_string()]);
+        let module_paths =
+            HashSet::from(["my_crate::cargo_command".to_string()]);
         let summary = data.roll_up_unmatched_frontend_costs(
             &symbol_paths,
             &module_paths,

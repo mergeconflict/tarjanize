@@ -948,8 +948,10 @@ dependencies = [
  "clap-verbosity-flag",
  "itertools",
  "mimalloc",
+ "serde_json",
  "tarjanize-condense",
  "tarjanize-cost",
+ "tarjanize-schemas",
  "tracing-subscriber",
 ]
 
@@ -972,6 +974,7 @@ dependencies = [
  "indexmap",
  "jiff",
  "petgraph",
+ "serde",
  "serde_json",
  "tarjanize-magsac",
  "tarjanize-schemas",

@@ -39,6 +39,7 @@ use clap::Parser;
 use clap_verbosity_flag::{InfoLevel, Verbosity};
 use itertools::Itertools;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Environment variable for passing verbosity level from orchestrator to driver.
 pub const ENV_VERBOSITY: &str = "TARJANIZE_VERBOSITY";
@@ -132,6 +133,7 @@ fn init_tracing(level: tracing::level_filters::LevelFilter) {
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .init();
 }
 
@@ -151,5 +153,6 @@ fn init_tracing_from_env() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_span_events(FmtSpan::ENTER | FmtSpan::CLOSE)
         .try_init();
 }

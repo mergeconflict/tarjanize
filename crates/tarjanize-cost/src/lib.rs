@@ -44,13 +44,87 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{Read, Write};
+use std::path::Path;
 
 use indexmap::IndexSet;
 use petgraph::Direction;
 use petgraph::algo::toposort;
 use petgraph::graph::{DiGraph, NodeIndex};
+use serde::{Deserialize, Serialize};
+use tarjanize_magsac::{
+    LinearModel, fit_magsac, r_squared_no_intercept_inliers,
+};
 use tarjanize_schemas::{Module, SymbolGraph, TargetTimings, sum_event_times};
-use tarjanize_magsac::{fit_two_var_magsac, r_squared_no_intercept_inliers};
+
+/// Serializable cost model for predicting synthetic crate wall times.
+///
+/// Stores the coefficients from the fitted 3-variable no-intercept model:
+/// ```text
+/// wall = coeff_attr · attr + coeff_meta · meta + coeff_other · other
+/// ```
+///
+/// For synthetic crates (after condensation), the caller computes:
+/// - `attr`: sum of per-symbol event times across the partition
+/// - `meta`: max of constituent targets' `metadata_decode_*` event sums
+/// - `other`: max of constituent targets' non-metadata event sums
+///
+/// The max-constituent heuristic works because a synthetic crate inherits
+/// at least as much metadata/other overhead as its largest constituent.
+///
+/// Named fields ensure schema mismatches fail at deserialization time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CostModel {
+    /// Coefficient for symbol-attributed cost.
+    pub coeff_attr: f64,
+    /// Coefficient for metadata decode cost (`metadata_decode_*` events).
+    pub coeff_meta: f64,
+    /// Coefficient for remaining unattributed cost (non-metadata events).
+    pub coeff_other: f64,
+    /// R² of the model fit.
+    pub r_squared: f64,
+    /// MAGSAC++ inlier threshold for classifying outliers.
+    pub inlier_threshold: f64,
+}
+
+impl CostModel {
+    /// Predicts wall time for a synthetic crate.
+    ///
+    /// The three inputs mirror the original model's predictors:
+    /// - `attr`: sum of symbol-attributed event times
+    /// - `meta`: metadata decode cost (max of constituent targets)
+    /// - `other`: non-metadata unattributed cost (max of constituent targets)
+    pub fn predict(&self, attr: f64, meta: f64, other: f64) -> f64 {
+        self.coeff_attr * attr
+            + self.coeff_meta * meta
+            + self.coeff_other * other
+    }
+}
+
+/// Loads a `CostModel` from a JSON file.
+pub fn load_cost_model(path: &Path) -> std::io::Result<CostModel> {
+    let file = std::fs::File::open(path)?;
+    let reader = std::io::BufReader::new(file);
+    serde_json::from_reader(reader)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
+/// Extracts a `CostModel` from a [`CriticalPathResult`].
+///
+/// Returns `None` if no model was fitted (insufficient profiling data).
+/// The `SymbolGraph` is not needed — the coefficients come entirely from
+/// the MAGSAC++ regression fitted during critical path computation.
+pub fn build_cost_model(result: &CriticalPathResult) -> Option<CostModel> {
+    let fit = result.model.as_ref()?;
+    let coeffs = &fit.model.coeffs;
+
+    Some(CostModel {
+        coeff_attr: *coeffs.first().unwrap_or(&0.0),
+        coeff_meta: *coeffs.get(1).unwrap_or(&0.0),
+        coeff_other: *coeffs.get(2).unwrap_or(&0.0),
+        r_squared: fit.r_squared,
+        inlier_threshold: fit.inlier_threshold,
+    })
+}
 
 /// Details about a single target on the critical path.
 #[derive(Debug, Clone)]
@@ -109,12 +183,33 @@ pub struct CriticalPathResult {
 
     /// Number of symbols in the graph.
     pub symbol_count: usize,
+
+    /// Fitted regression model, if enough profiled targets were available.
+    /// Reused by both the modeled scheduling pass and the validation table.
+    pub model: Option<ModelFit>,
+
+    /// Modeled critical path length (using model-predicted timings).
+    /// `None` when no model could be fitted.
+    pub modeled_critical_path_ms: Option<f64>,
+
+    /// Target names on the modeled critical path.
+    pub modeled_path: Option<Vec<String>>,
+
+    /// Detailed timing info for targets on the modeled critical path.
+    pub modeled_path_details: Option<Vec<TargetOnPath>>,
+
+    /// All targets with modeled timing details, sorted by `finish_time`
+    /// descending.
+    pub modeled_all_targets: Option<Vec<TargetOnPath>>,
+
+    /// Sum of all modeled target costs.
+    pub modeled_total_cost: Option<f64>,
 }
 
 /// Configuration options for cost reporting.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CostOptions {
-    /// Fit the two-variable model using lib targets only.
+    /// Fit the regression model using lib targets only.
     pub fit_libs_only: bool,
 }
 
@@ -128,32 +223,50 @@ impl CriticalPathResult {
 
     /// Writes a human-readable report to the given writer with custom options.
     ///
-    /// The report includes summary statistics and timing tables for all targets.
+    /// Shows both wall-clock and modeled critical paths when a model is
+    /// available. The wall-clock path uses effective timings (profiled
+    /// values or per-symbol fallback). The modeled path uses regression-
+    /// predicted timings, enabling apples-to-apples comparison before/after
+    /// crate condensation.
     pub fn write_report_with_options(
         &self,
         mut w: impl Write,
-        options: CostOptions,
+        _options: CostOptions,
     ) -> std::io::Result<()> {
-        // Summary statistics.
+        // Summary statistics — show both actual and modeled when available.
         writeln!(
             w,
-            "Critical path:             {}",
+            "Critical path (wall-clock): {}",
             format_duration_ms(self.critical_path_ms)
         )?;
+        if let Some(modeled_ms) = self.modeled_critical_path_ms {
+            writeln!(
+                w,
+                "Critical path (modeled):    {}",
+                format_duration_ms(modeled_ms)
+            )?;
+        }
         writeln!(
             w,
-            "Total cost (sequential):   {}",
+            "Total cost (wall-clock):    {}",
             format_duration_ms(self.total_cost)
         )?;
+        if let Some(modeled_total) = self.modeled_total_cost {
+            writeln!(
+                w,
+                "Total cost (modeled):       {}",
+                format_duration_ms(modeled_total)
+            )?;
+        }
 
         let parallelism = if self.critical_path_ms > 0.0 {
             self.total_cost / self.critical_path_ms
         } else {
             1.0
         };
-        writeln!(w, "Parallelism ratio:         {parallelism:.2}x")?;
-        writeln!(w, "Target count:              {}", self.target_count)?;
-        writeln!(w, "Symbol count:              {}", self.symbol_count)?;
+        writeln!(w, "Parallelism ratio:          {parallelism:.2}x")?;
+        writeln!(w, "Target count:               {}", self.target_count)?;
+        writeln!(w, "Symbol count:               {}", self.symbol_count)?;
 
         // Table header for timing details.
         let header = format!(
@@ -162,8 +275,13 @@ impl CriticalPathResult {
         );
         let separator = "-".repeat(header.len() + 20);
 
+        // --- Actual (wall-clock) tables ---
         if !self.path_details.is_empty() {
-            writeln!(w, "\nCritical path ({} targets):\n", self.path.len())?;
+            writeln!(
+                w,
+                "\nCritical path — wall-clock ({} targets):\n",
+                self.path.len()
+            )?;
             writeln!(w, "{header}")?;
             writeln!(w, "{separator}")?;
 
@@ -175,7 +293,7 @@ impl CriticalPathResult {
         if !self.all_targets.is_empty() {
             writeln!(
                 w,
-                "\nAll targets by finish time ({} targets):\n",
+                "\nAll targets by finish time — wall-clock ({} targets):\n",
                 self.all_targets.len()
             )?;
             writeln!(w, "{header}")?;
@@ -186,7 +304,41 @@ impl CriticalPathResult {
             }
         }
 
-        self.write_validation_table(&mut w, options.fit_libs_only)?;
+        // --- Modeled tables (only when model was fitted) ---
+        if let Some(ref modeled_path_details) = self.modeled_path_details {
+            let modeled_path = self.modeled_path.as_ref().unwrap();
+            if !modeled_path_details.is_empty() {
+                writeln!(
+                    w,
+                    "\nCritical path — modeled ({} targets):\n",
+                    modeled_path.len()
+                )?;
+                writeln!(w, "{header}")?;
+                writeln!(w, "{separator}")?;
+
+                for target in modeled_path_details {
+                    writeln!(w, "{target}")?;
+                }
+            }
+        }
+
+        if let Some(ref modeled_all) = self.modeled_all_targets
+            && !modeled_all.is_empty()
+        {
+            writeln!(
+                w,
+                "\nAll targets by finish time — modeled ({} targets):\n",
+                modeled_all.len()
+            )?;
+            writeln!(w, "{header}")?;
+            writeln!(w, "{separator}")?;
+
+            for target in modeled_all {
+                writeln!(w, "{target}")?;
+            }
+        }
+
+        self.write_validation_table(&mut w)?;
 
         Ok(())
     }
@@ -195,23 +347,18 @@ impl CriticalPathResult {
     /// times.
     ///
     /// Only emitted when at least one target has non-zero wall-clock data
-    /// from profiling. Fits the two-variable model (`wall = a·attr + b·meta`)
-    /// on either all targets with profiling data or lib targets only,
-    /// depending on `fit_libs_only`, then shows per-target predictions and
-    /// percentage errors. Sorted by absolute error descending so the worst
-    /// predictions appear first.
+    /// from profiling. Reuses `self.model` (fitted during critical path
+    /// computation) to show per-target predictions and percentage errors.
+    /// Sorted by absolute error descending so the worst predictions appear
+    /// first.
     ///
-    /// Falls back to showing just Target + Actual when fewer than 3 fit targets
-    /// are available (insufficient for model fitting).
+    /// Falls back to showing just Target + Actual when no model was fitted
+    /// (insufficient profiled targets).
     #[expect(
         clippy::too_many_lines,
         reason = "formatting-heavy table output, splitting would scatter layout logic"
     )]
-    fn write_validation_table(
-        &self,
-        mut w: impl Write,
-        fit_libs_only: bool,
-    ) -> std::io::Result<()> {
+    fn write_validation_table(&self, mut w: impl Write) -> std::io::Result<()> {
         // Collect targets that have wall-clock profiling data.
         let validated: Vec<&TargetOnPath> = self
             .all_targets
@@ -223,8 +370,9 @@ impl CriticalPathResult {
             return Ok(());
         }
 
-        // Build regression data per target: (attr, meta, wall).
-        let regression_data: Vec<(f64, f64, f64)> = validated
+        // Build regression data per target: [attr, meta, other, wall].
+        // Used for predictions even though the model is already fitted.
+        let regression_data: Vec<Vec<f64>> = validated
             .iter()
             .map(|t| {
                 let attr = t.symbol_timings.wall_time_ms;
@@ -235,86 +383,79 @@ impl CriticalPathResult {
                     .filter(|(k, _)| k.starts_with("metadata_decode_"))
                     .map(|(_, v)| v)
                     .sum();
+                let other: f64 = t
+                    .wall_timings
+                    .event_times_ms
+                    .iter()
+                    .filter(|(k, _)| !k.starts_with("metadata_decode_"))
+                    .map(|(_, v)| v)
+                    .sum();
                 let wall = t.wall_timings.wall_time_ms;
-                (attr, meta, wall)
+                vec![attr, meta, other, wall]
             })
             .collect();
 
-        let mut lib_count = 0;
-        let mut other_count = 0;
-        let fit_data = if fit_libs_only {
-            let lib_regression_data: Vec<(f64, f64, f64)> = validated
-                .iter()
-                .zip(&regression_data)
-                .filter(|(t, _)| t.name.ends_with("/lib"))
-                .map(|(_, &data)| data)
-                .collect();
-            lib_count = lib_regression_data.len();
-            other_count = validated.len() - lib_count;
-            lib_regression_data
-        } else {
-            regression_data.clone()
-        };
+        writeln!(
+            w,
+            "\nModel validation ({} targets with profiling):\n",
+            validated.len(),
+        )?;
 
-        let fit = two_var_fit(&fit_data);
+        let mut outlier_count_for_summary = None;
 
-        if fit_libs_only {
-            writeln!(
-                w,
-                "\nModel validation ({} targets with profiling, \
-                 fit on {} lib targets):\n",
-                validated.len(),
-                lib_count,
-            )?;
-        } else {
-            writeln!(
-                w,
-                "\nModel validation ({} targets with profiling):\n",
-                validated.len(),
-            )?;
-        }
-
-        if let Some(ref fit) = fit {
+        if let Some(ref fit) = self.model {
             // Build rows with predictions and sort by absolute error.
-            // Predictions use the fitted model for all targets.
-            let mut rows: Vec<(&str, f64, f64, f64, f64)> = validated
+            // Predictions use the fitted model for all targets. Mark
+            // outliers using MAGSAC's inlier threshold — points whose
+            // absolute residual exceeds the threshold are outliers that
+            // the robust estimator down-weighted during fitting.
+            let mut rows: Vec<(&str, f64, f64, f64, bool)> = validated
                 .iter()
                 .zip(&regression_data)
-                .map(|(t, &(attr, meta, _))| {
+                .map(|(t, row)| {
                     let actual = t.wall_timings.wall_time_ms;
-                    let predicted = fit.a * attr + fit.b * meta;
+                    let predicted = fit.model.predict(&row[..row.len() - 1]);
                     let delta_ms = predicted - actual;
-                    let error_pct = delta_ms / actual * 100.0;
-                    (t.name.as_str(), actual, predicted, delta_ms, error_pct)
+                    let is_outlier =
+                        (actual - predicted).abs() > fit.inlier_threshold;
+                    (t.name.as_str(), actual, predicted, delta_ms, is_outlier)
                 })
                 .collect();
+            // Sort by absolute error descending so the worst predictions
+            // appear at the top of the table.
             rows.sort_by(|a, b| {
-                b.4.abs()
-                    .partial_cmp(&a.4.abs())
+                b.3.abs()
+                    .partial_cmp(&a.3.abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
 
-            // Table header: actual, predicted, delta, error%.
+            let outlier_count = rows.iter().filter(|r| r.4).count();
+
+            // Table header: actual, predicted, delta, outlier marker.
             writeln!(
                 w,
-                "{:<35} {:>9} {:>9} {:>9}  {:>7}",
-                "Target", "Actual", "Predicted", "Delta", "Error%",
+                "{:<35} {:>9} {:>9} {:>9}  Out",
+                "Target", "Actual", "Predicted", "Delta",
             )?;
-            writeln!(w, "{}", "-".repeat(74))?;
+            writeln!(w, "{}", "-".repeat(70))?;
 
-            for (name, actual, predicted, delta_ms, error_pct) in &rows {
+            for (name, actual, predicted, delta_ms, is_outlier) in &rows {
+                let marker = if *is_outlier { " *" } else { "" };
                 writeln!(
                     w,
-                    "{:<35} {:>9} {:>9} {:>9}  {:>6.1}%",
+                    "{:<35} {:>9} {:>9} {:>9} {:>3}",
                     truncate_name(name, 35),
                     format_duration_ms(*actual),
                     format_duration_ms(*predicted),
                     format_duration_ms(*delta_ms),
-                    error_pct,
+                    marker,
                 )?;
             }
+
+            // Store outlier count for the summary section below.
+            outlier_count_for_summary = Some(outlier_count);
         } else {
-            // Fewer than 3 targets — can't fit the model. Show actuals.
+            // No model — show actuals only.
             writeln!(w, "{:<35} {:>9}", "Target", "Actual")?;
             writeln!(w, "{}", "-".repeat(46))?;
 
@@ -330,25 +471,32 @@ impl CriticalPathResult {
 
         // Summary statistics.
         writeln!(w)?;
-        if fit_libs_only {
-            writeln!(
-                w,
-                "Targets compared:    {} ({} lib, {} other)",
-                validated.len(),
-                lib_count,
-                other_count,
-            )?;
-        } else {
-            writeln!(w, "Targets compared:    {}", validated.len(),)?;
-        }
+        writeln!(w, "Targets compared:    {}", validated.len())?;
 
-        if let Some(ref fit) = fit {
-            writeln!(
-                w,
-                "Two-var fit:         wall = {:.2} * attr + {:.2} * meta",
-                fit.a, fit.b,
-            )?;
-            writeln!(w, "R² (two-var):        {:.4}", fit.r_squared)?;
+        if let Some(ref fit) = self.model {
+            let coeffs = &fit.model.coeffs;
+            // Display the model equation with named predictors.
+            // Coefficients: [0]=attr, [1]=meta, [2]=other.
+            if coeffs.len() >= 3 {
+                writeln!(
+                    w,
+                    "Model fit:           wall = {:.2} * attr + \
+                     {:.2} * meta + {:.2} * other",
+                    coeffs[0], coeffs[1], coeffs[2],
+                )?;
+            } else if coeffs.len() == 2 {
+                writeln!(
+                    w,
+                    "Model fit:           wall = {:.2} * attr + \
+                     {:.2} * meta",
+                    coeffs[0], coeffs[1],
+                )?;
+            }
+            writeln!(w, "R²:                  {:.4}", fit.r_squared)?;
+
+            if let Some(n) = outlier_count_for_summary {
+                writeln!(w, "Outliers excluded:   {n}")?;
+            }
         }
 
         Ok(())
@@ -407,51 +555,136 @@ struct TargetGraph {
     graph: DiGraph<usize, ()>,
 }
 
-/// Result of two-variable no-intercept regression.
+/// Result of N-variable no-intercept regression.
 ///
-/// Fits `y = a * x1 + b * x2` (no intercept). Used to model
-/// `wall_time = a * attr + b * meta` where `attr` is the sum of
-/// symbol-attributed event times and `meta` is the sum of
-/// `metadata_decode_*` event times.
-#[derive(Debug)]
-pub struct TwoVarFit {
-    /// Coefficient for the first predictor (symbol attribution).
-    pub a: f64,
-    /// Coefficient for the second predictor (metadata decode).
-    pub b: f64,
+/// Fits `y = Σ βᵢ·xᵢ` (no intercept). Used to model
+/// `wall_time = a·attr + b·meta + c·other` where:
+/// - `attr` = sum of symbol-attributed event times
+/// - `meta` = sum of `metadata_decode_*` event times
+/// - `other` = sum of remaining unattributed event times
+#[derive(Debug, Clone)]
+pub struct ModelFit {
+    /// The fitted linear model (coefficients in predictor order).
+    pub model: LinearModel,
     /// Coefficient of determination (R²).
     pub r_squared: f64,
+    /// Residual threshold from MAGSAC++ for classifying outliers.
+    /// Points with `|y - predicted| > inlier_threshold` are outliers.
+    pub inlier_threshold: f64,
 }
 
-/// Fits `y = a * x1 + b * x2` (no intercept) using MAGSAC++ for robustness.
+/// Fits `y = Σ βᵢ·xᵢ` (no intercept) using MAGSAC++ for robustness.
 ///
 /// The no-intercept constraint is physically motivated: zero code plus zero
 /// dependencies should produce zero compilation time.
 ///
-/// Returns `None` if fewer than 3 data points or if the robust estimator
-/// cannot produce a stable model.
-///
-/// # Arguments
-///
-/// * `data` - Slice of `(x1, x2, y)` triples: (symbol attribution sum,
-///   metadata decode sum, wall time).
-pub fn two_var_fit(data: &[(f64, f64, f64)]) -> Option<TwoVarFit> {
-    if data.len() < 3 {
+/// Each row in `data` is `[x1, x2, ..., xn, y]`. Returns `None` if
+/// insufficient data points or if the robust estimator can't produce a
+/// stable model.
+pub fn model_fit(data: &[Vec<f64>]) -> Option<ModelFit> {
+    if data.is_empty() {
+        return None;
+    }
+    let n_vars = data[0].len().checked_sub(1)?;
+    if n_vars == 0 || data.len() < n_vars + 1 {
         return None;
     }
 
-    let result = fit_two_var_magsac(data)?;
+    let result = fit_magsac(data)?;
     let r_squared = r_squared_no_intercept_inliers(
         data,
-        result.model,
+        &result.model,
         result.inlier_threshold,
     );
 
-    Some(TwoVarFit {
-        a: result.model.a,
-        b: result.model.b,
+    Some(ModelFit {
+        model: result.model,
         r_squared,
+        inlier_threshold: result.inlier_threshold,
     })
+}
+
+/// Result of scheduling targets in topological order using DP.
+///
+/// Contains timing arrays and the reconstructed critical path. Reusable
+/// for both wall-clock and model-predicted scheduling passes.
+struct ScheduleResult {
+    /// Start time for each target (indexed by node index).
+    start: Vec<f64>,
+    /// Finish time for each target (indexed by node index).
+    finish: Vec<f64>,
+    /// Minimum build time with infinite parallelism (max finish time).
+    critical_path_ms: f64,
+    /// Nodes on the critical path, from deepest dependency to top-level.
+    path_nodes: Vec<NodeIndex>,
+    /// Sum of all target costs (theoretical sequential build time).
+    total_cost: f64,
+}
+
+/// Schedules targets in topological order using DP.
+///
+/// For each target t:
+///   `start[t] = max(finish[dep] for dep in dependencies)`
+///   `finish[t] = start[t] + cost[t]`
+///
+/// The critical path is the chain of dependencies that determines the
+/// latest finish time. This is factored out so we can run it twice:
+/// once with wall-clock timings, once with model-predicted timings.
+fn schedule(
+    costs: &[f64],
+    graph: &DiGraph<usize, ()>,
+    sorted: &[NodeIndex],
+) -> ScheduleResult {
+    let n = costs.len();
+    let mut start = vec![0.0; n];
+    let mut finish = vec![0.0; n];
+    let mut predecessor: Vec<Option<NodeIndex>> = vec![None; n];
+
+    for &node in sorted {
+        let idx = node.index();
+
+        // Find max finish time among dependencies.
+        let mut max_dep_finish = 0.0f64;
+        let mut max_dep_node: Option<NodeIndex> = None;
+
+        for dep in graph.neighbors_directed(node, Direction::Incoming) {
+            let dep_idx = dep.index();
+            if finish[dep_idx] > max_dep_finish {
+                max_dep_finish = finish[dep_idx];
+                max_dep_node = Some(dep);
+            }
+        }
+
+        start[idx] = max_dep_finish;
+        finish[idx] = max_dep_finish + costs[idx];
+        predecessor[idx] = max_dep_node;
+    }
+
+    // Critical path ends at the target with latest finish time.
+    let (max_node, &critical_path_ms) = finish
+        .iter()
+        .enumerate()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
+        .unwrap();
+
+    // Reconstruct the critical path by following predecessors.
+    let mut path_nodes = Vec::new();
+    let mut current = Some(NodeIndex::new(max_node));
+    while let Some(node) = current {
+        path_nodes.push(node);
+        current = predecessor[node.index()];
+    }
+    path_nodes.reverse();
+
+    let total_cost: f64 = costs.iter().sum();
+
+    ScheduleResult {
+        start,
+        finish,
+        critical_path_ms,
+        path_nodes,
+        total_cost,
+    }
 }
 
 /// Computes the critical path of a symbol graph at the target level.
@@ -462,11 +695,29 @@ pub fn two_var_fit(data: &[(f64, f64, f64)]) -> Option<TwoVarFit> {
 /// Each compilation target (lib, test, bin, etc.) is a separate node. This
 /// naturally resolves dev-dependency "cycles" because test targets depend on
 /// lib targets, not vice versa.
+///
+/// Uses default options (no model fitting). For model-predicted scheduling,
+/// use [`critical_path_with_options`].
+pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
+    critical_path_with_options(symbol_graph, CostOptions::default())
+}
+
+/// Computes the critical path with custom options.
+///
+/// When profiling data is available for enough targets, fits a regression
+/// model and runs scheduling twice: once with wall-clock/effective timings
+/// (the "actual" critical path) and once with model-predicted timings
+/// (the "modeled" critical path). This enables apples-to-apples comparison
+/// before/after crate condensation.
 #[expect(
     clippy::too_many_lines,
-    reason = "core algorithm, splitting would obscure logic"
+    reason = "core algorithm with model fitting + dual scheduling, \
+              splitting would scatter the scheduling logic"
 )]
-pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
+pub fn critical_path_with_options(
+    symbol_graph: &SymbolGraph,
+    options: CostOptions,
+) -> CriticalPathResult {
     let TargetGraph {
         names: target_names,
         effective: target_timings,
@@ -486,10 +737,14 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
             total_cost: 0.0,
             target_count: 0,
             symbol_count: 0,
+            model: None,
+            modeled_critical_path_ms: None,
+            modeled_path: None,
+            modeled_path_details: None,
+            modeled_all_targets: None,
+            modeled_total_cost: None,
         };
     }
-
-    let total_cost: f64 = target_timings.iter().map(|t| t.wall_time_ms).sum();
 
     // Topological sort. With target-level analysis, the graph should always
     // be a DAG (no cycles from dev-dependencies). If there are cycles, it
@@ -500,6 +755,8 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
              skipping critical path computation"
         );
         // Return early with just the target timings (no scheduling computed).
+        let total_cost: f64 =
+            target_timings.iter().map(|t| t.wall_time_ms).sum();
         let mut all_targets: Vec<TargetOnPath> = target_names
             .iter()
             .enumerate()
@@ -534,106 +791,195 @@ pub fn critical_path(symbol_graph: &SymbolGraph) -> CriticalPathResult {
             total_cost,
             target_count: n,
             symbol_count,
+            model: None,
+            modeled_critical_path_ms: None,
+            modeled_path: None,
+            modeled_path_details: None,
+            modeled_all_targets: None,
+            modeled_total_cost: None,
         };
     };
 
-    // DP scheduling: process targets in topological order.
-    //
-    // For each target t:
-    //   start[t] = max(finish[dep] for dep in dependencies)
-    //   finish[t] = start[t] + wall_time_ms[t]
-    //
-    // The critical path is the chain of dependencies that determines the
-    // latest finish time. We track predecessors based on which dependency's
-    // finish time determined each target's start time.
-    let mut start: Vec<f64> = vec![0.0; n];
-    let mut finish: Vec<f64> = vec![0.0; n];
-    let mut predecessor: Vec<Option<NodeIndex>> = vec![None; n];
+    // Extract effective costs for the actual scheduling pass.
+    let effective_costs: Vec<f64> =
+        target_timings.iter().map(|t| t.wall_time_ms).collect();
 
-    for &node in &sorted {
-        let idx = node.index();
-        let timings = &target_timings[idx];
+    // --- Actual scheduling pass (wall-clock / per-symbol fallback) ---
+    let actual = schedule(&effective_costs, &graph, &sorted);
 
-        // Find max finish time among dependencies.
-        let mut max_dep_finish = 0.0f64;
-        let mut max_dep_node: Option<NodeIndex> = None;
+    // --- Model fitting ---
+    // Build regression data from targets with wall-clock profiling data.
+    // Each row: [attr, meta, other, wall].
+    let regression_data: Vec<(usize, Vec<f64>)> = (0..n)
+        .filter(|&idx| wall_timings[idx].wall_time_ms > 0.0)
+        .map(|idx| {
+            let attr = symbol_timings[idx].wall_time_ms;
+            let meta: f64 = wall_timings[idx]
+                .event_times_ms
+                .iter()
+                .filter(|(k, _)| k.starts_with("metadata_decode_"))
+                .map(|(_, v)| v)
+                .sum();
+            let other: f64 = wall_timings[idx]
+                .event_times_ms
+                .iter()
+                .filter(|(k, _)| !k.starts_with("metadata_decode_"))
+                .map(|(_, v)| v)
+                .sum();
+            let wall = wall_timings[idx].wall_time_ms;
+            (idx, vec![attr, meta, other, wall])
+        })
+        .collect();
 
-        for dep in graph.neighbors_directed(node, Direction::Incoming) {
-            let dep_idx = dep.index();
-            if finish[dep_idx] > max_dep_finish {
-                max_dep_finish = finish[dep_idx];
-                max_dep_node = Some(dep);
-            }
-        }
-
-        start[idx] = max_dep_finish;
-        finish[idx] = max_dep_finish + timings.wall_time_ms;
-        predecessor[idx] = max_dep_node;
-    }
-
-    // Critical path ends at the target with latest finish time.
-    let (max_node, &critical_path_ms) = finish
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-        .unwrap();
-
-    // Reconstruct the critical path by following predecessors from the end node.
-    let mut path_nodes = Vec::new();
-    let mut current = Some(NodeIndex::new(max_node));
-    while let Some(node) = current {
-        path_nodes.push(node);
-        current = predecessor[node.index()];
-    }
-    path_nodes.reverse();
-
-    // Helper to build TargetOnPath from index.
-    let build_target_on_path = |idx: usize| {
-        let node = NodeIndex::new(idx);
-        let name = target_names.get_index(idx).unwrap().clone();
-        let timings = &target_timings[idx];
-
-        let dependencies: Vec<String> = graph
-            .neighbors_directed(node, Direction::Incoming)
-            .map(|dep| target_names.get_index(dep.index()).unwrap().clone())
-            .collect();
-
-        TargetOnPath {
-            name,
-            frontend_cost: timings.wall_time_ms,
-            start_time: start[idx],
-            finish_time: finish[idx],
-            dependencies,
-            wall_timings: wall_timings[idx].clone(),
-            symbol_timings: symbol_timings[idx].clone(),
-        }
+    // Filter to lib targets only when requested, for model fitting.
+    let fit_data: Vec<Vec<f64>> = if options.fit_libs_only {
+        regression_data
+            .iter()
+            .filter(|(idx, _)| {
+                target_names
+                    .get_index(*idx)
+                    .is_some_and(|n| n.ends_with("/lib"))
+            })
+            .map(|(_, row)| row.clone())
+            .collect()
+    } else {
+        regression_data.iter().map(|(_, row)| row.clone()).collect()
     };
 
-    // Build path names and details.
-    let path: Vec<String> = path_nodes
+    let model = model_fit(&fit_data);
+
+    // --- Modeled scheduling pass ---
+    // Build modeled costs: use model prediction for profiled targets,
+    // fall back to effective cost for targets without profiling data.
+    // This ensures the modeled critical path uses predictions where
+    // available while keeping unprofiled targets at their best estimate.
+    let modeled_result = model.as_ref().map(|fit| {
+        let modeled_costs: Vec<f64> = (0..n)
+            .map(|idx| {
+                // Look up this target's regression row if it was profiled.
+                regression_data
+                    .iter()
+                    .find(|(i, _)| *i == idx)
+                    .map_or(effective_costs[idx], |(_, row)| {
+                        fit.model.predict(&row[..row.len() - 1])
+                    })
+            })
+            .collect();
+        schedule(&modeled_costs, &graph, &sorted)
+    });
+
+    // --- Build result ---
+    // Helper to build TargetOnPath from a ScheduleResult and index.
+    let build_target_on_path =
+        |sched: &ScheduleResult, costs: &[f64], idx: usize| {
+            let node = NodeIndex::new(idx);
+            let name = target_names.get_index(idx).unwrap().clone();
+
+            let dependencies: Vec<String> = graph
+                .neighbors_directed(node, Direction::Incoming)
+                .map(|dep| target_names.get_index(dep.index()).unwrap().clone())
+                .collect();
+
+            TargetOnPath {
+                name,
+                frontend_cost: costs[idx],
+                start_time: sched.start[idx],
+                finish_time: sched.finish[idx],
+                dependencies,
+                wall_timings: wall_timings[idx].clone(),
+                symbol_timings: symbol_timings[idx].clone(),
+            }
+        };
+
+    // Build actual path names and details.
+    let path: Vec<String> = actual
+        .path_nodes
         .iter()
         .map(|node| target_names.get_index(node.index()).unwrap().clone())
         .collect();
 
-    let path_details: Vec<TargetOnPath> = path_nodes
+    let path_details: Vec<TargetOnPath> = actual
+        .path_nodes
         .iter()
-        .map(|&node| build_target_on_path(node.index()))
+        .map(|&node| {
+            build_target_on_path(&actual, &effective_costs, node.index())
+        })
         .collect();
 
-    // Build all_targets, sorted by finish_time descending.
-    let mut all_targets: Vec<TargetOnPath> =
-        (0..n).map(build_target_on_path).collect();
+    let mut all_targets: Vec<TargetOnPath> = (0..n)
+        .map(|idx| build_target_on_path(&actual, &effective_costs, idx))
+        .collect();
     all_targets
         .sort_by(|a, b| b.finish_time.partial_cmp(&a.finish_time).unwrap());
 
+    // Build modeled path names and details (if model was fitted).
+    let (
+        modeled_critical_path_ms,
+        modeled_path,
+        modeled_path_details,
+        modeled_all_targets,
+        modeled_total_cost,
+    ) = if let Some(ref modeled) = modeled_result {
+        let modeled_costs: Vec<f64> = (0..n)
+            .map(|idx| {
+                regression_data.iter().find(|(i, _)| *i == idx).map_or(
+                    effective_costs[idx],
+                    |(_, row)| {
+                        model
+                            .as_ref()
+                            .unwrap()
+                            .model
+                            .predict(&row[..row.len() - 1])
+                    },
+                )
+            })
+            .collect();
+
+        let m_path: Vec<String> = modeled
+            .path_nodes
+            .iter()
+            .map(|node| target_names.get_index(node.index()).unwrap().clone())
+            .collect();
+
+        let m_path_details: Vec<TargetOnPath> = modeled
+            .path_nodes
+            .iter()
+            .map(|&node| {
+                build_target_on_path(modeled, &modeled_costs, node.index())
+            })
+            .collect();
+
+        let mut m_all_targets: Vec<TargetOnPath> = (0..n)
+            .map(|idx| build_target_on_path(modeled, &modeled_costs, idx))
+            .collect();
+        m_all_targets
+            .sort_by(|a, b| b.finish_time.partial_cmp(&a.finish_time).unwrap());
+
+        (
+            Some(modeled.critical_path_ms),
+            Some(m_path),
+            Some(m_path_details),
+            Some(m_all_targets),
+            Some(modeled.total_cost),
+        )
+    } else {
+        (None, None, None, None, None)
+    };
+
     CriticalPathResult {
-        critical_path_ms,
+        critical_path_ms: actual.critical_path_ms,
         path,
         path_details,
         all_targets,
-        total_cost,
+        total_cost: actual.total_cost,
         target_count: n,
         symbol_count,
+        model,
+        modeled_critical_path_ms,
+        modeled_path,
+        modeled_path_details,
+        modeled_all_targets,
+        modeled_total_cost,
     }
 }
 
@@ -658,7 +1004,7 @@ pub fn run_with_options(
     let symbol_graph: SymbolGraph = serde_json::from_str(&json)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
-    let result = critical_path(&symbol_graph);
+    let result = critical_path_with_options(&symbol_graph, options);
     result.write_report_with_options(output, options)
 }
 
@@ -1995,19 +2341,20 @@ mod tests {
     }
 
     // =========================================================================
-    // two_var_fit tests
+    // model_fit tests
     // =========================================================================
 
     #[test]
-    fn test_validation_includes_two_var_fit() {
-        // Build 4 targets with wall-clock data and metadata decode events.
-        // The two-variable fit and per-target predictions should appear.
+    fn test_validation_includes_model_fit() {
+        // Build 5 targets with wall-clock data, metadata decode events, and
+        // other events. The model fit and per-target predictions should appear.
         let mut packages = HashMap::new();
-        for (pkg, sym_cost, meta_cost, wall) in [
-            ("a", 100.0, 20.0, 400.0),
-            ("b", 50.0, 40.0, 280.0),
-            ("c", 200.0, 10.0, 700.0),
-            ("d", 30.0, 80.0, 330.0),
+        for (pkg, sym_cost, meta_cost, other_cost, wall) in [
+            ("a", 100.0, 20.0, 10.0, 440.0),
+            ("b", 50.0, 40.0, 20.0, 340.0),
+            ("c", 200.0, 10.0, 5.0, 725.0),
+            ("d", 30.0, 80.0, 15.0, 405.0),
+            ("e", 150.0, 30.0, 25.0, 625.0),
         ] {
             let mut symbols = HashMap::new();
             symbols.insert("fn1".to_string(), make_symbol(sym_cost));
@@ -2017,6 +2364,7 @@ mod tests {
                 "metadata_decode_entry_generics_of".to_string(),
                 meta_cost,
             );
+            event_times_ms.insert("typeck".to_string(), other_cost);
 
             let crate_data = tarjanize_schemas::Crate {
                 timings: TargetTimings {
@@ -2043,14 +2391,11 @@ mod tests {
         let report = String::from_utf8(output).unwrap();
 
         assert!(
-            report.contains("Two-var fit:"),
-            "report should contain two-variable fit when profiling data \
-             has metadata decode events. Report:\n{report}",
+            report.contains("Model fit:"),
+            "report should contain model fit when profiling data \
+             has events. Report:\n{report}",
         );
-        assert!(
-            report.contains("R² (two-var):"),
-            "report should contain two-variable R²",
-        );
+        assert!(report.contains("R²:"), "report should contain R²",);
         // The table should show prediction columns.
         assert!(
             report.contains("Predicted"),
@@ -2061,24 +2406,51 @@ mod tests {
             "report should contain Delta column. Report:\n{report}",
         );
         assert!(
-            report.contains("Error%"),
-            "report should contain Error% column. Report:\n{report}",
+            report.contains("Out"),
+            "report should contain Out column. Report:\n{report}",
+        );
+        assert!(
+            report.contains("Outliers excluded:"),
+            "report should contain outlier count. Report:\n{report}",
         );
     }
 
     #[test]
-    fn test_two_var_fit_perfect() {
-        // wall = 3·attr + 2·meta, 5 data points → R²=1.0, a=3.0, b=2.0
-        let data: Vec<(f64, f64, f64)> = vec![
-            (1.0, 1.0, 5.0),   // 3*1 + 2*1 = 5
-            (2.0, 3.0, 12.0),  // 3*2 + 2*3 = 12
-            (4.0, 1.0, 14.0),  // 3*4 + 2*1 = 14
-            (0.5, 5.0, 11.5),  // 3*0.5 + 2*5 = 11.5
-            (10.0, 2.0, 34.0), // 3*10 + 2*2 = 34
+    fn test_model_fit_perfect_3var() {
+        // wall = 3·attr + 2·meta + 4·other, 5 data points
+        let data: Vec<Vec<f64>> = vec![
+            vec![1.0, 1.0, 1.0, 9.0],   // 3+2+4
+            vec![2.0, 3.0, 0.5, 14.0],  // 6+6+2
+            vec![4.0, 1.0, 2.0, 22.0],  // 12+2+8
+            vec![0.5, 5.0, 1.0, 15.5],  // 1.5+10+4
+            vec![10.0, 2.0, 3.0, 46.0], // 30+4+12
         ];
-        let fit = two_var_fit(&data).expect("should fit");
-        assert!((fit.a - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", fit.a,);
-        assert!((fit.b - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", fit.b,);
+        let fit = model_fit(&data).expect("should fit");
+        let c = &fit.model.coeffs;
+        assert!((c[0] - 3.0).abs() < 1e-6, "Expected a=3.0, got {}", c[0],);
+        assert!((c[1] - 2.0).abs() < 1e-6, "Expected b=2.0, got {}", c[1],);
+        assert!((c[2] - 4.0).abs() < 1e-6, "Expected c=4.0, got {}", c[2],);
+        assert!(
+            (fit.r_squared - 1.0).abs() < 1e-6,
+            "Expected R²=1.0, got {}",
+            fit.r_squared,
+        );
+    }
+
+    #[test]
+    fn test_model_fit_perfect_2var() {
+        // wall = 3·attr + 2·meta, 5 data points (2-var)
+        let data: Vec<Vec<f64>> = vec![
+            vec![1.0, 1.0, 5.0],   // 3*1 + 2*1 = 5
+            vec![2.0, 3.0, 12.0],  // 3*2 + 2*3 = 12
+            vec![4.0, 1.0, 14.0],  // 3*4 + 2*1 = 14
+            vec![0.5, 5.0, 11.5],  // 3*0.5 + 2*5 = 11.5
+            vec![10.0, 2.0, 34.0], // 3*10 + 2*2 = 34
+        ];
+        let fit = model_fit(&data).expect("should fit");
+        let c = &fit.model.coeffs;
+        assert!((c[0] - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", c[0],);
+        assert!((c[1] - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", c[1],);
         assert!(
             (fit.r_squared - 1.0).abs() < 1e-10,
             "Expected R²=1.0, got {}",
@@ -2087,17 +2459,17 @@ mod tests {
     }
 
     #[test]
-    fn test_two_var_fit_zero_metadata() {
+    fn test_model_fit_zero_metadata() {
         // All metadata values zero → degenerates to wall = a·attr.
-        let data: Vec<(f64, f64, f64)> = vec![
-            (1.0, 0.0, 3.0),
-            (2.0, 0.0, 6.0),
-            (5.0, 0.0, 15.0),
-            (10.0, 0.0, 30.0),
+        let data: Vec<Vec<f64>> = vec![
+            vec![1.0, 0.0, 3.0],
+            vec![2.0, 0.0, 6.0],
+            vec![5.0, 0.0, 15.0],
+            vec![10.0, 0.0, 30.0],
         ];
-        let fit = two_var_fit(&data).expect("should fit");
-        assert!((fit.a - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", fit.a,);
-        // b is irrelevant when all x2=0, but coefficient is well-defined (0).
+        let fit = model_fit(&data).expect("should fit");
+        let c = &fit.model.coeffs;
+        assert!((c[0] - 3.0).abs() < 1e-10, "Expected a=3.0, got {}", c[0],);
         assert!(
             (fit.r_squared - 1.0).abs() < 1e-10,
             "Expected R²=1.0, got {}",
@@ -2106,16 +2478,17 @@ mod tests {
     }
 
     #[test]
-    fn test_two_var_fit_zero_attribution() {
+    fn test_model_fit_zero_attribution() {
         // All attr values zero → degenerates to wall = b·meta.
-        let data: Vec<(f64, f64, f64)> = vec![
-            (0.0, 1.0, 2.0),
-            (0.0, 3.0, 6.0),
-            (0.0, 5.0, 10.0),
-            (0.0, 10.0, 20.0),
+        let data: Vec<Vec<f64>> = vec![
+            vec![0.0, 1.0, 2.0],
+            vec![0.0, 3.0, 6.0],
+            vec![0.0, 5.0, 10.0],
+            vec![0.0, 10.0, 20.0],
         ];
-        let fit = two_var_fit(&data).expect("should fit");
-        assert!((fit.b - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", fit.b,);
+        let fit = model_fit(&data).expect("should fit");
+        let c = &fit.model.coeffs;
+        assert!((c[1] - 2.0).abs() < 1e-10, "Expected b=2.0, got {}", c[1],);
         assert!(
             (fit.r_squared - 1.0).abs() < 1e-10,
             "Expected R²=1.0, got {}",
@@ -2124,35 +2497,110 @@ mod tests {
     }
 
     #[test]
-    fn test_two_var_fit_insufficient_data() {
-        // Fewer than 3 points → None.
-        assert!(two_var_fit(&[]).is_none());
-        assert!(two_var_fit(&[(1.0, 2.0, 3.0)]).is_none());
-        assert!(two_var_fit(&[(1.0, 2.0, 3.0), (4.0, 5.0, 6.0)]).is_none());
+    fn test_model_fit_insufficient_data() {
+        // Fewer than n_vars + 1 points → None.
+        let empty: Vec<Vec<f64>> = vec![];
+        assert!(model_fit(&empty).is_none());
+        assert!(model_fit(&[vec![1.0, 2.0, 3.0]]).is_none());
+        assert!(
+            model_fit(&[vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]]).is_none()
+        );
     }
 
     #[test]
-    fn test_two_var_fit_realistic() {
+    fn test_model_fit_realistic() {
         // Simulated data with a≈3.4, b≈2.8 and some noise.
-        // Points generated as: wall ≈ 3.4·attr + 2.8·meta + noise
-        let data: Vec<(f64, f64, f64)> = vec![
-            (100.0, 20.0, 398.0),   // 3.4*100 + 2.8*20 = 396
-            (50.0, 40.0, 283.0),    // 3.4*50 + 2.8*40 = 282
-            (200.0, 10.0, 710.0),   // 3.4*200 + 2.8*10 = 708
-            (30.0, 80.0, 325.0),    // 3.4*30 + 2.8*80 = 326
-            (150.0, 50.0, 651.0),   // 3.4*150 + 2.8*50 = 650
-            (500.0, 100.0, 1982.0), // 3.4*500 + 2.8*100 = 1980
-            (10.0, 5.0, 49.0),      // 3.4*10 + 2.8*5 = 48
+        let data: Vec<Vec<f64>> = vec![
+            vec![100.0, 20.0, 398.0],   // 3.4*100 + 2.8*20 = 396
+            vec![50.0, 40.0, 283.0],    // 3.4*50 + 2.8*40 = 282
+            vec![200.0, 10.0, 710.0],   // 3.4*200 + 2.8*10 = 708
+            vec![30.0, 80.0, 325.0],    // 3.4*30 + 2.8*80 = 326
+            vec![150.0, 50.0, 651.0],   // 3.4*150 + 2.8*50 = 650
+            vec![500.0, 100.0, 1982.0], // 3.4*500 + 2.8*100 = 1980
+            vec![10.0, 5.0, 49.0],      // 3.4*10 + 2.8*5 = 48
         ];
-        let fit = two_var_fit(&data).expect("should fit");
+        let fit = model_fit(&data).expect("should fit");
         assert!(
             fit.r_squared > 0.99,
             "Expected R² > 0.99, got {}",
             fit.r_squared,
         );
-        // Coefficients should be close to 3.4 and 2.8.
-        assert!((fit.a - 3.4).abs() < 0.1, "Expected a ≈ 3.4, got {}", fit.a,);
-        assert!((fit.b - 2.8).abs() < 0.1, "Expected b ≈ 2.8, got {}", fit.b,);
+        let c = &fit.model.coeffs;
+        assert!((c[0] - 3.4).abs() < 0.1, "Expected a ≈ 3.4, got {}", c[0],);
+        assert!((c[1] - 2.8).abs() < 0.1, "Expected b ≈ 2.8, got {}", c[1],);
+    }
+
+    #[test]
+    fn test_validation_table_marks_outliers() {
+        // Build targets where one is a clear outlier. The model should
+        // detect it via MAGSAC's inlier threshold and mark it with `*`.
+        //
+        // 7 targets that follow wall ≈ 3·attr + 2·meta + 1·other,
+        // plus one egregious outlier whose wall time is 10× the model.
+        let mut packages = HashMap::new();
+        for (pkg, sym_cost, meta_cost, other_cost, wall) in [
+            ("a", 100.0, 20.0, 10.0, 350.0), // 3*100+2*20+1*10=350
+            ("b", 50.0, 40.0, 20.0, 250.0),  // 3*50+2*40+1*20=250
+            ("c", 200.0, 10.0, 5.0, 625.0),  // 3*200+2*10+1*5=625
+            ("d", 30.0, 80.0, 15.0, 265.0),  // 3*30+2*80+1*15=265
+            ("e", 150.0, 30.0, 25.0, 535.0), // 3*150+2*30+1*25=535
+            ("f", 80.0, 50.0, 30.0, 370.0),  // 3*80+2*50+1*30=370
+            ("g", 120.0, 15.0, 10.0, 400.0), // 3*120+2*15+1*10=400
+            ("outlier", 10.0, 5.0, 2.0, 5000.0), // model predicts ~42
+        ] {
+            let mut symbols = HashMap::new();
+            symbols.insert("fn1".to_string(), make_symbol(sym_cost));
+
+            let mut event_times_ms = HashMap::new();
+            event_times_ms
+                .insert("metadata_decode_entry_foo".to_string(), meta_cost);
+            event_times_ms.insert("typeck".to_string(), other_cost);
+
+            let crate_data = tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: wall,
+                    event_times_ms,
+                },
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            };
+
+            let mut targets = HashMap::new();
+            targets.insert("lib".to_string(), crate_data);
+            packages.insert(pkg.to_string(), Package { targets });
+        }
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        let mut output = Vec::new();
+        result.write_report(&mut output).unwrap();
+        let report = String::from_utf8(output).unwrap();
+
+        // The outlier target should have an asterisk in its validation
+        // table row. Only look at lines after the "Out" header to
+        // avoid matching the timing detail table.
+        let after_header = report
+            .split_once("  Out")
+            .expect("report should contain Out header")
+            .1;
+        let outlier_line = after_header
+            .lines()
+            .find(|l| l.contains("outlier/lib"))
+            .expect("outlier should appear in validation table");
+        assert!(
+            outlier_line.contains('*'),
+            "outlier row should be marked with *. Line: {outlier_line}",
+        );
+
+        // Summary should show at least 1 outlier excluded.
+        assert!(
+            report.contains("Outliers excluded:   1"),
+            "summary should show 1 outlier. Report:\n{report}",
+        );
     }
 
     // =========================================================================
@@ -2195,12 +2643,13 @@ mod tests {
         // only, but predictions should appear for all targets.
         let mut packages = HashMap::new();
 
-        // 4 lib targets — enough for fitting.
-        for (pkg, sym_cost, meta_cost, wall) in [
-            ("a", 100.0, 20.0, 400.0),
-            ("b", 50.0, 40.0, 280.0),
-            ("c", 200.0, 10.0, 700.0),
-            ("d", 30.0, 80.0, 330.0),
+        // 5 lib targets — enough for fitting (3-var model needs 4+).
+        for (pkg, sym_cost, meta_cost, other_cost, wall) in [
+            ("a", 100.0, 20.0, 10.0, 440.0),
+            ("b", 50.0, 40.0, 20.0, 340.0),
+            ("c", 200.0, 10.0, 5.0, 725.0),
+            ("d", 30.0, 80.0, 15.0, 405.0),
+            ("e", 150.0, 30.0, 25.0, 625.0),
         ] {
             let mut symbols = HashMap::new();
             symbols.insert("fn1".to_string(), make_symbol(sym_cost));
@@ -2210,6 +2659,7 @@ mod tests {
                 "metadata_decode_entry_generics_of".to_string(),
                 meta_cost,
             );
+            event_times_ms.insert("typeck".to_string(), other_cost);
 
             let crate_data = tarjanize_schemas::Crate {
                 timings: TargetTimings {
@@ -2235,6 +2685,7 @@ mod tests {
         let mut test_event_times = HashMap::new();
         test_event_times
             .insert("metadata_decode_entry_generics_of".to_string(), 15.0);
+        test_event_times.insert("typeck".to_string(), 5.0);
 
         let test_crate = tarjanize_schemas::Crate {
             timings: TargetTimings {
@@ -2255,7 +2706,24 @@ mod tests {
             .insert("test".to_string(), test_crate);
 
         let graph = SymbolGraph { packages };
-        let result = critical_path(&graph);
+        let result = critical_path_with_options(
+            &graph,
+            CostOptions {
+                fit_libs_only: true,
+            },
+        );
+
+        // Model should be fitted (enough lib targets).
+        assert!(
+            result.model.is_some(),
+            "model should be fitted with 5 lib targets",
+        );
+
+        // Modeled critical path should be populated.
+        assert!(
+            result.modeled_critical_path_ms.is_some(),
+            "modeled critical path should exist when model is fitted",
+        );
 
         let mut output = Vec::new();
         result
@@ -2268,28 +2736,210 @@ mod tests {
             .unwrap();
         let report = String::from_utf8(output).unwrap();
 
-        // Header should show lib target count.
-        assert!(
-            report.contains("fit on 4 lib targets"),
-            "header should mention lib target count. Report:\n{report}",
-        );
-
-        // Summary should show lib/other breakdown.
-        assert!(
-            report.contains("4 lib, 1 other"),
-            "summary should show lib/other breakdown. Report:\n{report}",
-        );
-
         // Non-lib target should still appear in predictions.
         assert!(
             report.contains("a/test"),
             "non-lib target should appear in table. Report:\n{report}",
         );
 
-        // Delta column should be present.
+        // Delta column should be present (model was fitted).
         assert!(
             report.contains("Delta"),
             "Delta column should appear. Report:\n{report}",
+        );
+
+        // Both critical paths should be shown.
+        assert!(
+            report.contains("Critical path (wall-clock)"),
+            "should show wall-clock critical path. Report:\n{report}",
+        );
+        assert!(
+            report.contains("Critical path (modeled)"),
+            "should show modeled critical path. Report:\n{report}",
+        );
+    }
+
+    // =========================================================================
+    // CostModel tests
+    // =========================================================================
+
+    #[test]
+    fn test_cost_model_json_roundtrip() {
+        // Verify CostModel serializes to JSON and deserializes back
+        // with all fields intact.
+        let model = CostModel {
+            coeff_attr: 1.5,
+            coeff_meta: 2.3,
+            coeff_other: 0.8,
+            r_squared: 0.95,
+            inlier_threshold: 100.0,
+        };
+
+        let json = serde_json::to_string_pretty(&model).unwrap();
+        let roundtripped: CostModel = serde_json::from_str(&json).unwrap();
+
+        assert!(
+            (roundtripped.coeff_attr - 1.5).abs() < f64::EPSILON,
+            "coeff_attr mismatch",
+        );
+        assert!(
+            (roundtripped.coeff_meta - 2.3).abs() < f64::EPSILON,
+            "coeff_meta mismatch",
+        );
+        assert!(
+            (roundtripped.coeff_other - 0.8).abs() < f64::EPSILON,
+            "coeff_other mismatch",
+        );
+        assert!(
+            (roundtripped.r_squared - 0.95).abs() < f64::EPSILON,
+            "r_squared mismatch",
+        );
+        assert!(
+            (roundtripped.inlier_threshold - 100.0).abs() < f64::EPSILON,
+            "inlier_threshold mismatch",
+        );
+    }
+
+    #[test]
+    fn test_cost_model_predict() {
+        // Verify CostModel::predict applies the 3-variable model directly.
+        //
+        // wall = 2.0 * attr + 3.0 * meta + 1.5 * other
+        //      = 2.0 * 100 + 3.0 * 20 + 1.5 * 10 = 275
+        let model = CostModel {
+            coeff_attr: 2.0,
+            coeff_meta: 3.0,
+            coeff_other: 1.5,
+            r_squared: 1.0,
+            inlier_threshold: 100.0,
+        };
+
+        let result = model.predict(100.0, 20.0, 10.0);
+        assert!(
+            (result - 275.0).abs() < 1e-6,
+            "Expected 275.0, got {result}",
+        );
+    }
+
+    #[test]
+    fn test_cost_model_predict_zero_meta_other() {
+        // With zero meta and other, only attr matters.
+        // wall = 2.0 * 200 + 3.0 * 0 + 1.5 * 0 = 400
+        let model = CostModel {
+            coeff_attr: 2.0,
+            coeff_meta: 3.0,
+            coeff_other: 1.5,
+            r_squared: 1.0,
+            inlier_threshold: 100.0,
+        };
+
+        let result = model.predict(200.0, 0.0, 0.0);
+        assert!(
+            (result - 400.0).abs() < 1e-6,
+            "Expected 400.0, got {result}",
+        );
+    }
+
+    #[test]
+    fn test_build_cost_model_basic() {
+        // Build a SymbolGraph with 5 packages that have profiling data,
+        // run critical_path to get the ModelFit, then build_cost_model
+        // and verify the extracted coefficients match the fitted model.
+        //
+        // Data (wall = 3·attr + 2·meta + 1·other):
+        //   pkg  attr  meta   other  wall
+        //   a    100   20     10     350
+        //   b    50    40     20     250
+        //   c    200   10     5      625
+        //   d    30    80     15     265
+        //   e    150   30     25     535
+        let mut packages = HashMap::new();
+        for (pkg, sym_cost, meta_cost, other_cost) in [
+            ("a", 100.0, 20.0, 10.0),
+            ("b", 50.0, 40.0, 20.0),
+            ("c", 200.0, 10.0, 5.0),
+            ("d", 30.0, 80.0, 15.0),
+            ("e", 150.0, 30.0, 25.0),
+        ] {
+            let wall = 3.0 * sym_cost + 2.0 * meta_cost + 1.0 * other_cost;
+            let mut symbols = HashMap::new();
+            symbols.insert("fn1".to_string(), make_symbol(sym_cost));
+
+            let mut event_times_ms = HashMap::new();
+            event_times_ms
+                .insert("metadata_decode_entry_foo".to_string(), meta_cost);
+            event_times_ms.insert("typeck".to_string(), other_cost);
+
+            let crate_data = tarjanize_schemas::Crate {
+                timings: TargetTimings {
+                    wall_time_ms: wall,
+                    event_times_ms,
+                },
+                root: Module {
+                    symbols,
+                    submodules: HashMap::new(),
+                },
+                ..Default::default()
+            };
+
+            let mut targets = HashMap::new();
+            targets.insert("lib".to_string(), crate_data);
+            packages.insert(pkg.to_string(), Package { targets });
+        }
+
+        let graph = SymbolGraph { packages };
+        let result = critical_path(&graph);
+
+        // The main model should be fitted.
+        assert!(result.model.is_some(), "model should be fitted");
+
+        let cost_model = build_cost_model(&result);
+        assert!(cost_model.is_some(), "cost model should be built");
+
+        let cm = cost_model.unwrap();
+
+        // Main model coefficients should be close to 3, 2, 1 (perfect fit).
+        assert!(
+            (cm.coeff_attr - 3.0).abs() < 0.5,
+            "coeff_attr should be ~3.0, got {}",
+            cm.coeff_attr,
+        );
+        assert!(
+            (cm.coeff_meta - 2.0).abs() < 0.5,
+            "coeff_meta should be ~2.0, got {}",
+            cm.coeff_meta,
+        );
+
+        // R² should be high (perfect main-model fit).
+        assert!(
+            cm.r_squared > 0.9,
+            "r_squared should be > 0.9, got {}",
+            cm.r_squared,
+        );
+    }
+
+    #[test]
+    fn test_build_cost_model_none_without_profiling() {
+        // Without profiling data (wall_time_ms = 0), build_cost_model
+        // should return None because no model can be fitted.
+        let mut symbols = HashMap::new();
+        symbols.insert("foo".to_string(), make_symbol(10.0));
+
+        let mut crates = HashMap::new();
+        crates.insert(
+            "my-pkg".to_string(),
+            make_crate(Module {
+                symbols,
+                submodules: HashMap::new(),
+            }),
+        );
+
+        let graph = make_graph(crates);
+        let result = critical_path(&graph);
+
+        assert!(
+            build_cost_model(&result).is_none(),
+            "should return None without profiling data",
         );
     }
 }
