@@ -652,15 +652,7 @@ fn normalize_frontend_path(path: &str) -> String {
         return String::new();
     }
 
-    // Treat extern-crate roots like `my_crate::std` as unattributed. These
-    // are not real symbols we extract, but they may appear in profiles.
     let segments: Vec<&str> = path.split("::").collect();
-    if segments.len() == 2 {
-        let last = segments[1];
-        if matches!(last, "std" | "core" | "alloc") {
-            return String::new();
-        }
-    }
 
     // Skip compiler-internal pseudo-paths that aren't real symbols.
     // These are compiler query keys, not DefPaths we can attribute to symbols.
@@ -785,7 +777,7 @@ fn is_descendant_segment(segment: &str) -> bool {
     // Braced compiler-internal segments: {{closure}}, {{closure}}[N],
     // {{opaque}}, {{opaque}}[N], {{constructor}}, {{coroutine}}.
     // Exclude {{impl}} and {{impl}}[N] — those are symbol-level entities.
-    if segment.starts_with("{{") && !segment.starts_with("{{impl}}") {
+    if segment.starts_with("{{") && !segment.starts_with("{{impl}}") && !segment.starts_with("{{use}}") {
         return true;
     }
 
@@ -817,12 +809,6 @@ fn local_path_for_event(
     let raw_path = event.additional_data.first()?;
     let normalized = normalize_frontend_path(raw_path);
     if !normalized.starts_with(crate_prefix) {
-        return None;
-    }
-
-    // Filter extern-crate roots that sometimes show up as `crate::std`.
-    let local = normalized.strip_prefix(crate_prefix).unwrap_or("");
-    if matches!(local, "std" | "core" | "alloc") {
         return None;
     }
 
@@ -1033,6 +1019,38 @@ mod tests {
         assert_eq!(
             normalize_frontend_path("my_crate::Type::{{impl}}"),
             "my_crate::Type::{{impl}}"
+        );
+    }
+
+    #[test]
+    fn test_normalize_frontend_path_keeps_use() {
+        // Use items are real symbols — don't peel them as descendants.
+        assert_eq!(
+            normalize_frontend_path("my_crate::{{use}}"),
+            "my_crate::{{use}}"
+        );
+        assert_eq!(
+            normalize_frontend_path("my_crate::module::{{use}}[3]"),
+            "my_crate::module::{{use}}[3]"
+        );
+    }
+
+    #[test]
+    fn test_normalize_frontend_path_keeps_extern_crate() {
+        // ExternCrate items like `extern crate std` are now extracted as
+        // symbols. Two-segment paths like `my_crate::std` should no longer
+        // be discarded.
+        assert_eq!(
+            normalize_frontend_path("my_crate::std"),
+            "my_crate::std"
+        );
+        assert_eq!(
+            normalize_frontend_path("my_crate::core"),
+            "my_crate::core"
+        );
+        assert_eq!(
+            normalize_frontend_path("my_crate::alloc"),
+            "my_crate::alloc"
         );
     }
 

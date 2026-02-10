@@ -718,6 +718,33 @@ impl Callbacks for TarjanizeCallbacks {
         let symbol_count = count_symbols(&extraction.module);
         debug!(crate_name = %self.crate_name, symbol_count, "extraction complete");
 
+        if symbol_count == 0 {
+            if self.is_test {
+                // Test targets with no #[cfg(test)] items produce 0 symbols
+                // because the test_only filter excludes everything to avoid
+                // duplicating lib symbols. Skip writing this target entirely
+                // — it adds no useful information for scheduling analysis.
+                info!(
+                    crate_name = %self.crate_name,
+                    package = %self.package_name,
+                    target = %self.target_key,
+                    "skipping test target with no #[cfg(test)] items"
+                );
+                return Compilation::Continue;
+            }
+            // Facade crates (e.g., gateway-types re-exporting from
+            // gateway-types-versions) consist entirely of `pub use` and `mod`
+            // items, which we don't extract as symbols. These are real nodes
+            // in the dependency graph so we keep them — they just have 0
+            // symbols and negligible self-cost.
+            info!(
+                crate_name = %self.crate_name,
+                package = %self.package_name,
+                target = %self.target_key,
+                "non-test target produced 0 symbols (likely a facade/re-export crate)"
+            );
+        }
+
         // Store the module for post-compilation processing.
         // We'll apply costs and write the final Crate JSON after rustc
         // completes (including codegen).

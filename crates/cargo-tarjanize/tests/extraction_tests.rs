@@ -2112,3 +2112,25 @@ fn test_closure_internal_struct() {
     // The containing function `run` should exist.
     assert!(symbol_exists(&graph, "run"), "run should exist");
 }
+
+/// Test: `pub use` re-exports are extracted as symbols.
+///
+/// Facade crates consist entirely of `pub use` re-exports, which have real
+/// compilation cost and create dependency edges. They should appear as symbols
+/// with kind "Use".
+#[test]
+fn test_use_reexport() {
+    let graph = extract_fixture("use_reexport");
+
+    // The re-exported struct and function should appear as Use symbols.
+    assert!(symbol_exists(&graph, "{{use}}"), "pub use should be extracted");
+    assert_eq!(
+        get_symbol_kind(&graph, "{{use}}"),
+        Some("Use".to_string()),
+        "pub use should have kind 'Use'"
+    );
+
+    // The original items in the inner module should also exist.
+    assert!(symbol_exists(&graph, "Original"), "Original should exist");
+    assert!(symbol_exists(&graph, "helper"), "helper should exist");
+}

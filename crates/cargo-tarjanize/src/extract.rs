@@ -110,9 +110,13 @@ impl<'tcx> Extractor<'tcx> {
     fn extract_all_items(&mut self) {
         // Iterate all items in the crate.
         let items = self.tcx.hir_crate_items(());
+        let mut total_items = 0usize;
+        let mut extracted = 0usize;
         for item_id in items.free_items() {
+            total_items += 1;
             let def_id = item_id.owner_id.def_id;
             let path = self.def_path_str(def_id.to_def_id());
+            let before = self.symbols.len();
             let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     self.extract_item(def_id);
@@ -120,12 +124,24 @@ impl<'tcx> Extractor<'tcx> {
             if result.is_err() {
                 tracing::warn!(path, "panic during item extraction");
             }
+            if self.symbols.len() > before {
+                extracted += 1;
+            }
         }
+        tracing::info!(
+            crate_name = %self.crate_name,
+            test_only = self.test_only,
+            total_items,
+            extracted,
+            symbols = self.symbols.len(),
+            "extraction summary"
+        );
     }
 
     /// Extract a single item and its nested items.
     fn extract_item(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
+        let def_kind = self.tcx.def_kind(def_id);
 
         // Skip items nested inside functions/consts.
         // These can't be split independently and their dependencies are captured
@@ -140,10 +156,14 @@ impl<'tcx> Extractor<'tcx> {
         // This prevents duplication of symbols between lib and test targets.
         let is_test_item = self.is_cfg_test(def_id);
         if self.test_only && !is_test_item {
+            let path = self.def_path_str(def_id);
+            tracing::trace!(
+                path,
+                kind = ?def_kind,
+                "skipping non-cfg(test) item in test target"
+            );
             return;
         }
-
-        let def_kind = self.tcx.def_kind(def_id);
 
         match def_kind {
             // Regular module-level definitions.
@@ -171,19 +191,26 @@ impl<'tcx> Extractor<'tcx> {
                 self.extract_impl(local_def_id);
             }
 
+            // Re-exports and extern crate declarations have real compilation
+            // cost (path resolution, visibility checking, metadata loading)
+            // and create dependency edges. Facade crates that consist entirely
+            // of re-exports need these to have any symbols at all.
+            DefKind::Use => {
+                self.extract_use(local_def_id);
+            }
+            DefKind::ExternCrate => {
+                self.extract_extern_crate(local_def_id);
+            }
+
             // Items we skip:
             // - Mod: module structure is built from symbol paths
             // - Foreign items (extern "C" blocks)
-            // - Use declarations (re-exports)
-            // - Extern crate declarations
             // - Global asm
             // - Closure, coroutine (not top-level)
             // - Associated items are handled when extracting their parent
             DefKind::Mod
             | DefKind::ForeignMod
             | DefKind::ForeignTy
-            | DefKind::Use
-            | DefKind::ExternCrate
             | DefKind::GlobalAsm
             | DefKind::Closure
             | DefKind::AssocTy
@@ -197,7 +224,14 @@ impl<'tcx> Extractor<'tcx> {
             | DefKind::Ctor(..)
             | DefKind::AnonConst
             | DefKind::InlineConst
-            | DefKind::SyntheticCoroutineBody => {}
+            | DefKind::SyntheticCoroutineBody => {
+                let path = self.def_path_str(def_id);
+                tracing::trace!(
+                    path,
+                    kind = ?def_kind,
+                    "skipping non-extractable item"
+                );
+            }
         }
     }
 
@@ -392,6 +426,99 @@ impl<'tcx> Extractor<'tcx> {
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Macro".to_string(),
+                visibility: self.extract_visibility(def_id),
+            },
+        };
+
+        self.symbols.insert(key, symbol);
+    }
+
+    /// Extract a `use` declaration (re-export).
+    ///
+    /// Re-exports have real compilation cost (path resolution, visibility
+    /// checking) and create dependency edges. Facade crates like `gateway-types`
+    /// consist entirely of re-exports — without extracting these, such crates
+    /// would have 0 symbols.
+    ///
+    /// For `pub use other_crate::Foo`, the dependency points to `Foo` in the
+    /// other crate. For glob re-exports (`pub use other_crate::*`), we record
+    /// a dependency on the module being re-exported.
+    fn extract_use(&mut self, local_def_id: LocalDefId) {
+        let def_id = local_def_id.to_def_id();
+        let key = self.raw_def_path(def_id);
+
+        let mut deps = HashSet::new();
+
+        // Resolve what this use item refers to. For `pub use foo::Bar`,
+        // this gives us the DefId of `Bar`.
+        // `type_of` works for type re-exports; for function/const re-exports
+        // we need to check the HIR directly.
+        let hir_id = self.tcx.local_def_id_to_hir_id(local_def_id);
+        if let rustc_hir::Node::Item(item) = self.tcx.hir_node(hir_id)
+            && let rustc_hir::ItemKind::Use(path, _use_kind) = &item.kind
+        {
+            // The path's resolution is a PerNS<Option<Res>> with one
+            // entry per namespace (type, value, macro). Check all three
+            // for resolved DefIds.
+            for res in path.res.iter() {
+                if let Some(rustc_hir::def::Res::Def(
+                    _kind,
+                    target_def_id,
+                )) = res
+                {
+                    self.maybe_add_dep(*target_def_id, &mut deps);
+                }
+            }
+        }
+
+        let symbol = Symbol {
+            file: self.source_file(local_def_id),
+            event_times_ms: HashMap::new(),
+            dependencies: deps,
+            kind: SymbolKind::ModuleDef {
+                kind: "Use".to_string(),
+                visibility: self.extract_visibility(def_id),
+            },
+        };
+
+        self.symbols.insert(key, symbol);
+    }
+
+    /// Extract an `extern crate` declaration.
+    ///
+    /// Extern crate declarations load crate metadata and establish namespace
+    /// bindings. While mostly obsolete in edition 2018+, they still appear
+    /// (especially for `std`) and have real compilation cost.
+    fn extract_extern_crate(&mut self, local_def_id: LocalDefId) {
+        let def_id = local_def_id.to_def_id();
+        let key = self.raw_def_path(def_id);
+
+        let mut deps = HashSet::new();
+
+        // Resolve the extern crate to its DefId and record the dependency.
+        let hir_id = self.tcx.local_def_id_to_hir_id(local_def_id);
+        if let rustc_hir::Node::Item(item) = self.tcx.hir_node(hir_id)
+            && let rustc_hir::ItemKind::ExternCrate(original_name, ident) =
+                &item.kind
+        {
+            // The `original_name` is the real crate name if renamed
+            // (e.g., `extern crate foo as bar`). Otherwise it's None
+            // and the crate name matches the item's identifier.
+            let sym = original_name.map_or(ident.name, |n| n);
+            let crate_name = sym.as_str();
+
+            // Check if this is a workspace crate and add dependency.
+            if self.workspace_crates.contains(crate_name) {
+                deps.insert(crate_name.to_string());
+            }
+        }
+
+        let symbol = Symbol {
+            file: self.source_file(local_def_id),
+            event_times_ms: HashMap::new(),
+            dependencies: deps,
+            kind: SymbolKind::ModuleDef {
+                kind: "ExternCrate".to_string(),
                 visibility: self.extract_visibility(def_id),
             },
         };
@@ -1620,8 +1747,11 @@ impl<'tcx> Extractor<'tcx> {
     fn is_nested_in_body(&self, def_id: DefId) -> bool {
         let mut current = def_id;
         loop {
+            // Stop before calling parent() on the crate root (which panics).
+            if current.is_crate_root() {
+                return false;
+            }
             let parent = self.tcx.parent(current);
-            // Reached the crate root - not nested.
             if parent == current || parent.is_crate_root() {
                 return false;
             }
@@ -1650,6 +1780,10 @@ impl<'tcx> Extractor<'tcx> {
     fn find_containing_function(&self, def_id: DefId) -> Option<DefId> {
         let mut current = def_id;
         loop {
+            // Stop before calling parent() on the crate root (which panics).
+            if current.is_crate_root() {
+                return None;
+            }
             let parent = self.tcx.parent(current);
             if parent == current || parent.is_crate_root() {
                 return None;
@@ -1678,6 +1812,11 @@ impl<'tcx> Extractor<'tcx> {
             // Check attributes on this item.
             if self.has_cfg_test_attr(current) {
                 return true;
+            }
+
+            // Stop before calling parent() on the crate root (which panics).
+            if current.is_crate_root() {
+                return false;
             }
 
             // Walk up to parent.
@@ -1830,7 +1969,12 @@ impl<'tcx> Extractor<'tcx> {
                     out.push_str("::{{extern}}");
                 }
                 DefPathData::Use => {
-                    out.push_str("::{{use}}");
+                    out.push_str("::");
+                    if disambiguator == 0 {
+                        out.push_str("{{use}}");
+                    } else {
+                        let _ = write!(out, "{{{{use}}}}[{disambiguator}]");
+                    }
                 }
                 DefPathData::GlobalAsm => {
                     out.push_str("::{{global_asm}}");
