@@ -1,8 +1,7 @@
 // logic.js — Pure functions for the tarjanize build schedule visualization.
 //
-// These functions have zero PixiJS dependency and operate only on the `DATA`
-// constant injected into the same <script> scope by viz.html. Keeping them
-// separate makes them independently testable with Node.js / Vitest.
+// This is a proper ES module. The renderer imports these functions, and they
+// can be tested directly with Vitest without any DOM or PixiJS dependency.
 
 // ---------------------------------------------------------------------------
 // Critical-path walk
@@ -16,9 +15,7 @@
 // union is the full critical path through this single target.
 //
 // Returns an array of target indices in start-time order.
-function criticalPathThrough(idx) {
-  const targets = DATA.targets;
-
+export function criticalPathThrough(idx, targets) {
   // Walk backward from idx through forward_pred to collect ancestors.
   const backward = [];
   let cur = idx;
@@ -50,7 +47,7 @@ function criticalPathThrough(idx) {
 // critical path: zero slack (fully critical) maps to red (hue 0), and the
 // maximum slack in the schedule maps to blue (hue 220). Intermediate values
 // interpolate linearly, producing an intuitive red-through-blue gradient.
-function slackColor(slack, maxSlack) {
+export function slackColor(slack, maxSlack) {
   // Protect against division by zero when all targets have equal slack.
   const ratio = maxSlack > 0 ? slack / maxSlack : 0;
   const hue = Math.round(ratio * 220);
@@ -66,7 +63,7 @@ function slackColor(slack, maxSlack) {
 // The `scale` parameter represents pixels per millisecond. It changes as the
 // user zooms in/out. Keeping this as a pure function (rather than reading
 // global state) makes the renderer easier to reason about.
-function timeToX(timeMs, scale) {
+export function timeToX(timeMs, scale) {
   return timeMs * scale;
 }
 
@@ -74,7 +71,7 @@ function timeToX(timeMs, scale) {
 //
 // Lane 0 is at the top of the chart. Each lane occupies `laneHeight` pixels,
 // producing a compact Gantt-style stacking.
-function laneToY(lane, laneHeight) {
+export function laneToY(lane, laneHeight) {
   return lane * laneHeight;
 }
 
@@ -84,17 +81,17 @@ function laneToY(lane, laneHeight) {
 
 // Filter targets by case-insensitive substring match on their name.
 //
-// Returns an array of indices into `DATA.targets` for every target whose
+// Returns an array of indices into `targets` for every target whose
 // name contains the query string. An empty query returns all indices (i.e.,
 // no filtering).
-function searchFilter(query) {
+export function searchFilter(query, targets) {
   if (!query) {
-    return DATA.targets.map((_, i) => i);
+    return targets.map((_, i) => i);
   }
   const lower = query.toLowerCase();
   const results = [];
-  for (let i = 0; i < DATA.targets.length; i++) {
-    if (DATA.targets[i].name.toLowerCase().includes(lower)) {
+  for (let i = 0; i < targets.length; i++) {
+    if (targets[i].name.toLowerCase().includes(lower)) {
       results.push(i);
     }
   }
@@ -112,7 +109,7 @@ function searchFilter(query) {
 //   - Under 1 minute: "12.3s"
 //   - 1 minute or more: "1m 10s"
 // This keeps the sidebar and tooltips readable without excessive precision.
-function formatMs(ms) {
+export function formatMs(ms) {
   if (ms < 1000) {
     return `${Math.round(ms)}ms`;
   }
@@ -127,4 +124,28 @@ function formatMs(ms) {
     return `${minutes}m`;
   }
   return `${minutes}m ${seconds}s`;
+}
+
+// ---------------------------------------------------------------------------
+// Time axis
+// ---------------------------------------------------------------------------
+
+// Choose a "nice" round tick interval for the time axis at the current zoom.
+//
+// Given the effective pixels-per-millisecond, this picks the smallest interval
+// from a predetermined list of human-friendly values that keeps ticks at
+// least `targetPx` pixels apart. The list covers sub-millisecond through
+// 10-minute intervals — enough for any realistic build schedule.
+export function niceTimeStep(pixelsPerMs, targetPx) {
+  if (!targetPx) targetPx = 100;
+  const msPerTarget = targetPx / pixelsPerMs;
+  const steps = [
+    1, 2, 5, 10, 20, 50, 100, 200, 500,
+    1000, 2000, 5000, 10000, 15000, 30000,
+    60000, 120000, 300000, 600000,
+  ];
+  for (const s of steps) {
+    if (s >= msPerTarget) return s;
+  }
+  return steps[steps.length - 1];
 }

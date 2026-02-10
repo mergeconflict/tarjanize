@@ -3,6 +3,10 @@
 debug
 target
 
+# Node.js (esbuild bundler + vitest)
+node_modules
+package-lock.json
+
 # macOS
 .DS_Store
 

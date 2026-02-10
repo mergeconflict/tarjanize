@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>tarjanize — Build Schedule</title>
-  <style>{% include "style.css" %}</style>
+  <style>{{ style_css }}</style>
 </head>
 <body>
   <!-- Sidebar: summary stats, search, and legend. Populated by renderer.js
@@ -19,7 +19,7 @@
     <div class="stat">Peak lanes: <span class="stat-value" id="stat-lanes"></span></div>
     <input type="text" id="search-input" placeholder="Search targets...">
     <div class="legend">
-      <div style="font-size: 12px; margin-bottom: 4px;">Slack</div>
+      <div style="font-size: 12px; margin-bottom: 4px;">Slack <span class="help-icon" data-tip="Slack is how much a target could be delayed without extending the overall build. Zero slack (red) means the target is on the critical path &mdash; any delay would increase total build time. High slack (blue) means the target has room to spare and is not a bottleneck.">?</span></div>
       <div class="legend-gradient"></div>
       <div class="legend-labels"><span>0 (critical)</span><span>max</span></div>
     </div>
@@ -37,12 +37,11 @@
   { "imports": { "pixi.js": "https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.mjs" } }
   </script>
 
-  <!-- Main script: DATA is injected by askama, then logic.js and renderer.js
-       are inlined. All three share the same module scope. -->
-  <script type="module">
-    const DATA = {{ schedule_json|safe }};
-    {% include "logic.js" %}
-    {% include "renderer.js" %}
-  </script>
+  <!-- DATA is injected by askama into a classic script so it runs
+       synchronously before the module script below. -->
+  <script>window.DATA = {{ schedule_json|safe }};</script>
+
+  <!-- esbuild bundle: renderer.js + logic.js inlined, pixi.js external. -->
+  <script type="module">{{ bundle_js|safe }}</script>
 </body>
 </html>

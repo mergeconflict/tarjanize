@@ -1,0 +1,12 @@
+{
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "vitest": "^3.0.0"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "bundle": "esbuild crates/tarjanize-viz/templates/renderer.js --bundle --format=esm --external:pixi.js --outfile=crates/tarjanize-viz/build/bundle.js"
+  }
+}

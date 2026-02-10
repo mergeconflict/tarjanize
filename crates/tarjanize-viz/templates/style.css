@@ -124,3 +124,44 @@ body {
   font-size: 11px;
   color: #888;
 }
+
+/* Help icon: small circled "?" that shows a tooltip on hover. */
+.help-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid #666;
+  font-size: 10px;
+  color: #888;
+  cursor: help;
+  position: relative;
+  vertical-align: middle;
+}
+
+.help-icon:hover {
+  color: #00d4ff;
+  border-color: #00d4ff;
+}
+
+/* Tooltip appears to the right of the icon on hover. Uses fixed positioning
+ * to escape the sidebar's overflow:auto clipping context. */
+.help-icon:hover::after {
+  content: attr(data-tip);
+  position: fixed;
+  top: auto;
+  left: 100px;
+  width: 200px;
+  padding: 8px;
+  background: rgba(22, 33, 62, 0.95);
+  border: 1px solid #00d4ff;
+  border-radius: 6px;
+  color: #e0e0e0;
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: normal;
+  pointer-events: none;
+  z-index: 200;
+}
