@@ -12,7 +12,8 @@ use indexmap::IndexSet;
 use petgraph::algo::condensation;
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::unionfind::UnionFind;
-use tarjanize_cost::{CostModel, ModelFit, model_fit};
+use tarjanize_cost::{ModelFit, model_fit};
+use tarjanize_schemas::CostModel;
 use tarjanize_schemas::{
     Crate, Module, Package, Symbol, SymbolGraph, SymbolKind, TargetTimings,
     sum_event_times,

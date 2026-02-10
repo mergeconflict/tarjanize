@@ -16,6 +16,7 @@ workspace = true
 tarjanize-condense.workspace = true
 tarjanize-cost.workspace = true
 tarjanize-schemas.workspace = true
+tarjanize-viz.workspace = true
 mimalloc.workspace = true
 anyhow.workspace = true
 clap.workspace = true

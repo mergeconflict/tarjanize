@@ -1,5 +1,6 @@
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
+use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -15,8 +16,12 @@ use tracing_subscriber::fmt::format::FmtSpan;
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// Crates to include in the logging allowlist.
-const CRATES: &[&str] =
-    &["tarjanize", "tarjanize_condense", "tarjanize_schemas"];
+const CRATES: &[&str] = &[
+    "tarjanize",
+    "tarjanize_condense",
+    "tarjanize_schemas",
+    "tarjanize_viz",
+];
 
 /// Analyze Rust workspace dependency structures to identify opportunities for
 /// splitting crates into smaller, parallelizable units for improved build times.
@@ -102,6 +107,21 @@ enum Commands {
         #[arg(long, value_name = "PATH")]
         output_model: Option<String>,
     },
+
+    /// Visualize the build schedule as an interactive HTML report
+    ///
+    /// Generates a self-contained HTML file with a `PixiJS` canvas-based Gantt
+    /// chart. Hover over targets to see the critical path through them.
+    Viz {
+        #[command(flatten)]
+        io: IoArgs,
+
+        /// Path to the fitted cost model (from `tarjanize cost --output-model`).
+        /// When provided, uses model predictions for target costs.
+        /// Without a model, falls back to wall-clock or per-symbol costs.
+        #[arg(long, value_name = "PATH")]
+        model: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -123,11 +143,21 @@ fn main() -> Result<()> {
             // Load the external cost model if a path was provided.
             let cost_model = model
                 .map(|p| {
-                    tarjanize_cost::load_cost_model(std::path::Path::new(&p))
+                    tarjanize_schemas::load_cost_model(std::path::Path::new(&p))
                 })
                 .transpose()?;
             io.run(|r, w| {
                 Ok(tarjanize_condense::run(r, w, cost_model.as_ref())?)
+            })
+        }
+        Commands::Viz { io, model } => {
+            // Load the cost model if a path was provided.
+            let cost_model = model
+                .map(|p| tarjanize_schemas::load_cost_model(&p))
+                .transpose()?;
+            io.run(|r, w| {
+                tarjanize_viz::run(r, cost_model.as_ref(), w)
+                    .map_err(|e| anyhow::anyhow!("{e}"))
             })
         }
         Commands::Cost {
@@ -135,8 +165,6 @@ fn main() -> Result<()> {
             fit_libs_only,
             output_model,
         } => io.run(|mut r, w| {
-            // Read the symbol graph ourselves so we can pass it to
-            // critical_path_with_options.
             let mut json = String::new();
             r.read_to_string(&mut json)?;
             let symbol_graph: tarjanize_schemas::SymbolGraph =
@@ -145,11 +173,8 @@ fn main() -> Result<()> {
                 })?;
 
             let options = tarjanize_cost::CostOptions { fit_libs_only };
-            let result = tarjanize_cost::critical_path_with_options(
-                &symbol_graph,
-                options,
-            );
-            result.write_report_with_options(w, options)?;
+            let result = tarjanize_cost::fit(&symbol_graph, options);
+            result.write_report(w)?;
 
             // Optionally build and write the cost model JSON.
             if let Some(model_path) = output_model {

@@ -8,6 +8,7 @@ tarjanize-condense = { path = "crates/tarjanize-condense" }
 tarjanize-cost = { path = "crates/tarjanize-cost" }
 tarjanize-magsac = { path = "crates/tarjanize-magsac" }
 tarjanize-schemas = { path = "crates/tarjanize-schemas" }
+tarjanize-viz = { path = "crates/tarjanize-viz" }
 
 # Serialization
 schemars = "1.2"
@@ -27,6 +28,9 @@ anyhow = "1.0"
 
 # Time formatting
 jiff = "0.2"
+
+# Templating
+askama = "0.12"
 
 # Algorithms and data structures
 indexmap = "2.13"

@@ -10,9 +10,12 @@
 //! - **Complete**: All information needed for analysis is captured
 //! - **Shared**: Used across all phases of the tarjanize pipeline
 
+mod cost_model;
 mod symbol_graph;
 #[cfg(test)]
 mod testutil;
 
+#[doc(inline)]
+pub use cost_model::*;
 #[doc(inline)]
 pub use symbol_graph::*;

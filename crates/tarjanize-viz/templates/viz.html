@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>tarjanize — Build Schedule</title>
+  <style>{% include "style.css" %}</style>
+</head>
+<body>
+  <!-- Sidebar: summary stats, search, and legend. Populated by renderer.js
+       at startup using DATA.summary values. -->
+  <div id="sidebar">
+    <h2>tarjanize</h2>
+    <div class="stat">Critical path: <span class="stat-value" id="stat-cp"></span></div>
+    <div class="stat">Total cost: <span class="stat-value" id="stat-total"></span></div>
+    <div class="stat">Parallelism: <span class="stat-value" id="stat-parallel"></span></div>
+    <div class="stat">Targets: <span class="stat-value" id="stat-targets"></span></div>
+    <div class="stat">Symbols: <span class="stat-value" id="stat-symbols"></span></div>
+    <div class="stat">Peak lanes: <span class="stat-value" id="stat-lanes"></span></div>
+    <input type="text" id="search-input" placeholder="Search targets...">
+    <div class="legend">
+      <div style="font-size: 12px; margin-bottom: 4px;">Slack</div>
+      <div class="legend-gradient"></div>
+      <div class="legend-labels"><span>0 (critical)</span><span>max</span></div>
+    </div>
+  </div>
+
+  <!-- PixiJS canvas mounts inside this div. -->
+  <div id="viewport"></div>
+
+  <!-- Floating tooltip for hover details. Hidden by default. -->
+  <div id="tooltip"></div>
+
+  <!-- Import map: resolve bare "pixi.js" specifier to the CDN ESM bundle.
+       Using a specific major version (v8) for API stability. -->
+  <script type="importmap">
+  { "imports": { "pixi.js": "https://cdn.jsdelivr.net/npm/pixi.js@8/dist/pixi.min.mjs" } }
+  </script>
+
+  <!-- Main script: DATA is injected by askama, then logic.js and renderer.js
+       are inlined. All three share the same module scope. -->
+  <script type="module">
+    const DATA = {{ schedule_json|safe }};
+    {% include "logic.js" %}
+    {% include "renderer.js" %}
+  </script>
+</body>
+</html>

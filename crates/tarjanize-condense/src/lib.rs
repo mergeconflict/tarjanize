@@ -35,7 +35,7 @@ mod scc;
 
 use std::io::{Read, Write};
 
-use tarjanize_cost::CostModel;
+use tarjanize_schemas::CostModel;
 use tarjanize_schemas::SymbolGraph;
 use tracing::debug_span;
 
