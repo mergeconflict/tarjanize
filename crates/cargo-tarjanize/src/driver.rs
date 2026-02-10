@@ -703,15 +703,16 @@ impl Callbacks for TarjanizeCallbacks {
         tcx: TyCtxt<'_>,
     ) -> Compilation {
         // Extract symbols from this crate.
-        // For test targets we now extract all items (not just #[cfg(test)])
-        // so test target costs can be modeled without gaps, even if that
-        // duplicates symbols across lib and test targets.
+        // For test targets, only extract #[cfg(test)] items to avoid
+        // duplicating the entire lib symbol set. The compiler already
+        // excludes cfg(test) items from lib targets, so this separation
+        // ensures no symbol duplication between lib and test targets.
         info!(crate_name = %self.crate_name, is_test = self.is_test, "extracting symbols");
         let extraction = extract::extract_crate(
             tcx,
             &self.crate_name,
             &self.config.workspace_crates,
-            false,
+            self.is_test,
         );
 
         let symbol_count = count_symbols(&extraction.module);

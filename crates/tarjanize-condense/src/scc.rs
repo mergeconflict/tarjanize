@@ -46,6 +46,30 @@ fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
     Some((prefix, rest))
 }
 
+/// Tries to resolve a sub-symbol dependency path to a known container.
+///
+/// When a dependency path like `[pkg/lib]::{{impl}}[2]::parse` isn't in the
+/// index, this strips trailing `::segment` suffixes one at a time to find
+/// the closest ancestor that IS in the index. Only strips one level to avoid
+/// creating spurious edges to unrelated ancestors.
+///
+/// Returns `None` if the path doesn't start with `[` (not a bracketed path)
+/// or if stripping the last segment still doesn't resolve.
+fn resolve_sub_symbol_path(
+    index: &SymbolIndex<'_>,
+    dep: &str,
+) -> Option<usize> {
+    // Only attempt resolution for bracketed paths (workspace-internal deps).
+    if !dep.starts_with('[') {
+        return None;
+    }
+
+    // Strip the last `::segment` and retry. Only strip once to avoid
+    // over-generalizing (e.g., resolving to a module instead of a symbol).
+    let parent = dep.rsplit_once("::")?;
+    index.get_index(parent.0)
+}
+
 /// Applies HMR (Habib-Morvan-Rampon) transitive reduction to a set of deps.
 ///
 /// Given a starting reachable set and a list of dependencies, returns the
@@ -219,12 +243,30 @@ pub(crate) fn condense_and_partition(
     for i in 0..index.len() {
         graph.add_node(i);
     }
+    let mut sub_symbol_resolved = 0usize;
     for from in 0..index.len() {
         for dep in &index.get_symbol(from).dependencies {
             if let Some(to) = index.get_index(dep) {
                 graph.add_edge(NodeIndex::new(from), NodeIndex::new(to), ());
+            } else if let Some(to) = resolve_sub_symbol_path(&index, dep) {
+                // Sub-symbol path: the dependency points to an associated
+                // item (e.g., `[pkg/lib]::{{impl}}[2]::parse`) but the
+                // index only has the container (`[pkg/lib]::{{impl}}[2]`).
+                //
+                // TODO: The root cause is in extract.rs — `normalize_def_id`
+                // doesn't collapse some associated items to their container.
+                // This fallback resolves the edge by stripping trailing path
+                // segments until we find a known symbol.
+                graph.add_edge(NodeIndex::new(from), NodeIndex::new(to), ());
+                sub_symbol_resolved += 1;
             }
         }
+    }
+    if sub_symbol_resolved > 0 {
+        debug!(
+            sub_symbol_resolved,
+            "Resolved sub-symbol dependencies by stripping trailing segments"
+        );
     }
 
     // Step 2b: Add synthetic back-edges for anchor constraints.
@@ -401,7 +443,14 @@ pub(crate) fn condense_and_partition(
 
         match effective_dependent_sets.len() {
             0 => {
-                // No effective dependents - this is a root, stays in its own set.
+                // No effective dependents — this is a root, stays in its own set.
+                //
+                // TODO: Downward merging. ~62% of SCCs are roots with 0
+                // dependents. A second pass should merge roots that have
+                // exactly 1 dependency into that dependency's set, iterating
+                // until stable. This would reduce the number of isolated
+                // single-symbol crates that add per-crate overhead without
+                // enabling any parallelism.
                 debug!(
                     scc_id,
                     ?scc_symbols,
@@ -656,9 +705,7 @@ fn build_output_graph(
         let my_target = format!("{crate_name}/synthetic");
         let synthetic_deps: HashSet<String> = symbol_indices
             .iter()
-            .flat_map(|&sym_idx| {
-                index.get_symbol(sym_idx).dependencies.iter()
-            })
+            .flat_map(|&sym_idx| index.get_symbol(sym_idx).dependencies.iter())
             .filter_map(|dep_path| {
                 let dep_idx = index.get_index(dep_path)?;
                 let dep_target = &symbol_to_synthetic[dep_idx];
@@ -669,6 +716,13 @@ fn build_output_graph(
         // Estimate meta/other for the synthetic crate using the
         // max-constituent heuristic: a synthetic crate inherits at least
         // as much metadata/other overhead as its largest constituent.
+        //
+        // TODO: Cost model inflation. The max-constituent heuristic assigns
+        // the full overhead of the largest original target to every fragment,
+        // even single-symbol crates. This inflates predicted wall times.
+        // Should scale meta/other proportionally by symbol count relative
+        // to the original target (e.g., a fragment with 10% of symbols
+        // gets 10% of the meta/other overhead).
         let meta: f64 = constituent_targets
             .iter()
             .filter_map(|t| target_meta.get(*t))
@@ -740,8 +794,8 @@ fn predict_wall_time(
 /// Computes a mapping from old symbol paths to new symbol paths.
 ///
 /// This handles conflict resolution: if two symbols from different original
-/// crates would have the same path in the new crate, they get placed in
-/// `conflict_from_{original_crate}` submodules.
+/// targets would have the same path in the new crate, they get placed in
+/// `conflict_from_{package_target}` submodules (with `/` replaced by `_`).
 fn compute_path_mapping(
     index: &SymbolIndex<'_>,
     set_crate_names: &[(u32, String, Vec<usize>)],
@@ -755,7 +809,7 @@ fn compute_path_mapping(
 
         for &symbol_idx in symbol_indices {
             let full_path = index.get_path(symbol_idx);
-            let original_crate = index.get_original_crate(symbol_idx);
+            let original_target = index.get_original_target(symbol_idx);
 
             // Parse path in new format: [package/target]::module::symbol
             let rest = if let Some((_, rest)) = parse_bracketed_path(full_path)
@@ -781,7 +835,7 @@ fn compute_path_mapping(
             path_to_symbols
                 .entry((module_parts, symbol_name))
                 .or_default()
-                .push((symbol_idx, original_crate.to_string()));
+                .push((symbol_idx, original_target.to_string()));
         }
 
         // Compute new paths, handling conflicts.
@@ -805,12 +859,15 @@ fn compute_path_mapping(
 
                 mapping.insert(old_path, new_path);
             } else {
-                // Conflict - each symbol goes into a conflict submodule.
-                for (symbol_idx, original_crate) in &occurrences {
+                // Conflict — use the full target ID (e.g., "pkg/lib")
+                // with `/` sanitized to `_` for valid module names.
+                for (symbol_idx, original_target) in &occurrences {
                     let old_path = index.get_path(*symbol_idx).to_string();
 
-                    let conflict_module =
-                        format!("conflict_from_{original_crate}");
+                    let conflict_module = format!(
+                        "conflict_from_{}",
+                        original_target.replace('/', "_")
+                    );
                     let new_path = if module_path.is_empty() {
                         format!(
                             "[{crate_name}/synthetic]::{conflict_module}::{symbol_name}"
@@ -834,13 +891,18 @@ fn compute_path_mapping(
 
 /// Builds a module tree from a list of symbol indices.
 ///
-/// Handles conflict detection: if two symbols from different original crates
-/// would have the same path, they are placed in `conflict_from_{original_crate}`
-/// submodules.
+/// Handles conflict detection: if two symbols from different original targets
+/// would have the same path, they are placed in `conflict_from_{package_target}`
+/// submodules (with `/` replaced by `_`).
 /// Key for grouping symbols: (module path segments, symbol name).
 type SymbolPathKey = (Vec<String>, String);
 
-/// Value for symbol grouping: list of (symbol index, original crate).
+/// Value for symbol grouping: list of (symbol index, original target).
+///
+/// The target identifier uses the `"package/target"` format (e.g.,
+/// `"mypkg/lib"`, `"mypkg/test"`) rather than just the package name.
+/// This ensures symbols from different targets of the same package
+/// (lib vs test) produce distinct conflict submodules.
 type SymbolOccurrences = Vec<(usize, String)>;
 
 fn build_module_tree(
@@ -854,7 +916,7 @@ fn build_module_tree(
 
     for &symbol_idx in symbol_indices {
         let full_path = index.get_path(symbol_idx);
-        let original_crate = index.get_original_crate(symbol_idx);
+        let original_target = index.get_original_target(symbol_idx);
 
         // Parse path in new format: [package/target]::module::symbol
         let rest = if let Some((_, rest)) = parse_bracketed_path(full_path) {
@@ -879,7 +941,7 @@ fn build_module_tree(
         path_to_symbols
             .entry((module_parts, symbol_name))
             .or_default()
-            .push((symbol_idx, original_crate.to_string()));
+            .push((symbol_idx, original_target.to_string()));
     }
 
     // Build the module tree, handling conflicts.
@@ -897,13 +959,17 @@ fn build_module_tree(
             let new_symbol = rewrite_symbol(symbol, path_mapping);
             target_module.symbols.insert(symbol_name, new_symbol);
         } else {
-            // Conflict - place each symbol in a conflict submodule.
-            for (symbol_idx, original_crate) in &occurrences {
+            // Conflict — use the full target ID (e.g., "pkg/lib")
+            // with `/` sanitized to `_` for valid module names.
+            for (symbol_idx, original_target) in &occurrences {
                 let symbol = index.get_symbol(*symbol_idx);
 
                 // Create path with conflict submodule.
                 let mut conflict_path = module_path.clone();
-                conflict_path.push(format!("conflict_from_{original_crate}"));
+                conflict_path.push(format!(
+                    "conflict_from_{}",
+                    original_target.replace('/', "_")
+                ));
 
                 let target_module =
                     get_or_create_module(&mut root, &conflict_path);
@@ -1049,14 +1115,17 @@ mod tests {
         &get_synthetic(pkg).root
     }
 
-    /// Helper to count total symbols across all packages.
-    #[expect(dead_code, reason = "utility function for future tests")]
+    /// Helper to count total symbols across all packages (recursive).
     fn count_total_symbols(graph: &SymbolGraph) -> usize {
+        fn count_module(module: &Module) -> usize {
+            module.symbols.len()
+                + module.submodules.values().map(count_module).sum::<usize>()
+        }
         graph
             .packages
             .values()
             .flat_map(|pkg| pkg.targets.values())
-            .map(|c| c.root.symbols.len())
+            .map(|c| count_module(&c.root))
             .sum()
     }
 
@@ -2001,6 +2070,92 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_symbol_dependency_resolves_to_container() {
+        // When a symbol depends on a sub-symbol path that isn't in the
+        // index (e.g., `[pkg/lib]::{{impl}}[2]::parse`), but the parent
+        // path `[pkg/lib]::{{impl}}[2]` IS in the index, the fallback
+        // should create an edge to the parent container.
+        //
+        // Graph: A depends on {{impl}}[2]::parse, but only {{impl}}[2]
+        // exists. The edge A → {{impl}}[2] should be created.
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "pkg": { "targets": { "lib": {
+                    "timings": {},
+                    "root": { "symbols": {
+                        "A": { "file": "", "event_times_ms": {"typeck": 10.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg/lib]::{{impl}}[2]::parse"] },
+                        "{{impl}}[2]": { "file": "", "event_times_ms": {"typeck": 5.0},
+                                         "impl": {"name": "impl Foo", "anchors": []} }
+                    }}
+                }}}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Both symbols should be present (A + {{impl}}[2]).
+        let total_symbols: usize = result
+            .packages
+            .values()
+            .map(|m| get_root(m).symbols.len())
+            .sum();
+        assert_eq!(total_symbols, 2);
+
+        // The dependency from A to {{impl}}[2] should be resolved via
+        // the sub-symbol fallback. Since it's a chain (A → {{impl}}[2]),
+        // both should merge into one crate.
+        assert_eq!(
+            result.packages.len(),
+            1,
+            "A → {{{{impl}}}}[2] chain should merge into one crate"
+        );
+    }
+
+    #[test]
+    fn test_sub_symbol_fallback_does_not_over_strip() {
+        // When stripping the last segment also doesn't resolve, the
+        // fallback should NOT keep stripping. No spurious edges should
+        // be created for completely unresolvable paths.
+        //
+        // A depends on [pkg/lib]::unknown_module::unknown_symbol.
+        // Neither the full path nor [pkg/lib]::unknown_module exists.
+        // B is independent.
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "pkg": { "targets": { "lib": {
+                    "timings": {},
+                    "root": { "symbols": {
+                        "A": { "file": "", "event_times_ms": {"typeck": 10.0},
+                               "module_def": {"kind": "Function"},
+                               "dependencies": ["[pkg/lib]::unknown_module::unknown_symbol"] },
+                        "B": { "file": "", "event_times_ms": {"typeck": 5.0},
+                               "module_def": {"kind": "Function"} }
+                    }}
+                }}}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Both A and B are independent roots (no edges between them).
+        // The unresolvable dep should be silently dropped, not create
+        // a spurious edge.
+        assert_eq!(
+            result.packages.len(),
+            2,
+            "A and B should remain in separate crates (no spurious edge)"
+        );
+    }
+
+    #[test]
     fn test_synthetic_deps_remapped_to_new_target_ids() {
         // Verify that dependencies between synthetic crates use new target
         // IDs ("pkg_b/synthetic"), not original ones ("pkg_b/lib").
@@ -2063,5 +2218,113 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Symbols from different targets (lib vs test) that end up in the same
+    /// SCC must not be silently dropped during conflict resolution.
+    ///
+    /// Regression test: when lib and test targets both have a symbol at the
+    /// same relative path, `build_module_tree` must disambiguate using the
+    /// full target identifier (e.g., `pkg/lib` vs `pkg/test`) rather than
+    /// just the package name.
+    #[test]
+    fn test_cross_target_symbols_not_dropped() {
+        // Build a graph where one package has lib and test targets, each
+        // containing a symbol with the same relative path "foo". A
+        // cross-target dependency forces them into the same SCC.
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "mypkg": { "targets": {
+                    "lib": {
+                        "timings": {},
+                        "root": { "symbols": {
+                            "foo": { "file": "lib.rs", "event_times_ms": {},
+                                     "module_def": {"kind": "Function"} }
+                        }}
+                    },
+                    "test": {
+                        "timings": {},
+                        "dependencies": ["mypkg/lib"],
+                        "root": { "symbols": {
+                            "foo": { "file": "lib.rs", "event_times_ms": {},
+                                     "module_def": {"kind": "Function"},
+                                     "dependencies": ["[mypkg/lib]::foo"] }
+                        }}
+                    }
+                }}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Both symbols must survive condensation (zero loss).
+        assert_eq!(
+            count_total_symbols(&result),
+            2,
+            "Both lib and test symbols must be preserved, got: {result:#?}"
+        );
+    }
+
+    /// When cross-target conflicts are resolved, the conflict submodule names
+    /// must use the full target identifier (with `/` sanitized to `_`) so that
+    /// symbols from `pkg/lib` and `pkg/test` produce distinct submodules.
+    #[test]
+    fn test_cross_target_conflict_uses_target_name() {
+        // Same setup as above: lib and test targets with duplicate "foo".
+        let graph: SymbolGraph = serde_json::from_str(
+            r#"{
+            "packages": {
+                "mypkg": { "targets": {
+                    "lib": {
+                        "timings": {},
+                        "root": { "symbols": {
+                            "foo": { "file": "lib.rs", "event_times_ms": {},
+                                     "module_def": {"kind": "Function"} }
+                        }}
+                    },
+                    "test": {
+                        "timings": {},
+                        "dependencies": ["mypkg/lib"],
+                        "root": { "symbols": {
+                            "foo": { "file": "lib.rs", "event_times_ms": {},
+                                     "module_def": {"kind": "Function"},
+                                     "dependencies": ["[mypkg/lib]::foo"] }
+                        }}
+                    }
+                }}
+            }
+        }"#,
+        )
+        .unwrap();
+
+        let result = condense_and_partition(&graph, None);
+
+        // Find the package containing the merged symbols. Since they form
+        // a cycle (test→lib via anchor back-edge), they'll be in one SCC.
+        let mut found_lib_conflict = false;
+        let mut found_test_conflict = false;
+
+        for pkg in result.packages.values() {
+            let root = get_root(pkg);
+            // Conflict submodules should use target-qualified names.
+            if root.submodules.contains_key("conflict_from_mypkg_lib") {
+                found_lib_conflict = true;
+            }
+            if root.submodules.contains_key("conflict_from_mypkg_test") {
+                found_test_conflict = true;
+            }
+        }
+
+        assert!(
+            found_lib_conflict,
+            "Expected conflict_from_mypkg_lib submodule in output: {result:#?}"
+        );
+        assert!(
+            found_test_conflict,
+            "Expected conflict_from_mypkg_test submodule in output: {result:#?}"
+        );
     }
 }

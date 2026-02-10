@@ -242,7 +242,6 @@ fn run_build(
         .env(ENV_VERBOSITY, config.verbosity_level)
         .env("RUSTC_WRAPPER", config.self_exe)
         .env("CARGO_TARGET_DIR", config.target_dir)
-        .env("CARGO_INCREMENTAL", "0")
         .current_dir(config.manifest_dir);
 
     // Skip profiling if requested.
@@ -326,10 +325,12 @@ fn aggregate_results(
             parse_target_key_from_filename(&path, &result.crate_name);
 
         // Look up the package name from the crate mapping.
+        // Mapping values are "package/target" format; extract just the
+        // package portion (everything before the first `/`).
         let package_name = crate_mapping
             .get(&result.crate_name)
-            .cloned()
-            .unwrap_or_else(|| result.crate_name.replace('_', "-"));
+            .and_then(|v| v.split('/').next())
+            .map_or_else(|| result.crate_name.replace('_', "-"), String::from);
 
         // Insert into the package's targets map.
         let package = packages.entry(package_name).or_default();
@@ -455,11 +456,18 @@ fn populate_dependencies(
 // target separation refactor. With separate lib/test/bin targets, we no longer
 // merge results - each target gets its own entry in Package.targets.
 
-/// Write a crate-to-package mapping file for the orchestrator to use later.
+/// Write a crate-to-target mapping file for the orchestrator to use later.
 ///
-/// This maps crate names (as rustc sees them, with underscores) to package
-/// names (as Cargo defines them, may have hyphens). The mapping is used when
-/// aggregating results to correctly associate driver output with packages.
+/// Maps crate names (as rustc sees them, with underscores) to their fully
+/// qualified target identifiers in `"package-name/target-key"` format.
+/// This mapping is used to transform symbol dependency paths from raw
+/// crate-name format (`crate_name::symbol`) to bracketed target format
+/// (`[package/target]::symbol`).
+///
+/// All workspace target types are included (lib, bin, test, example, bench)
+/// so that dependencies on non-lib targets (e.g., binary-to-binary) resolve
+/// correctly. When two targets share a crate name, the lib target takes
+/// priority since cross-crate `use` statements resolve to lib targets.
 ///
 /// The mapping file is written to `{output_dir}/crate_mapping.json`.
 fn write_crate_mapping(
@@ -469,28 +477,51 @@ fn write_crate_mapping(
     let mut mapping = HashMap::new();
 
     for pkg in metadata.workspace_packages() {
-        // For each lib target, map the crate name to the package name.
-        // The crate name for a lib target is either explicitly set in
-        // Cargo.toml [lib] name, or defaults to the package name with
-        // hyphens replaced by underscores.
+        // Two-pass insertion: lib targets first (they take priority when
+        // a lib and bin share the same crate name, since extern crate
+        // resolution always refers to the lib target).
+        let mut lib_targets = Vec::new();
+        let mut other_targets = Vec::new();
+
         for target in &pkg.targets {
-            // Check if this is a lib target by looking for Lib kind.
-            let is_lib = target
-                .kind
-                .iter()
-                .any(|k| matches!(k, cargo_metadata::TargetKind::Lib));
+            let is_lib = target.kind.iter().any(|k| {
+                matches!(
+                    k,
+                    cargo_metadata::TargetKind::Lib
+                        | cargo_metadata::TargetKind::ProcMacro
+                )
+            });
             if is_lib {
-                // target.name is the crate name (underscores).
-                mapping.insert(target.name.clone(), pkg.name.to_string());
+                lib_targets.push(target);
+            } else {
+                other_targets.push(target);
             }
         }
-        // Also add a mapping for the default crate name (package name with
-        // hyphens → underscores). This handles cases where there's no explicit
-        // lib target or it uses the default name.
+
+        // Insert lib targets first so they win collisions.
+        for target in lib_targets {
+            let crate_name = target.name.replace('-', "_");
+            mapping.insert(crate_name, format!("{}/lib", pkg.name));
+        }
+
+        // Insert non-lib targets (bin, test, example, bench).
+        // Uses entry() so lib targets retain priority on collisions.
+        for target in other_targets {
+            let crate_name = target.name.replace('-', "_");
+            if let Some(target_key) = target_key_for_cargo_target(target) {
+                mapping
+                    .entry(crate_name)
+                    .or_insert_with(|| format!("{}/{target_key}", pkg.name));
+            }
+        }
+
+        // Also add a default entry for the package name with hyphens →
+        // underscores. Handles cases where there's no explicit lib target
+        // or it uses a different name.
         let default_crate_name = pkg.name.replace('-', "_");
         mapping
             .entry(default_crate_name)
-            .or_insert_with(|| pkg.name.to_string());
+            .or_insert_with(|| format!("{}/lib", pkg.name));
     }
 
     let mapping_path = output_dir.join(CRATE_MAPPING_FILENAME);
@@ -510,6 +541,38 @@ fn write_crate_mapping(
     Ok(mapping)
 }
 
+/// Converts a `cargo_metadata::Target` into our target-key format.
+///
+/// Returns `None` for target kinds we don't track (e.g., build scripts).
+fn target_key_for_cargo_target(
+    target: &cargo_metadata::Target,
+) -> Option<String> {
+    for kind in &target.kind {
+        match kind {
+            cargo_metadata::TargetKind::Lib
+            | cargo_metadata::TargetKind::ProcMacro => {
+                return Some("lib".to_string());
+            }
+            cargo_metadata::TargetKind::Bin => {
+                return Some(format!("bin/{}", target.name));
+            }
+            cargo_metadata::TargetKind::Test => {
+                return Some(format!("test/{}", target.name));
+            }
+            cargo_metadata::TargetKind::Example => {
+                return Some(format!("example/{}", target.name));
+            }
+            cargo_metadata::TargetKind::Bench => {
+                return Some(format!("bench/{}", target.name));
+            }
+            // Build scripts and unknown kinds are not compilation targets
+            // we track for dependency analysis.
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Load the crate mapping from a file.
 fn load_crate_mapping(output_dir: &Path) -> Result<HashMap<String, String>> {
     let mapping_path = output_dir.join(CRATE_MAPPING_FILENAME);
@@ -526,23 +589,16 @@ fn load_crate_mapping(output_dir: &Path) -> Result<HashMap<String, String>> {
 /// Transform symbol paths from crate-name format to package/target format.
 ///
 /// Symbol dependencies and impl anchors use paths like `crate_name::module::symbol`.
-/// This function transforms them to `[package-name/target]::module::symbol`.
-///
-/// For same-package references, we use the current target (a binary referencing
-/// its own symbols stays within that binary). For cross-package references, we
-/// use `/lib` since that's what rustc resolves for `use other_crate::foo`.
+/// This function transforms them to `[package-name/target]::module::symbol`
+/// using the crate mapping which maps each crate name to its fully qualified
+/// `"package/target"` identifier.
 fn transform_symbol_paths(
     packages: &mut HashMap<String, Package>,
     crate_mapping: &HashMap<String, String>,
 ) {
-    for (package_name, package) in &mut *packages {
-        for (target_key, crate_data) in &mut package.targets {
-            transform_module_paths(
-                &mut crate_data.root,
-                crate_mapping,
-                package_name,
-                target_key,
-            );
+    for package in packages.values_mut() {
+        for crate_data in package.targets.values_mut() {
+            transform_module_paths(&mut crate_data.root, crate_mapping);
         }
     }
 }
@@ -551,47 +607,26 @@ fn transform_symbol_paths(
 fn transform_module_paths(
     module: &mut tarjanize_schemas::Module,
     crate_mapping: &HashMap<String, String>,
-    current_package: &str,
-    current_target: &str,
 ) {
     for symbol in module.symbols.values_mut() {
         // Transform dependencies.
         symbol.dependencies = symbol
             .dependencies
             .iter()
-            .map(|dep| {
-                transform_path(
-                    dep,
-                    crate_mapping,
-                    current_package,
-                    current_target,
-                )
-            })
+            .map(|dep| transform_path(dep, crate_mapping))
             .collect();
 
         // Transform impl anchors if this is an impl block.
         if let SymbolKind::Impl { anchors, .. } = &mut symbol.kind {
             *anchors = anchors
                 .iter()
-                .map(|anchor| {
-                    transform_path(
-                        anchor,
-                        crate_mapping,
-                        current_package,
-                        current_target,
-                    )
-                })
+                .map(|anchor| transform_path(anchor, crate_mapping))
                 .collect();
         }
     }
 
     for submodule in module.submodules.values_mut() {
-        transform_module_paths(
-            submodule,
-            crate_mapping,
-            current_package,
-            current_target,
-        );
+        transform_module_paths(submodule, crate_mapping);
     }
 }
 
@@ -600,35 +635,27 @@ fn transform_module_paths(
 /// Input:  `crate_name::module::symbol`
 /// Output: `[package-name/target]::module::symbol`
 ///
-/// For same-package references, uses the current target. For cross-package
-/// references, uses `/lib`. If the crate name is not in the mapping (external
-/// crate), the path is returned unchanged.
+/// The crate mapping provides the full `"package/target"` value for each
+/// known crate name, so no same-package vs. cross-package heuristic is
+/// needed. If the crate name is not in the mapping (external crate), the
+/// path is returned unchanged.
 fn transform_path(
     path: &str,
     crate_mapping: &HashMap<String, String>,
-    current_package: &str,
-    current_target: &str,
 ) -> String {
     // Parse the crate name from the path (everything before the first `::`)
     let Some((crate_name, rest)) = path.split_once("::") else {
-        // No `::` in path - return unchanged.
+        // No `::` in path — return unchanged.
         return path.to_string();
     };
 
-    // Look up the package name. If not found, this is an external crate.
-    let Some(package_name) = crate_mapping.get(crate_name) else {
-        // External crate - return unchanged.
+    // Look up the target identifier. If not found, this is an external crate.
+    let Some(target_id) = crate_mapping.get(crate_name) else {
+        // External crate — return unchanged.
         return path.to_string();
     };
 
-    // Determine the target: same package uses current target, cross-package uses lib.
-    let target = if package_name == current_package {
-        current_target
-    } else {
-        "lib"
-    };
-
-    format!("[{package_name}/{target}]::{rest}")
+    format!("[{target_id}]::{rest}")
 }
 
 #[cfg(test)]
@@ -636,6 +663,8 @@ mod tests {
     use super::*;
 
     /// Build a crate mapping for tests.
+    ///
+    /// Values are in `"package/target"` format (e.g., `"my-pkg/lib"`).
     fn make_mapping(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
             .iter()
@@ -643,87 +672,14 @@ mod tests {
             .collect()
     }
 
-    #[test]
-    fn test_transform_path_same_package_uses_current_target() {
-        // When a symbol in a binary references another symbol in the same package,
-        // it should use the current target (bin/foo), not lib.
-        let mapping = make_mapping(&[("my_bin", "my-package")]);
-
-        let result = transform_path(
-            "my_bin::SomeStruct",
-            &mapping,
-            "my-package", // current package
-            "bin/my_bin", // current target
-        );
-
-        assert_eq!(result, "[my-package/bin/my_bin]::SomeStruct");
-    }
+    // ── transform_path: lib target resolution ──────────────────────────
 
     #[test]
-    fn test_transform_path_cross_package_uses_lib() {
-        // When a symbol references another package, it should use lib target.
-        let mapping = make_mapping(&[
-            ("my_bin", "my-package"),
-            ("other_crate", "other-package"),
-        ]);
+    fn test_transform_path_lib_target() {
+        // Lib crate name resolves to its lib target.
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
 
-        let result = transform_path(
-            "other_crate::SomeStruct",
-            &mapping,
-            "my-package", // current package
-            "bin/my_bin", // current target
-        );
-
-        assert_eq!(result, "[other-package/lib]::SomeStruct");
-    }
-
-    #[test]
-    fn test_transform_path_external_crate_unchanged() {
-        // External crates (not in mapping) should be returned unchanged.
-        let mapping = make_mapping(&[("my_crate", "my-package")]);
-
-        let result =
-            transform_path("serde::Serialize", &mapping, "my-package", "lib");
-
-        assert_eq!(result, "serde::Serialize");
-    }
-
-    #[test]
-    fn test_transform_path_no_colons_unchanged() {
-        // Paths without `::` (just crate name) should be returned unchanged.
-        let mapping = make_mapping(&[("my_crate", "my-package")]);
-
-        let result = transform_path("std", &mapping, "my-package", "lib");
-
-        assert_eq!(result, "std");
-    }
-
-    #[test]
-    fn test_transform_path_test_target() {
-        // Test target referencing its own symbols should use test target.
-        let mapping = make_mapping(&[("my_crate", "my-package")]);
-
-        let result = transform_path(
-            "my_crate::tests::helper",
-            &mapping,
-            "my-package",
-            "test",
-        );
-
-        assert_eq!(result, "[my-package/test]::tests::helper");
-    }
-
-    #[test]
-    fn test_transform_path_nested_module() {
-        // Nested module paths should be preserved.
-        let mapping = make_mapping(&[("my_crate", "my-package")]);
-
-        let result = transform_path(
-            "my_crate::foo::bar::Baz",
-            &mapping,
-            "my-package",
-            "lib",
-        );
+        let result = transform_path("my_crate::foo::bar::Baz", &mapping);
 
         assert_eq!(result, "[my-package/lib]::foo::bar::Baz");
     }
@@ -731,15 +687,98 @@ mod tests {
     #[test]
     fn test_transform_path_hyphenated_package_name() {
         // Package names with hyphens should be preserved in output.
-        let mapping = make_mapping(&[("my_crate", "my-hyphenated-package")]);
+        let mapping =
+            make_mapping(&[("my_crate", "my-hyphenated-package/lib")]);
 
-        let result = transform_path(
-            "my_crate::Item",
-            &mapping,
-            "my-hyphenated-package",
-            "lib",
-        );
+        let result = transform_path("my_crate::Item", &mapping);
 
         assert_eq!(result, "[my-hyphenated-package/lib]::Item");
+    }
+
+    // ── transform_path: bin/test target resolution ─────────────────────
+
+    #[test]
+    fn test_transform_path_bin_target() {
+        // Binary crate name resolves to its bin target via the mapping.
+        let mapping =
+            make_mapping(&[("ntp_admin", "omicron-ntp-admin/bin/ntp_admin")]);
+
+        let result = transform_path("ntp_admin::Args", &mapping);
+
+        assert_eq!(result, "[omicron-ntp-admin/bin/ntp_admin]::Args");
+    }
+
+    #[test]
+    fn test_transform_path_integration_test_target() {
+        // Integration test crate name resolves to its test target.
+        let mapping = make_mapping(&[(
+            "v0_fsm_proptest_rack_coordinator",
+            "bootstore/test/v0_fsm_proptest_rack_coordinator",
+        )]);
+
+        let result = transform_path(
+            "v0_fsm_proptest_rack_coordinator::common::foo",
+            &mapping,
+        );
+
+        assert_eq!(
+            result,
+            "[bootstore/test/v0_fsm_proptest_rack_coordinator]\
+             ::common::foo"
+        );
+    }
+
+    // ── transform_path: cross-package and same-package resolution ──────
+
+    #[test]
+    fn test_transform_path_cross_package_uses_lib() {
+        // Cross-package dependency resolves to the dep's lib target.
+        let mapping = make_mapping(&[
+            ("ntp_admin", "omicron-ntp-admin/bin/ntp_admin"),
+            ("other_crate", "other-package/lib"),
+        ]);
+
+        let result = transform_path("other_crate::SomeStruct", &mapping);
+
+        assert_eq!(result, "[other-package/lib]::SomeStruct");
+    }
+
+    #[test]
+    fn test_transform_path_same_package_lib_from_bin() {
+        // Binary references its own package's lib. The lib crate name
+        // maps to the lib target, NOT the current bin target. This is
+        // correct because `use omicron_ntp_admin::Foo` resolves to the
+        // lib even when called from bin/ntp_admin.
+        let mapping = make_mapping(&[
+            ("omicron_ntp_admin", "omicron-ntp-admin/lib"),
+            ("ntp_admin", "omicron-ntp-admin/bin/ntp_admin"),
+        ]);
+
+        let result =
+            transform_path("omicron_ntp_admin::server::Config", &mapping);
+
+        assert_eq!(result, "[omicron-ntp-admin/lib]::server::Config");
+    }
+
+    // ── transform_path: external crates and edge cases ─────────────────
+
+    #[test]
+    fn test_transform_path_external_crate_unchanged() {
+        // External crates (not in mapping) should be returned unchanged.
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
+
+        let result = transform_path("serde::Serialize", &mapping);
+
+        assert_eq!(result, "serde::Serialize");
+    }
+
+    #[test]
+    fn test_transform_path_no_colons_unchanged() {
+        // Paths without `::` (just crate name) should be returned unchanged.
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
+
+        let result = transform_path("std", &mapping);
+
+        assert_eq!(result, "std");
     }
 }
