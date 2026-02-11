@@ -72,7 +72,6 @@ pub struct Cli {
     /// If not specified, analyzes all workspace members.
     #[arg(short, long, value_name = "SPEC")]
     pub package: Vec<String>,
-
 }
 
 fn main() -> ExitCode {

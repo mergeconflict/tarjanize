@@ -11,10 +11,12 @@ use std::process::Command;
 
 fn main() {
     let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
-    let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
-    let project_root = PathBuf::from(&manifest_dir).join("../..").canonicalize().expect(
-        "could not resolve project root",
-    );
+    let manifest_dir =
+        env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set");
+    let project_root = PathBuf::from(&manifest_dir)
+        .join("../..")
+        .canonicalize()
+        .expect("could not resolve project root");
 
     let entry = PathBuf::from(&manifest_dir).join("templates/renderer.js");
     let output = PathBuf::from(&out_dir).join("bundle.js");

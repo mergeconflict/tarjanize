@@ -777,7 +777,10 @@ fn is_descendant_segment(segment: &str) -> bool {
     // Braced compiler-internal segments: {{closure}}, {{closure}}[N],
     // {{opaque}}, {{opaque}}[N], {{constructor}}, {{coroutine}}.
     // Exclude {{impl}} and {{impl}}[N] — those are symbol-level entities.
-    if segment.starts_with("{{") && !segment.starts_with("{{impl}}") && !segment.starts_with("{{use}}") {
+    if segment.starts_with("{{")
+        && !segment.starts_with("{{impl}}")
+        && !segment.starts_with("{{use}}")
+    {
         return true;
     }
 
@@ -1040,14 +1043,8 @@ mod tests {
         // ExternCrate items like `extern crate std` are now extracted as
         // symbols. Two-segment paths like `my_crate::std` should no longer
         // be discarded.
-        assert_eq!(
-            normalize_frontend_path("my_crate::std"),
-            "my_crate::std"
-        );
-        assert_eq!(
-            normalize_frontend_path("my_crate::core"),
-            "my_crate::core"
-        );
+        assert_eq!(normalize_frontend_path("my_crate::std"), "my_crate::std");
+        assert_eq!(normalize_frontend_path("my_crate::core"), "my_crate::core");
         assert_eq!(
             normalize_frontend_path("my_crate::alloc"),
             "my_crate::alloc"

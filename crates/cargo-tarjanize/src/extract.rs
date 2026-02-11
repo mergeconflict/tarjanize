@@ -461,10 +461,8 @@ impl<'tcx> Extractor<'tcx> {
             // entry per namespace (type, value, macro). Check all three
             // for resolved DefIds.
             for res in path.res.iter() {
-                if let Some(rustc_hir::def::Res::Def(
-                    _kind,
-                    target_def_id,
-                )) = res
+                if let Some(rustc_hir::def::Res::Def(_kind, target_def_id)) =
+                    res
                 {
                     self.maybe_add_dep(*target_def_id, &mut deps);
                 }

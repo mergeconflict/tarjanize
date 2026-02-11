@@ -292,8 +292,7 @@ fn pack_swim_lanes(
     for &idx in &order {
         // Ideal lane: lane of the dependency that gates our start time.
         // Root targets (no deps) prefer lane 0.
-        let ideal =
-            forward_pred[idx].map_or(0, |pred| lanes[pred]);
+        let ideal = forward_pred[idx].map_or(0, |pred| lanes[pred]);
 
         // Lanes used by direct dependencies. We prefer to avoid these
         // so each target is visually distinct, but we won't allocate
@@ -321,9 +320,7 @@ fn pack_swim_lanes(
                     _ => {
                         dist < best_dist
                             || (dist == best_dist
-                                && lane
-                                    < best_lane
-                                        .unwrap_or(usize::MAX))
+                                && lane < best_lane.unwrap_or(usize::MAX))
                     }
                 };
                 if dominated {

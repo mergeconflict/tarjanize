@@ -56,7 +56,6 @@ pub const ENV_WORKSPACE_CRATES: &str = "TARJANIZE_WORKSPACE_CRATES";
 /// When set, the driver adds `-Zself-profile` flags to rustc invocations.
 pub const ENV_PROFILE_DIR: &str = "TARJANIZE_PROFILE_DIR";
 
-
 /// Environment variable containing workspace member paths.
 /// Format: `pkg1=/path/to/pkg1,pkg2=/path/to/pkg2`
 ///
@@ -723,12 +722,11 @@ fn transform_symbol_paths(
         // Build snapshot: Vec<(target_key, cloned_root_module)> for
         // this package. Cloning the Module trees is cheap relative to
         // the O(deps * targets * path_depth) lookup cost.
-        let target_snapshot: Vec<(String, tarjanize_schemas::Module)> =
-            package
-                .targets
-                .iter()
-                .map(|(key, target)| (key.clone(), target.root.clone()))
-                .collect();
+        let target_snapshot: Vec<(String, tarjanize_schemas::Module)> = package
+            .targets
+            .iter()
+            .map(|(key, target)| (key.clone(), target.root.clone()))
+            .collect();
 
         // Build the borrowed slice that find_symbol_target expects.
         let target_refs: Vec<(&str, &tarjanize_schemas::Module)> =
@@ -847,11 +845,8 @@ fn transform_path(
 
     if mapped_package == current_package {
         // Same-package reference: search all targets for the symbol.
-        if let Some(found_target) =
-            find_symbol_target(target_refs, rest)
-        {
-            let target_id =
-                format!("{current_package}/{found_target}");
+        if let Some(found_target) = find_symbol_target(target_refs, rest) {
+            let target_id = format!("{current_package}/{found_target}");
             return format!("[{target_id}]::{rest}");
         }
     }
@@ -884,13 +879,7 @@ mod tests {
         crate_mapping: &HashMap<String, String>,
     ) -> String {
         let empty_tp: HashMap<&str, &str> = HashMap::new();
-        transform_path(
-            path,
-            crate_mapping,
-            &empty_tp,
-            "",
-            &[],
-        )
+        transform_path(path, crate_mapping, &empty_tp, "", &[])
     }
 
     // ── transform_path: lib target resolution ──────────────────────────
@@ -898,13 +887,9 @@ mod tests {
     #[test]
     fn test_transform_path_lib_target() {
         // Lib crate name resolves to its lib target.
-        let mapping =
-            make_mapping(&[("my_crate", "my-package/lib")]);
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
 
-        let result = transform_path_simple(
-            "my_crate::foo::bar::Baz",
-            &mapping,
-        );
+        let result = transform_path_simple("my_crate::foo::bar::Baz", &mapping);
 
         assert_eq!(result, "[my-package/lib]::foo::bar::Baz");
     }
@@ -912,13 +897,10 @@ mod tests {
     #[test]
     fn test_transform_path_hyphenated_package_name() {
         // Package names with hyphens should be preserved in output.
-        let mapping = make_mapping(&[(
-            "my_crate",
-            "my-hyphenated-package/lib",
-        )]);
+        let mapping =
+            make_mapping(&[("my_crate", "my-hyphenated-package/lib")]);
 
-        let result =
-            transform_path_simple("my_crate::Item", &mapping);
+        let result = transform_path_simple("my_crate::Item", &mapping);
 
         assert_eq!(result, "[my-hyphenated-package/lib]::Item");
     }
@@ -928,18 +910,12 @@ mod tests {
     #[test]
     fn test_transform_path_bin_target() {
         // Binary crate name resolves to its bin target via the mapping.
-        let mapping = make_mapping(&[(
-            "ntp_admin",
-            "omicron-ntp-admin/bin/ntp_admin",
-        )]);
+        let mapping =
+            make_mapping(&[("ntp_admin", "omicron-ntp-admin/bin/ntp_admin")]);
 
-        let result =
-            transform_path_simple("ntp_admin::Args", &mapping);
+        let result = transform_path_simple("ntp_admin::Args", &mapping);
 
-        assert_eq!(
-            result,
-            "[omicron-ntp-admin/bin/ntp_admin]::Args"
-        );
+        assert_eq!(result, "[omicron-ntp-admin/bin/ntp_admin]::Args");
     }
 
     #[test]
@@ -972,10 +948,7 @@ mod tests {
             ("other_crate", "other-package/lib"),
         ]);
 
-        let result = transform_path_simple(
-            "other_crate::SomeStruct",
-            &mapping,
-        );
+        let result = transform_path_simple("other_crate::SomeStruct", &mapping);
 
         assert_eq!(result, "[other-package/lib]::SomeStruct");
     }
@@ -996,10 +969,7 @@ mod tests {
             &mapping,
         );
 
-        assert_eq!(
-            result,
-            "[omicron-ntp-admin/lib]::server::Config"
-        );
+        assert_eq!(result, "[omicron-ntp-admin/lib]::server::Config");
     }
 
     // ── transform_path: external crates and edge cases ─────────────────
@@ -1007,11 +977,9 @@ mod tests {
     #[test]
     fn test_transform_path_external_crate_unchanged() {
         // External crates (not in mapping) are returned unchanged.
-        let mapping =
-            make_mapping(&[("my_crate", "my-package/lib")]);
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
 
-        let result =
-            transform_path_simple("serde::Serialize", &mapping);
+        let result = transform_path_simple("serde::Serialize", &mapping);
 
         assert_eq!(result, "serde::Serialize");
     }
@@ -1019,8 +987,7 @@ mod tests {
     #[test]
     fn test_transform_path_no_colons_unchanged() {
         // Paths without `::` (just crate name) are returned unchanged.
-        let mapping =
-            make_mapping(&[("my_crate", "my-package/lib")]);
+        let mapping = make_mapping(&[("my_crate", "my-package/lib")]);
 
         let result = transform_path_simple("std", &mapping);
 
@@ -1082,13 +1049,8 @@ mod tests {
         // referencing `my_pkg::test_mod::TestType` should resolve to
         // `[my-pkg/test]::test_mod::TestType`, not `[my-pkg/lib]`.
         let lib_root = make_module(&["LibType"], &[]);
-        let test_root = make_module(
-            &[],
-            &[(
-                "test_mod",
-                make_module(&["TestType"], &[]),
-            )],
-        );
+        let test_root =
+            make_module(&[], &[("test_mod", make_module(&["TestType"], &[]))]);
 
         // The referencing symbol lives in the test target and has a
         // same-crate dep path.
@@ -1145,13 +1107,8 @@ mod tests {
         // defaults to lib, so this forces impl-child truncation + lookup
         // to find the correct target.
         let lib_root = make_module(&["LibType"], &[]);
-        let test_root = make_module(
-            &[],
-            &[(
-                "Foo",
-                make_module(&["{{impl}}[0]"], &[]),
-            )],
-        );
+        let test_root =
+            make_module(&[], &[("Foo", make_module(&["{{impl}}[0]"], &[]))]);
 
         let mut test_root_with_dep = test_root.clone();
         test_root_with_dep.symbols.insert(
@@ -1205,16 +1162,13 @@ mod tests {
         // *test* only. Crate mapping defaults to lib, so module-tree
         // lookup is needed to find the correct target.
         let lib_root = make_module(&["LibType"], &[]);
-        let test_root = make_module(
-            &[],
-            &[("some_mod", make_module(&["Item"], &[]))],
-        );
+        let test_root =
+            make_module(&[], &[("some_mod", make_module(&["Item"], &[]))]);
 
         let mut test_root_with_dep = test_root.clone();
-        test_root_with_dep.symbols.insert(
-            "test_fn".to_string(),
-            make_symbol(&["my_pkg::some_mod"]),
-        );
+        test_root_with_dep
+            .symbols
+            .insert("test_fn".to_string(), make_symbol(&["my_pkg::some_mod"]));
 
         let mut packages = HashMap::from([(
             "my-pkg".to_string(),
@@ -1247,9 +1201,7 @@ mod tests {
             .get("test_fn")
             .unwrap();
         assert!(
-            test_fn
-                .dependencies
-                .contains("[my-pkg/test]::some_mod"),
+            test_fn.dependencies.contains("[my-pkg/test]::some_mod"),
             "expected [my-pkg/test]::some_mod, got: {:?}",
             test_fn.dependencies,
         );
@@ -1262,10 +1214,9 @@ mod tests {
         let lib_root = make_module(&["MyType"], &[]);
 
         let mut other_root = make_module(&[], &[]);
-        other_root.symbols.insert(
-            "caller".to_string(),
-            make_symbol(&["my_pkg::MyType"]),
-        );
+        other_root
+            .symbols
+            .insert("caller".to_string(), make_symbol(&["my_pkg::MyType"]));
 
         let mut packages = HashMap::from([
             (
@@ -1319,10 +1270,9 @@ mod tests {
         let bin_root = make_module(&["Args"], &[]);
 
         let mut bin_root_with_dep = bin_root.clone();
-        bin_root_with_dep.symbols.insert(
-            "main_fn".to_string(),
-            make_symbol(&["my_tool::Args"]),
-        );
+        bin_root_with_dep
+            .symbols
+            .insert("main_fn".to_string(), make_symbol(&["my_tool::Args"]));
 
         let mut packages = HashMap::from([(
             "my-pkg".to_string(),
@@ -1338,8 +1288,7 @@ mod tests {
         )]);
 
         // Crate mapping maps to bin (no lib exists).
-        let mapping =
-            make_mapping(&[("my_tool", "my-pkg/bin/my_tool")]);
+        let mapping = make_mapping(&[("my_tool", "my-pkg/bin/my_tool")]);
         transform_symbol_paths(&mut packages, &mapping);
 
         let main_fn = packages["my-pkg"].targets["bin/my_tool"]
@@ -1348,9 +1297,7 @@ mod tests {
             .get("main_fn")
             .unwrap();
         assert!(
-            main_fn
-                .dependencies
-                .contains("[my-pkg/bin/my_tool]::Args"),
+            main_fn.dependencies.contains("[my-pkg/bin/my_tool]::Args"),
             "expected [my-pkg/bin/my_tool]::Args, got: {:?}",
             main_fn.dependencies,
         );
@@ -1414,21 +1361,13 @@ mod tests {
         // the target where `TestTrait` exists, not the crate mapping
         // default.
         let lib_root = make_module(&["LibType"], &[]);
-        let test_root = make_module(
-            &[],
-            &[(
-                "test_mod",
-                make_module(&["TestTrait"], &[]),
-            )],
-        );
+        let test_root =
+            make_module(&[], &[("test_mod", make_module(&["TestTrait"], &[]))]);
 
         let mut test_root_with_impl = test_root.clone();
         test_root_with_impl.symbols.insert(
             "{{impl}}[0]".to_string(),
-            make_impl_symbol(
-                &[],
-                &["my_pkg::test_mod::TestTrait"],
-            ),
+            make_impl_symbol(&[], &["my_pkg::test_mod::TestTrait"]),
         );
 
         let mut packages = HashMap::from([(
@@ -1463,9 +1402,7 @@ mod tests {
             .unwrap();
         if let SymbolKind::Impl { anchors, .. } = &impl_sym.kind {
             assert!(
-                anchors.contains(
-                    "[my-pkg/test]::test_mod::TestTrait"
-                ),
+                anchors.contains("[my-pkg/test]::test_mod::TestTrait"),
                 "expected [my-pkg/test]::test_mod::TestTrait \
                  in anchors, got: {anchors:?}",
             );

@@ -2123,7 +2123,10 @@ fn test_use_reexport() {
     let graph = extract_fixture("use_reexport");
 
     // The re-exported struct and function should appear as Use symbols.
-    assert!(symbol_exists(&graph, "{{use}}"), "pub use should be extracted");
+    assert!(
+        symbol_exists(&graph, "{{use}}"),
+        "pub use should be extracted"
+    );
     assert_eq!(
         get_symbol_kind(&graph, "{{use}}"),
         Some("Use".to_string()),

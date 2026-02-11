@@ -28,8 +28,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::extract;
 use crate::orchestrator::{
-    ENV_OUTPUT_DIR, ENV_PROFILE_DIR, ENV_WORKSPACE_CRATES,
-    ENV_WORKSPACE_PATHS,
+    ENV_OUTPUT_DIR, ENV_PROFILE_DIR, ENV_WORKSPACE_CRATES, ENV_WORKSPACE_PATHS,
 };
 use crate::profile::ProfileData;
 
@@ -136,11 +135,8 @@ pub fn run(args: &[String]) -> ExitCode {
 
     // Determine target kind from rustc args.
     let is_test = args.iter().any(|a| a == "--test");
-    let target_key = determine_target_key(
-        args,
-        &crate_name,
-        is_integration_test,
-    );
+    let target_key =
+        determine_target_key(args, &crate_name, is_integration_test);
 
     // Only record profiles from metadata-only invocations to avoid duplicate
     // profile files for targets that build multiple times under cargo check.
@@ -190,8 +186,7 @@ pub fn run(args: &[String]) -> ExitCode {
         target_key.replace('/', "_")
     ));
 
-    if profile_dir_has_profile(&target_profile_dir)
-    {
+    if profile_dir_has_profile(&target_profile_dir) {
         info!(
             crate_name,
             package_name,
@@ -249,7 +244,8 @@ pub fn run(args: &[String]) -> ExitCode {
     // Use underscore-separated key for filesystem safety (bin/foo → bin_foo).
     fs::create_dir_all(&target_profile_dir)
         .expect("failed to create profile subdirectory");
-    compiler_args.push(format!("-Zself-profile={}", target_profile_dir.display()));
+    compiler_args
+        .push(format!("-Zself-profile={}", target_profile_dir.display()));
     compiler_args.push("-Zself-profile-events=default,args".to_string());
 
     let exit_code = run_rustc_with_span(
@@ -711,7 +707,6 @@ fn count_symbols(module: &Module) -> usize {
     let nested: usize = module.submodules.values().map(count_symbols).sum();
     direct + nested
 }
-
 
 /// Process profile data, apply per-event timing breakdowns to the module, and
 /// write the final Crate.
