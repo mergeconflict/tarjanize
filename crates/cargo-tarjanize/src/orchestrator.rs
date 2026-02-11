@@ -56,10 +56,6 @@ pub const ENV_WORKSPACE_CRATES: &str = "TARJANIZE_WORKSPACE_CRATES";
 /// When set, the driver adds `-Zself-profile` flags to rustc invocations.
 pub const ENV_PROFILE_DIR: &str = "TARJANIZE_PROFILE_DIR";
 
-/// Environment variable that tells the driver to skip profiling.
-/// When set to "1", the driver does not add `-Zself-profile` flags
-/// and does not apply costs. Used with --no-profile flag.
-pub const ENV_SKIP_PROFILE: &str = "TARJANIZE_SKIP_PROFILE";
 
 /// Environment variable containing workspace member paths.
 /// Format: `pkg1=/path/to/pkg1,pkg2=/path/to/pkg2`
@@ -176,12 +172,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
 
     // Single cargo check pass: driver does profiling, extraction, cost
     // application, and cleanup for each crate as it compiles.
-    run_build(
-        &config,
-        output_dir.path(),
-        profile_dir.path(),
-        cli.no_profile,
-    )?;
+    run_build(&config, output_dir.path(), profile_dir.path())?;
 
     // Aggregate results from all JSON files.
     // Costs are already applied by the driver.
@@ -203,7 +194,7 @@ fn run_inner(cli: &Cli) -> Result<()> {
 ///
 /// Uses `RUSTC_WRAPPER` to run our custom driver. For workspace crates, the
 /// driver:
-/// 1. Adds `-Zself-profile` flags (unless `no_profile` is true)
+/// 1. Adds `-Zself-profile` flags
 /// 2. Extracts symbols via `after_analysis` callback
 /// 3. Applies costs from profile data
 /// 4. Deletes profile files immediately to avoid filling /tmp
@@ -213,7 +204,6 @@ fn run_build(
     config: &BuildConfig<'_>,
     output_dir: &Path,
     profile_dir: &Path,
-    no_profile: bool,
 ) -> Result<()> {
     info!("running build");
 
@@ -244,12 +234,7 @@ fn run_build(
         .env("CARGO_TARGET_DIR", config.target_dir)
         .current_dir(config.manifest_dir);
 
-    // Skip profiling if requested.
-    if no_profile {
-        cmd.env(ENV_SKIP_PROFILE, "1");
-    }
-
-    debug!(manifest = %config.manifest_path.display(), no_profile, "running cargo check");
+    debug!(manifest = %config.manifest_path.display(), "running cargo check");
     let status = cmd.status().context("failed to run cargo check")?;
 
     if !status.success() {

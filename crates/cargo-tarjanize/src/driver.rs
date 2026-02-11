@@ -28,7 +28,7 @@ use tracing::{debug, info, trace, warn};
 
 use crate::extract;
 use crate::orchestrator::{
-    ENV_OUTPUT_DIR, ENV_PROFILE_DIR, ENV_SKIP_PROFILE, ENV_WORKSPACE_CRATES,
+    ENV_OUTPUT_DIR, ENV_PROFILE_DIR, ENV_WORKSPACE_CRATES,
     ENV_WORKSPACE_PATHS,
 };
 use crate::profile::ProfileData;
@@ -184,25 +184,20 @@ pub fn run(args: &[String]) -> ExitCode {
         );
     }
 
-    let target_profile_dir = if config.skip_profile {
-        None
-    } else {
-        Some(config.profile_dir.join(format!(
-            "{}_{}",
-            package_name,
-            target_key.replace('/', "_")
-        )))
-    };
+    let target_profile_dir = config.profile_dir.join(format!(
+        "{}_{}",
+        package_name,
+        target_key.replace('/', "_")
+    ));
 
-    if let Some(dir) = &target_profile_dir
-        && profile_dir_has_profile(dir)
+    if profile_dir_has_profile(&target_profile_dir)
     {
         info!(
             crate_name,
             package_name,
             target_key,
             emit = %emit_str,
-            dir = %dir.display(),
+            dir = %target_profile_dir.display(),
             "skipping duplicate metadata invocation"
         );
         return run_rustc_with_span(
@@ -245,27 +240,17 @@ pub fn run(args: &[String]) -> ExitCode {
     let mut compiler_args: Vec<String> = args.to_vec();
     compiler_args.push("-Zno-steal-thir".to_string());
 
-    // Only add self-profiling flags when profiling is enabled.
-    // In two-pass mode or --no-profile mode (skip_profile=true), profiling is
-    // either done in Pass 1 without RUSTC_WRAPPER, or skipped entirely.
-    let target_profile_dir = if callbacks.config.skip_profile {
-        None
-    } else {
-        // Add self-profiling flags to collect compilation timing data.
-        // We need `default` for core events, `llvm` for backend costs per CGU,
-        // and `args` for DefPath associations.
-        //
-        // Each target (lib, test, bin) gets its own profile subdirectory so they can
-        // clean up independently without interfering with concurrent targets.
-        // Use underscore-separated key for filesystem safety (bin/foo → bin_foo).
-        let dir = target_profile_dir
-            .as_ref()
-            .expect("profile dir required for metadata-only invocation");
-        fs::create_dir_all(dir).expect("failed to create profile subdirectory");
-        compiler_args.push(format!("-Zself-profile={}", dir.display()));
-        compiler_args.push("-Zself-profile-events=default,args".to_string());
-        Some(dir.clone())
-    };
+    // Add self-profiling flags to collect compilation timing data.
+    // We need `default` for core events, `llvm` for backend costs per CGU,
+    // and `args` for DefPath associations.
+    //
+    // Each target (lib, test, bin) gets its own profile subdirectory so they can
+    // clean up independently without interfering with concurrent targets.
+    // Use underscore-separated key for filesystem safety (bin/foo → bin_foo).
+    fs::create_dir_all(&target_profile_dir)
+        .expect("failed to create profile subdirectory");
+    compiler_args.push(format!("-Zself-profile={}", target_profile_dir.display()));
+    compiler_args.push("-Zself-profile-events=default,args".to_string());
 
     let exit_code = run_rustc_with_span(
         &compiler_args,
@@ -278,32 +263,17 @@ pub fn run(args: &[String]) -> ExitCode {
         Some(is_integration_test),
     );
 
-    // After rustc completes (including codegen), write the results.
-    // In single-pass mode: apply costs from profile data, then delete profile files.
-    // In two-pass mode: just write the raw module (orchestrator applies costs later).
+    // After rustc completes (including codegen), apply costs from profile
+    // data, write the results, then delete profile files.
     if let Some(module) = callbacks.extracted_module.lock().unwrap().take() {
-        if callbacks.config.skip_profile {
-            // Two-pass mode: write module without costs.
-            // Orchestrator will apply costs from Pass 1's profile data.
-            write_crate_without_costs(
-                &callbacks.config,
-                &callbacks.package_name,
-                module,
-                &callbacks.target_key,
-            );
-        } else {
-            // Single-pass mode: apply costs and delete profile files.
-            process_and_write_crate(
-                &callbacks.config,
-                &callbacks.crate_name,
-                &callbacks.package_name,
-                module,
-                &callbacks.target_key,
-                target_profile_dir
-                    .as_ref()
-                    .expect("profile dir required in single-pass mode"),
-            );
-        }
+        process_and_write_crate(
+            &callbacks.config,
+            &callbacks.crate_name,
+            &callbacks.package_name,
+            module,
+            &callbacks.target_key,
+            &target_profile_dir,
+        );
     }
 
     exit_code
@@ -472,13 +442,7 @@ struct DriverConfig {
     /// Used to identify which package integration tests belong to.
     workspace_paths: HashMap<String, PathBuf>,
     /// Directory for self-profile output.
-    /// Only used when `skip_profile` is false.
     profile_dir: PathBuf,
-    /// Whether to skip profiling (--no-profile mode).
-    /// When true, the driver does not add `-Zself-profile` flags
-    /// and does not apply costs. Useful for faster iteration when
-    /// profiling data is not needed.
-    skip_profile: bool,
 }
 
 impl DriverConfig {
@@ -501,18 +465,13 @@ impl DriverConfig {
                 })
                 .collect();
 
-        // Profile dir is optional when skip_profile is true.
-        let profile_dir: PathBuf = env::var(ENV_PROFILE_DIR)
-            .map(PathBuf::from)
-            .unwrap_or_default();
-        let skip_profile = env::var(ENV_SKIP_PROFILE).is_ok_and(|v| v == "1");
+        let profile_dir: PathBuf = env::var(ENV_PROFILE_DIR).ok()?.into();
 
         trace!(
             output_dir = %output_dir.display(),
             workspace_crates = ?workspace_crates,
             workspace_paths_count = workspace_paths.len(),
             profile_dir = %profile_dir.display(),
-            skip_profile,
             "loaded driver config from env"
         );
 
@@ -521,7 +480,6 @@ impl DriverConfig {
             workspace_crates,
             workspace_paths,
             profile_dir,
-            skip_profile,
         })
     }
 }
@@ -754,46 +712,6 @@ fn count_symbols(module: &Module) -> usize {
     direct + nested
 }
 
-/// Write extracted module without applying costs (two-pass mode).
-///
-/// In two-pass mode, the orchestrator applies costs after both passes complete.
-/// This function just writes the raw extraction results.
-///
-/// The `package_name` is the cargo package this target belongs to (e.g., "tokio").
-/// For integration tests, this differs from the rustc crate name (e.g., `sync_mpsc`).
-fn write_crate_without_costs(
-    config: &DriverConfig,
-    package_name: &str,
-    module: Module,
-    target_key: &str,
-) {
-    // Build the Crate without costs.
-    let crate_data = Crate {
-        root: module,
-        ..Default::default()
-    };
-
-    // Write to JSON file.
-    // Filename uses package_name so all targets for a package are grouped together.
-    let safe_target_key = target_key.replace('/', "_");
-    let filename = format!("{package_name}_{safe_target_key}.json");
-    let output_path = config.output_dir.join(filename);
-
-    let result = CrateResult {
-        crate_name: package_name.to_string(),
-        crate_data,
-    };
-
-    let json =
-        serde_json::to_string_pretty(&result).expect("failed to serialize");
-    fs::write(&output_path, &json).expect("failed to write output file");
-
-    debug!(
-        path = %output_path.display(),
-        bytes = json.len(),
-        "wrote crate (costs deferred to orchestrator)"
-    );
-}
 
 /// Process profile data, apply per-event timing breakdowns to the module, and
 /// write the final Crate.
