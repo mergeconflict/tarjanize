@@ -139,7 +139,6 @@ pub fn run(args: &[String]) -> ExitCode {
     let target_key = determine_target_key(
         args,
         &crate_name,
-        &package_name,
         is_integration_test,
     );
 
@@ -600,12 +599,11 @@ fn find_package_for_source(
 /// - "example/{name}" for examples
 /// - "bench/{name}" for benchmarks
 ///
-/// The `is_integration_test` flag indicates the `crate_name` doesn't match the
-/// package name, meaning this is an integration test, example, or bench.
+/// The `is_integration_test` flag indicates this is an integration test,
+/// example, or bench (detected by the caller from crate/package name mismatch).
 fn determine_target_key(
     args: &[String],
     crate_name: &str,
-    package_name: &str,
     is_integration_test: bool,
 ) -> String {
     let is_test = args.iter().any(|a| a == "--test");
@@ -657,13 +655,7 @@ fn determine_target_key(
         // This is the lib compiled with --test for unit tests
         "test".to_string()
     } else if is_bin {
-        // Check if this is the "main" binary (same name as package) or a named binary
-        let pkg_crate_name = package_name.replace('-', "_");
-        if crate_name == pkg_crate_name {
-            "bin".to_string()
-        } else {
-            format!("bin/{crate_name}")
-        }
+        format!("bin/{crate_name}")
     } else {
         "lib".to_string()
     }
@@ -1088,6 +1080,49 @@ fn collect_module_paths(
             format!("{path_prefix}::{submod_name}").replace('-', "_");
         module_paths.insert(submod_path.clone());
         collect_module_paths(submodule, &submod_path, module_paths);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The primary binary (crate name matches package name after hyphen→underscore
+    /// normalization) must include the crate name in the target key, producing
+    /// `"bin/{crate_name}"` instead of bare `"bin"`. Without this, impl block
+    /// paths like `[pkg/bin]::{{impl}}[N]` won't match anchor paths like
+    /// `[pkg/bin/name]::Struct`, causing condense to strand impls as roots.
+    #[test]
+    fn primary_binary_target_key_includes_name() {
+        let args = vec!["--crate-type=bin".to_string()];
+        let result = determine_target_key(&args, "omicron_dev", false);
+        assert_eq!(result, "bin/omicron_dev");
+    }
+
+    /// Secondary binaries (crate name differs from package name) should also
+    /// produce `"bin/{crate_name}"` — this was already working but we test it
+    /// to guard against regressions.
+    #[test]
+    fn secondary_binary_target_key_includes_name() {
+        let args = vec!["--crate-type=bin".to_string()];
+        let result = determine_target_key(&args, "other_bin", false);
+        assert_eq!(result, "bin/other_bin");
+    }
+
+    /// Lib targets should still produce `"lib"`.
+    #[test]
+    fn lib_target_key() {
+        let args = vec!["--crate-type=lib".to_string()];
+        let result = determine_target_key(&args, "omicron_dev", false);
+        assert_eq!(result, "lib");
+    }
+
+    /// Unit test targets (lib with --test) should still produce `"test"`.
+    #[test]
+    fn unit_test_target_key() {
+        let args = vec!["--crate-type=lib".to_string(), "--test".to_string()];
+        let result = determine_target_key(&args, "omicron_dev", false);
+        assert_eq!(result, "test");
     }
 }
 

@@ -24,17 +24,17 @@ This project uses [jj (Jujutsu)](https://github.com/martinvonz/jj) for version c
 
 **tarjanize** analyzes Rust workspace dependency structures to identify opportunities for splitting crates into smaller, parallelizable units for improved build times. Named after Robert Tarjan (SCC algorithms).
 
-## Architecture
-
-The tool implements a multi-phase pipeline:
+## Pipeline
 
 ```
-Phase 1: Extract Symbol Graph          → symbol_graph.json  (cargo tarjanize)
-Phase 2: SCC + Partition + Reorganize  → optimized_symbol_graph.json  (tarjanize condense)
-Cost:    Critical Path Analysis        → report  (tarjanize cost)
+cargo tarjanize        → symbol_graph.json             Extract symbol graph from workspace
+tarjanize cost         → report + cost_model.json       Fit cost model, critical path analysis
+tarjanize viz          → interactive HTML               Visualize the original build schedule
+tarjanize condense     → optimized_symbol_graph.json    SCC + partition + reorganize
+tarjanize viz          → interactive HTML               Visualize the condensed build schedule
 ```
 
-Phase 1 extracts the symbol graph. Phase 2 computes SCCs, merges them via union-find into optimal crate groupings (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`. The cost command computes build metrics including critical path analysis.
+`cargo tarjanize` extracts symbols and dependencies from a Rust workspace via a custom rustc driver. `tarjanize cost` fits a MAGSAC++ regression model to profile data and reports the critical path. `tarjanize viz` generates an interactive PixiJS Gantt chart of the build schedule. `tarjanize condense` computes SCCs, merges them via union-find (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`.
 
 See PLAN.md for the full specification and future phases.
 
@@ -54,70 +54,93 @@ This is a pure virtual workspace - all crates live under `crates/`. Dependencies
 
 ```
 tarjanize/
-├── Cargo.toml               # Virtual workspace manifest (dependencies, lints)
+├── Cargo.toml                 # Virtual workspace manifest (dependencies, lints)
 └── crates/
-    ├── tarjanize/           # CLI binary (condense, cost subcommands)
+    ├── cargo-tarjanize/       # Phase 1: Symbol graph extraction via rustc
+    │   ├── src/
+    │   │   ├── main.rs        # CLI entry point (orchestrator/driver modes)
+    │   │   ├── orchestrator.rs  # Coordinates cargo check with RUSTC_WRAPPER
+    │   │   ├── driver.rs      # Custom rustc driver for symbol extraction
+    │   │   ├── extract.rs     # HIR/THIR analysis for dependency extraction
+    │   │   └── profile.rs     # Self-profile parsing for cost estimation
+    │   └── tests/fixtures/    # Integration test fixtures (~207 directories)
+    │
+    ├── tarjanize/             # CLI binary (condense, cost, viz subcommands)
     │   └── src/main.rs
     │
-    ├── tarjanize-schemas/   # Schema definitions (SymbolGraph types)
+    ├── tarjanize-schemas/     # Schema definitions (SymbolGraph, CostModel types)
     │   └── src/
     │       ├── lib.rs
     │       ├── symbol_graph.rs
-    │       └── testutil.rs  # proptest strategies
+    │       ├── cost_model.rs
+    │       └── testutil.rs    # proptest strategies
     │
-    ├── cargo-tarjanize/     # Phase 1: Symbol graph extraction via rustc
-    │   ├── src/
-    │   │   ├── main.rs      # CLI entry point (orchestrator/driver modes)
-    │   │   ├── orchestrator.rs  # Coordinates cargo check with RUSTC_WRAPPER
-    │   │   ├── driver.rs    # Custom rustc driver for symbol extraction
-    │   │   ├── extract.rs   # HIR/THIR analysis for dependency extraction
-    │   │   └── profile.rs   # Self-profile parsing for cost estimation
-    │   └── tests/fixtures/  # Integration test fixtures
-    │
-    ├── tarjanize-condense/  # Phase 2: SCC + partition + reorganize
+    ├── tarjanize-condense/    # SCC + partition + reorganize
     │   └── src/
-    │       ├── lib.rs       # Public API: run()
-    │       ├── error.rs     # CondenseError
-    │       └── scc.rs       # SCC, union-find merging, anchor constraint fixing
+    │       ├── lib.rs         # Public API: run()
+    │       ├── error.rs       # CondenseError
+    │       └── scc.rs         # SCC, union-find merging, anchor constraint fixing
     │
-    └── tarjanize-cost/      # Cost analysis: critical path scheduling
+    ├── tarjanize-cost/        # Cost model fitting and critical path analysis
+    │   └── src/
+    │       └── lib.rs         # fit(), build_cost_model(), extract_predictors()
+    │
+    ├── tarjanize-magsac/      # MAGSAC++ robust N-variable linear regression
+    │   └── src/
+    │       └── lib.rs         # fit_magsac(), fit_magsac_with_params()
+    │
+    └── tarjanize-viz/         # Interactive HTML build schedule visualization
         └── src/
-            └── lib.rs       # critical_path(), run(), CriticalPathResult
+            ├── lib.rs         # Public API: run()
+            ├── data.rs        # ScheduleData, TargetData structures
+            ├── error.rs       # VizError
+            ├── html.rs        # Askama HTML template generation
+            └── schedule.rs    # Forward/backward DP, swim lane packing
 ```
 
 ## Crate Details
 
-**tarjanize** (binary)
-- **main.rs** - CLI with `condense` and `cost` subcommands, common I/O args pattern
-
-**tarjanize-schemas** (library)
-- **symbol_graph.rs** - `SymbolGraph`, `Package`, `Crate`, `Module`, `Symbol`, `SymbolKind`, `Visibility` types
-- **testutil.rs** - Shared proptest strategies for generating arbitrary schema instances
-
 **cargo-tarjanize** (binary)
 - **main.rs** - Detects mode (orchestrator vs driver) and dispatches
-- **orchestrator.rs** - Runs `cargo check` with `RUSTC_WRAPPER` set to this binary
-- **driver.rs** - Custom rustc driver that runs extraction callbacks
+- **orchestrator.rs** - Runs `cargo check` with `RUSTC_WRAPPER` set to this binary. Two-pass strategy: clean profile pass with `-Zself-profile`, then extraction pass
+- **driver.rs** - Custom rustc driver that runs extraction callbacks in `after_analysis`
 - **extract.rs** - Walks rustc's HIR and THIR to extract symbols and dependencies
 - **profile.rs** - Parses `-Zself-profile` output for accurate compilation costs
 
+**tarjanize** (binary)
+- **main.rs** - CLI with `condense`, `cost`, and `viz` subcommands. Common `IoArgs` pattern for input/output
+
+**tarjanize-schemas** (library)
+- **symbol_graph.rs** - `SymbolGraph`, `Package`, `Target` (alias `Crate`), `Module`, `Symbol`, `SymbolKind`, `Visibility`
+- **cost_model.rs** - `CostModel` (serializable 3-variable regression model), `load_cost_model()`
+- **testutil.rs** - Shared proptest strategies for generating arbitrary schema instances
+
 **tarjanize-condense** (library)
-- **lib.rs** - Public API: `run()` reads SymbolGraph JSON, outputs optimized SymbolGraph JSON
+- **lib.rs** - `run()` reads SymbolGraph JSON, outputs optimized SymbolGraph JSON
 - **error.rs** - `CondenseError` for deserialization, serialization, and I/O failures
-- **scc.rs** - SCC computation via petgraph condensation, union-find merging, and anchor constraint fixing (orphan rule)
+- **scc.rs** - SCC computation via petgraph condensation, union-find merging, and hitting set algorithm for anchor constraints (orphan rule)
 
 **tarjanize-cost** (library)
-- **lib.rs** - Critical path analysis. Models frontend compilation costs (serial). Target-level analysis avoids dev-dependency cycles.
+- **lib.rs** - `fit()` uses MAGSAC++ to fit a 3-variable no-intercept regression model (`wall_time = c_attr * attr + c_meta * meta + c_other * other`). Also: `build_cost_model()`, `extract_predictors()`, critical path analysis
+
+**tarjanize-magsac** (library)
+- **lib.rs** - MAGSAC++ robust regression: `fit_magsac()`, `fit_magsac_with_params()`. Sigma consensus for outlier-robust fitting without manual threshold tuning
+
+**tarjanize-viz** (library)
+- **lib.rs** - `run()` generates self-contained HTML with PixiJS canvas Gantt chart
+- **schedule.rs** - Forward/backward DP for critical path, swim lane packing for parallelism visualization
 
 ## Key Patterns
 
 **Rustc Driver**: `cargo-tarjanize` acts as a `RUSTC_WRAPPER`, intercepting rustc invocations. For workspace crates, it runs our extraction callbacks in `after_analysis`. For external crates, it passes through to normal compilation.
 
+**Two-Pass Profiling**: The orchestrator runs two separate `cargo check` passes — first a clean nightly build with `-Zself-profile` (no extraction overhead), then an extraction pass with the RUSTC_WRAPPER. This avoids 10-15x cost inflation from extraction callbacks.
+
 **THIR Analysis**: Uses THIR (Typed High-level IR) for body analysis because it preserves source-level information (static refs, named consts, const patterns) that MIR loses.
 
 **Container Collapsing**: Associated items (impl methods, trait methods, enum variants) collapse to their containers since they can't be split independently.
 
-**Profile Matching**: For accurate cost estimation, `--profile` runs with `-Zself-profile`. The profile uses compiler internal paths (`{{impl}}[N]`) which are stored in `Symbol.profile_key` for matching.
+**Profile Matching**: For accurate cost estimation, profiles use compiler internal paths (`{{impl}}[N]`) which are stored in `Symbol.profile_key` for matching.
 
 **Target-Level Analysis**: The cost model operates at the compilation target level (`{package}/{target}` format, e.g. `my-pkg/lib`, `my-pkg/test`), not the package level. This naturally resolves dev-dependency "cycles" since test targets depend on lib targets, not vice versa.
 
@@ -125,11 +148,11 @@ tarjanize/
 
 ## Testing
 
-**Coverage requirement:** All modules except `main.rs` must maintain ≥90% line coverage. Run `cargo llvm-cov nextest` to check. The `main.rs` file is excluded because it's the CLI entry point and not exercised by unit tests.
+**Coverage requirement:** All modules except `main.rs` must maintain >=90% line coverage. Run `cargo llvm-cov nextest` to check. The `main.rs` files are excluded because they're CLI entry points not exercised by unit tests.
 
 ### Integration Test Fixtures
 
-Real Cargo projects in `tests/fixtures/` are used for integration tests. Each fixture must have an empty `[workspace]` table in its Cargo.toml to prevent being detected as part of the parent workspace.
+~207 real Cargo projects in `crates/cargo-tarjanize/tests/fixtures/` are used for integration tests. Each fixture must have an empty `[workspace]` table in its Cargo.toml to prevent being detected as part of the parent workspace. Fixtures cover symbol paths, visibility, cross-crate dependencies, anchors, profile keys, cost extraction, and edge cases.
 
 ## Static Verification
 
@@ -139,25 +162,14 @@ Workspace-level lint configuration follows [M-STATIC-VERIFICATION](https://micro
 
 **CI runs with `RUSTFLAGS=-Dwarnings`**, so all warnings are errors. Test fixtures must use `#[expect(...)]` for intentional lint violations.
 
-Beyond `cargo clippy` and `cargo fmt`, consider running these tools periodically:
-
-```bash
-cargo audit                     # Check for security vulnerabilities in deps
-cargo udeps                     # Find unused dependencies
-cargo hack check --feature-powerset  # Verify all feature combinations compile
-```
-
 ## Documentation
 
 Read these docs for deeper context on specific topics:
 
 - **[PLAN.md](PLAN.md)** — Full project specification: algorithm details, optimality proofs, phase design
-- **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R²=0.856 accuracy, per-symbol cost skew (top 1% = 75% of cost), and why only lib targets matter for critical path. Also documents the validation directory structure at `/home/debian/github/validation/` (repos + extracted data for tokio, omicron, helix, and 8 other workspaces)
-- **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). Note: tarjanize only tracks frontend costs; backend/CGU tracking was removed as unreliable for crate-splitting predictions
-- **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties (item count, predicate count, MIR size, etc.) drive compilation time, and how to extract them for better cost prediction
-- **[docs/validation-plan.md](docs/validation-plan.md)** — Plan to validate cost model across 10 popular Rust workspaces (Zed, Bevy, uv, ruff, etc.)
-- **[docs/external-profile-plan.md](docs/external-profile-plan.md)** — Two-pass profiling plan to fix 10-15x cost inflation from extraction callback overhead
-- **[PLAN_COST_TRACKING.md](PLAN_COST_TRACKING.md)** — Historical: implementation plan for frontend/backend cost separation (backend tracking later removed)
-- **[PLAN_TARGETS.md](PLAN_TARGETS.md)** — Implementation plan for separating lib/test/bin targets to fix dev-dependency cycles
-- **[TARJAN.md](TARJAN.md)** — Reference: Tarjan's SCC algorithm explained
+- **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R^2=0.856 accuracy, per-symbol cost skew, and why only lib targets matter for critical path
+- **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). tarjanize only tracks frontend costs
+- **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties drive compilation time
+- **[docs/external-profile-plan.md](docs/external-profile-plan.md)** — Two-pass profiling plan to fix extraction callback overhead
+- **[docs/critical-path-pruning.md](docs/critical-path-pruning.md)** — Algorithm for identifying unnecessary edges in dependency DAG
 - **[scripts/README.md](scripts/README.md)** — Python analysis scripts for comparing model predictions vs actual cargo build times
