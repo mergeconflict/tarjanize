@@ -7,6 +7,11 @@ target
 node_modules
 package-lock.json
 
+# Playwright
+e2e/.server-state.json
+test-results/
+playwright-report/
+
 # macOS
 .DS_Store
 

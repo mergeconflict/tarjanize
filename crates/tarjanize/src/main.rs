@@ -108,18 +108,25 @@ enum Commands {
         output_model: Option<String>,
     },
 
-    /// Visualize the build schedule as an interactive HTML report
+    /// Visualize the build schedule interactively or as static HTML
     ///
-    /// Generates a self-contained HTML file with a `PixiJS` canvas-based Gantt
-    /// chart. Hover over targets to see the critical path through them.
+    /// By default, starts a local web server with an interactive split
+    /// explorer. Pass `--static` to generate a self-contained HTML file
+    /// for sharing (the original behavior).
     Viz {
         #[command(flatten)]
         io: IoArgs,
 
+        /// Generate a static HTML file instead of starting the web server.
+        /// Useful for sharing visualizations without running a server.
+        #[arg(long = "static")]
+        static_html: bool,
+
         /// Path to the fitted cost model (from `tarjanize cost --output-model`).
         /// When provided, uses model predictions for target costs.
-        /// Without a model, falls back to wall-clock or per-symbol costs.
-        #[arg(long, value_name = "PATH")]
+        /// Only used in `--static` mode; the web server auto-fits from
+        /// profiling data.
+        #[arg(long, value_name = "PATH", requires = "static_html")]
         model: Option<PathBuf>,
     },
 }
@@ -150,15 +157,43 @@ fn main() -> Result<()> {
                 Ok(tarjanize_condense::run(r, w, cost_model.as_ref())?)
             })
         }
-        Commands::Viz { io, model } => {
-            // Load the cost model if a path was provided.
-            let cost_model = model
-                .map(|p| tarjanize_schemas::load_cost_model(&p))
-                .transpose()?;
-            io.run(|r, w| {
-                tarjanize_viz::run(r, cost_model.as_ref(), w)
-                    .map_err(|e| anyhow::anyhow!("{e}"))
-            })
+        Commands::Viz {
+            io,
+            static_html,
+            model,
+        } => {
+            if static_html {
+                // Static mode: generate a self-contained HTML file using
+                // the provided cost model (if any). This is the original
+                // behavior from before the web server was added.
+                let cost_model = model
+                    .map(|p| tarjanize_schemas::load_cost_model(&p))
+                    .transpose()?;
+                io.run(|r, w| {
+                    tarjanize_viz::run(r, cost_model.as_ref(), w)
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
+            } else {
+                // Web server mode (default): start an interactive split
+                // explorer. Open the input before entering the async
+                // runtime. For stdin, read everything up front so we
+                // don't hold the lock across the async boundary.
+                let input: Box<dyn Read + Send> = if let Some(path) = &io.input
+                {
+                    Box::new(BufReader::new(File::open(path)?))
+                } else {
+                    let mut buf = Vec::new();
+                    std::io::stdin().lock().read_to_end(&mut buf)?;
+                    Box::new(std::io::Cursor::new(buf))
+                };
+
+                let rt = tokio::runtime::Runtime::new()?;
+                rt.block_on(async {
+                    tarjanize_viz::run_server(input)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))
+                })
+            }
         }
         Commands::Cost {
             io,

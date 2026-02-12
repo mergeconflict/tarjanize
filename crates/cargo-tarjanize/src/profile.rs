@@ -362,13 +362,13 @@ impl ProfileData {
             .target_timings
             .entry(crate_name.to_string())
             .or_default();
-        timings.wall_time_ms += duration_between(min_start, max_end);
+        timings.wall_time += duration_between(min_start, max_end);
 
         // Log the inflation ratio for debugging.
         info!(
             raw_ms = raw_duration_sum.as_millis(),
             self_time_ms = recorded_self_time_sum.as_millis(),
-            wall_time_ms = timings.wall_time_ms,
+            wall_time_ms = timings.wall_time.as_secs_f64() * 1000.0,
             "self-time sums"
         );
 
@@ -609,13 +609,12 @@ fn extract_crate_name(stem: &str) -> String {
 fn duration_between(
     min_start: Option<SystemTime>,
     max_end: Option<SystemTime>,
-) -> f64 {
+) -> Duration {
     match (min_start, max_end) {
-        (Some(start), Some(end)) => end
-            .duration_since(start)
-            .unwrap_or(Duration::ZERO)
-            .as_millis_f64(),
-        _ => 0.0,
+        (Some(start), Some(end)) => {
+            end.duration_since(start).unwrap_or(Duration::ZERO)
+        }
+        _ => Duration::ZERO,
     }
 }
 
@@ -1256,9 +1255,9 @@ mod tests {
 
         // Wall-clock spans all events: 100ms - 10ms = 90ms.
         assert!(
-            (timings.wall_time_ms - 90.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 90.0).abs() < 0.1,
             "Expected wall_time_ms ~90.0, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
     }
 
@@ -1279,9 +1278,9 @@ mod tests {
             data.get_target_timings("test_crate").expect("should exist");
 
         assert!(
-            (timings.wall_time_ms - 40.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 40.0).abs() < 0.1,
             "Expected wall_time_ms ~40.0, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
     }
 
@@ -1314,9 +1313,9 @@ mod tests {
 
         // Frontend wall-clock includes metadata: 25ms - 0ms = 25ms.
         assert!(
-            (timings.wall_time_ms - 25.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 25.0).abs() < 0.1,
             "Expected wall_time_ms ~25.0 (includes metadata), got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
 
         // Metadata self-time appears in event_times_ms under its raw label.
@@ -1358,9 +1357,9 @@ mod tests {
             data.get_target_timings("test_crate").expect("should exist");
 
         assert!(
-            (timings.wall_time_ms - 40.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 40.0).abs() < 0.1,
             "Nested events should not inflate wall-clock: expected ~40, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
     }
 
@@ -1404,9 +1403,9 @@ mod tests {
             data.get_target_timings("test_crate").expect("should exist");
 
         assert!(
-            (timings.wall_time_ms - 70.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 70.0).abs() < 0.1,
             "Multi-thread events should merge: expected ~70, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
     }
 
@@ -1451,9 +1450,9 @@ mod tests {
 
         // Wall-clock spans all events: 100 - 10 = 90ms.
         assert!(
-            (timings.wall_time_ms - 90.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 90.0).abs() < 0.1,
             "Wall-clock should span all events: expected ~90, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
         // Metadata self-time in event_times_ms.
         let metadata_cost = timings
@@ -1540,9 +1539,9 @@ mod tests {
 
         // And it should extend the frontend wall-clock span.
         assert!(
-            (timings.wall_time_ms - 20.0).abs() < 0.1,
+            (timings.wall_time.as_secs_f64() * 1000.0 - 20.0).abs() < 0.1,
             "Expected wall_time_ms ~20, got {}",
-            timings.wall_time_ms
+            timings.wall_time.as_secs_f64() * 1000.0
         );
     }
 

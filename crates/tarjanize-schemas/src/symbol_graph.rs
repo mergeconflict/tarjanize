@@ -15,19 +15,16 @@
 //! A Package contains multiple Targets, and each Target compiles to a Crate.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Returns true if the value is zero (for serde `skip_serializing_if`).
-///
-/// Takes `&f64` because serde's `skip_serializing_if` passes by reference.
-#[expect(
-    clippy::trivially_copy_pass_by_ref,
-    reason = "serde skip_serializing_if requires &self"
-)]
-fn is_zero(value: &f64) -> bool {
-    *value == 0.0
+use crate::serde_duration;
+
+/// Returns true if the duration is zero (for serde `skip_serializing_if`).
+fn is_zero_duration(value: &Duration) -> bool {
+    value.is_zero()
 }
 
 /// Helper to sum all values in a `HashMap<String, f64>`.
@@ -101,13 +98,18 @@ pub struct Package {
     Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema,
 )]
 pub struct TargetTimings {
-    /// Wall-clock time in milliseconds.
+    /// Wall-clock elapsed time of all profiled events.
     ///
-    /// Wall-clock elapsed time of all profiled events. Measured as
-    /// max(end) - min(start) across all events in the profile.
-    #[serde(default, skip_serializing_if = "is_zero")]
-    #[schemars(range(min = 0.0))]
-    pub wall_time_ms: f64,
+    /// Measured as max(end) - min(start) across all events in the
+    /// profile. Serialized as f64 milliseconds for JSON consumers.
+    #[serde(
+        rename = "wall_time_ms",
+        default,
+        skip_serializing_if = "is_zero_duration",
+        with = "serde_duration"
+    )]
+    #[schemars(with = "f64", range(min = 0.0))]
+    pub wall_time: Duration,
 
     /// Unattributed self-time breakdown by event label (ms).
     ///
@@ -410,13 +412,14 @@ mod tests {
     ///
     /// Generates timing values with an optional `event_times_ms` map containing
     /// integer-valued costs (floats don't survive JSON roundtrip perfectly).
+    /// Wall time uses integer milliseconds to survive f64 JSON roundtrip.
     fn arb_target_timings() -> impl Strategy<Value = TargetTimings> {
         (
-            (0..1_000_000).prop_map(f64::from),
+            (0..1_000_000u64).prop_map(Duration::from_millis),
             hash_map(arb_name(), (0..1_000_000).prop_map(f64::from), 0..3),
         )
-            .prop_map(|(wall_time_ms, event_times_ms)| TargetTimings {
-                wall_time_ms,
+            .prop_map(|(wall_time, event_times_ms)| TargetTimings {
+                wall_time,
                 event_times_ms,
             })
     }

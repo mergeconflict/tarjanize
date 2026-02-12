@@ -7,7 +7,7 @@
   <style>{{ style_css }}</style>
 </head>
 <body>
-  <!-- Sidebar: summary stats, search, and legend. Populated by renderer.js
+  <!-- Sidebar: summary stats, search, and legend. Populated by renderer.ts
        at startup using DATA.summary values. -->
   <div id="sidebar">
     <h2>tarjanize</h2>
@@ -41,7 +41,7 @@
        synchronously before the module script below. -->
   <script>window.DATA = {{ schedule_json|safe }};</script>
 
-  <!-- esbuild bundle: renderer.js + logic.js inlined, pixi.js external. -->
+  <!-- esbuild bundle: renderer.ts + logic.ts inlined, pixi.js external. -->
   <script type="module">{{ bundle_js|safe }}</script>
 </body>
 </html>

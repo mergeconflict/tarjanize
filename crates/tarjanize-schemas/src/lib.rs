@@ -11,6 +11,7 @@
 //! - **Shared**: Used across all phases of the tarjanize pipeline
 
 mod cost_model;
+pub mod serde_duration;
 mod symbol_graph;
 #[cfg(test)]
 mod testutil;

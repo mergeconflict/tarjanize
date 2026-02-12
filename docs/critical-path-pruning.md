@@ -1,265 +1,385 @@
 # Critical Path Pruning: Minimal Splits for Optimal Build Time
 
-> **Status**: Design proposal (not yet implemented)
+> **Status**: Design (not yet implemented)
 >
-> **Problem**: `tarjanize condense` produces thousands of synthetic crates for
-> large workspaces. Most splits don't improve the critical path. We need the
-> **minimum set of splits** that achieves the optimal critical path.
+> **Problem**: Given a Rust workspace and a fitted cost model, find a
+> small set of crate splits that significantly improves the critical path
+> via parallelism, where each split produces semantically meaningful
+> output crates that a developer can reasonably implement.
 
 ## Motivation
 
-The current pipeline runs condense on the entire workspace symbol graph,
-producing an optimized symbol graph where every SCC boundary becomes a crate
-boundary. For a workspace like Omicron (~160 crates), this can recommend
-splitting into thousands of synthetic crates — far too many for a human to
-reorganize.
+The current `tarjanize condense` pipeline computes SCCs and partitions the workspace
+into fine-grained pieces. For a workspace like Omicron (~160 original
+crates, ~180k symbols), this produces ~60-70k synthetic crates -- most
+containing only a few symbols. The average SCC is ~3 symbols, and many
+are singletons.
 
-But most of those splits don't matter. The critical path (the longest weighted
-path through the dependency DAG, assuming infinite parallelism) determines the
-minimum possible build time. Splits that only affect crates far from the
-critical path contribute nothing to build time improvement. We should only
-recommend splits that are **necessary** to achieve the optimal critical path.
+This output is not actionable. No developer will reorganize 160 crates
+into 60,000 pieces. But most of those boundaries don't matter. The
+critical path (the longest weighted path through the dependency DAG,
+assuming infinite parallelism) determines the minimum possible build
+time. Splits far from the critical path contribute nothing to build time
+improvement.
 
-## Problem statement
+The output should be a practical plan: a small number of
+recommended splits that achieve (or nearly achieve) the best possible
+critical path. Each recommended split is a refactoring a developer needs
+to implement, so fewer splits means less work.
 
-Given the original workspace dependency DAG and the set of per-crate splits
-recommended by condense, find the **minimum subset of splits** to apply such
-that the critical path equals `T_opt` (the critical path of the fully-split
-graph).
+## CLI: `tarjanize split`
 
-The original workspace structure is the baseline. Every split is a deviation
-from that baseline, and we want to minimize deviations. We never recommend
-merging originally-separate crates — the action space is strictly splits.
+This is a new subcommand that replaces `tarjanize condense`. The
+pipeline becomes:
+
+```
+cargo tarjanize        -> symbol_graph.json
+tarjanize cost         -> cost_model.json
+tarjanize split        -> split_plan.json
+```
+
+The `split` command takes the original symbol graph plus a **required**
+cost model, and outputs a set of recommended splits. The cost model is
+required because the algorithm is driven by critical path computation,
+which depends on accurate per-target cost predictions. The existing
+`condense` subcommand and `tarjanize-condense` crate will be removed
+once `split` is complete.
+
+## Problem definition
 
 ### Definitions
 
-- **Original DAG**: the workspace as-is, with critical path `T_orig`
-- **Fully-split DAG**: the condense output, with critical path `T_opt ≤ T_orig`
-- **Split decision**: for each original crate that condense split into multiple
-  pieces, a binary choice — apply the split or leave the crate whole
-- `T(S)`: the critical path length when we apply the set of splits `S`
-- `D`: the set of all possible splits (one per original crate that condense
-  recommends splitting)
+- **Target**: a compilation unit (`{package}/{target}`, e.g.
+  `my-pkg/lib`). The cost model and schedule operate at target
+  granularity.
+- **SCC**: a strongly connected component in the symbol dependency
+  graph. Symbols in the same SCC must stay in the same target (they
+  have cyclic dependencies).
+- **Split**: a target boundary in the output that didn't exist in the
+  original workspace. If an original target becomes k output targets,
+  that's k-1 splits.
+- **Cut**: a binary partition of a target's SCCs into two convex groups
+  (see "Validity constraints" below). Each cut adds one split.
 
-**Goal**: find minimum `S ⊆ D` such that `T(S) = T_opt`.
+### Goal
 
-### Monotonicity
+Given the original workspace DAG (with critical path T_orig) and a
+fitted cost model, find a set of cuts that:
 
-Splitting more crates can only decrease or maintain the critical path, never
-increase it. Splitting replaces a single heavy node with lighter pieces and
-can only add parallelism:
+1. **Improves the critical path** -- each cut should contribute to
+   reducing the predicted build time, primarily by enabling parallelism
+2. **Minimizes the number of splits** -- each split is developer work,
+   so fewer is better
+3. **Produces semantically meaningful groups** -- the output targets
+   should correspond to recognizable subsystems or features, not
+   arbitrary collections of symbols
 
-```
-If S ⊆ S', then T(S) ≥ T(S')
-```
+These goals are in tension. The ideal algorithm balances all three, but
+(1) and (2) are measurable while (3) is harder to quantify.
 
-This means `T_opt = T(D)` is the global optimum, and un-doing any split can
-only make things worse or keep things equal.
+### Non-monotonicity of splits
 
-## Over-long paths and the hitting set formulation
+The cost model includes per-target fixed overhead (rustc invocation,
+linking, etc.). This means not every split improves the critical path:
 
-The key insight: in the original DAG, some paths are **over-long** — their
-total weight exceeds `T_opt`. Each over-long path must have at least one crate
-on it split to bring the path weight back under `T_opt`. This is the
-**minimum hitting set** problem.
+- Splitting a target increases total work (two invocations instead of
+  one) but may decrease the critical path (via parallelism)
+- Some splits are **detrimental** -- the overhead of two small targets
+  outweighs the parallelism gained
+- The fully-split graph (every SCC as its own target) does NOT
+  necessarily have the optimal critical path
 
-### Why paths matter
+The algorithm only accepts cuts that improve the schedule, so
+detrimental splits are naturally rejected.
 
-When we leave a crate un-split, it retains its original weight (the sum of all
-its symbols' compilation costs) and its original edges. The critical path of
-the resulting DAG is determined by the longest path, where un-split crates
-contribute their full weight and split crates contribute only the weight of
-whichever piece is on that path.
+## Validity constraints
 
-An over-long path exists because the crates along it are collectively too
-heavy. Splitting at least one crate on the path breaks the heavy node into
-lighter pieces, potentially allowing parts of it to compile in parallel with
-other work, shortening the path.
+Not every partition of a target's SCCs is valid. Invalid partitions
+create dependency cycles in the output DAG.
 
-### Subtlety: path-dependent savings
+### The cycle problem
 
-Splitting crate `C` doesn't reduce every path through `C` by the same amount.
-`C` gets replaced by multiple pieces `{C₁, ..., C_k}`, and different paths
-may route through different pieces. A path that only depends on `C₁` (the
-heaviest piece) gets little benefit, while a path that depended on all of `C`
-but now only needs `C₃` (a light piece) gets a large benefit.
-
-This means the hitting set isn't a simple "does this path contain a split?"
-check — we need to verify that the split provides **enough** weight reduction
-on each specific path.
-
-### Formulation
-
-For each over-long path `P` in the original DAG, let `excess(P) = weight(P) -
-T_opt`. For each crate `C_i` on path `P`, let `savings(C_i, P)` be the weight
-reduction on `P` from splitting `C_i`: the difference between `C_i`'s merged
-weight and the weight of whichever piece of `C_i` path `P` would route
-through after splitting.
+Consider SCCs P1, P2, P3 from the same original target, where
+P1 → P3 → P2 and P1 → P2:
 
 ```
-minimize  Σ xᵢ
-
-s.t.      Σ savings(Cᵢ, P) · xᵢ  ≥  excess(P)    for each over-long path P
-          xᵢ ∈ {0, 1}
+P1 -> P2
+P1 -> P3 -> P2
 ```
 
-This is a weighted set cover / hitting set variant. NP-hard in general.
+P1 and P2 share a direct edge, but merging them (skipping P3) creates
+a cycle: {P1, P2} depends on P3 (via P1 → P3) and P3 depends on
+{P1, P2} (via P3 → P2).
 
-## Complexity
+### Convexity
 
-### NP-hard in general
+A set of SCCs can be merged if and only if the set is **convex** in
+the intra-target DAG: for every pair of members, every SCC on every
+path between them must also be included. Equivalently, contracting the
+merged set to a single node must not create a cycle.
 
-The problem is NP-hard because splits interact: two un-split crates on the
-same path contribute their full weights additively, so leaving both un-split
-can make a path over-long even though leaving either one alone would be fine.
+For a **binary partition** (splitting a target into exactly two groups),
+convexity is equivalent to the upset/downset condition: one group must
+be an upward-closed set (upset) and the other a downward-closed set
+(downset). All inter-group edges flow in one direction, guaranteeing
+acyclicity.
 
-Concrete example. Three original crates X, Y, Z, each split into two pieces
-(weight 30 each, merged weight 60). `T_opt = 100`, with the true critical
-path elsewhere:
+For **multi-way partitions**, each group must individually be convex.
 
-```
-         ┌→ Y₁(30) → Q(5)     path weight = 70, slack = 30
-X₁(30) ──┤
-P(5) →   └→ Z₁(30) → R(5)     path weight = 70, slack = 30
-```
+### Valid binary cuts biject with antichains
 
-| Action | Longest new path | OK? |
-|--------|-----------------|-----|
-| Un-split X only | `P(5) → X(60) → Y₁(30) → Q(5) = 100` | Yes |
-| Un-split Y only | `P(5) → X₁(30) → Y(60) → Q(5) = 100` | Yes |
-| Un-split X + Y | `P(5) → X(60) → Y(60) → Q(5) = 130` | **No** |
-| Un-split Y + Z | No shared path | Yes |
+There is a bijection between valid binary cuts and **antichains** of
+the intra-target SCC DAG. An antichain is a set of nodes where no two
+are comparable (no directed path between any pair). Each antichain
+defines a cut boundary:
 
-Un-splitting X or Y individually is safe, but both together create a path of
-130. The optimal solution keeps only X split (1 split), un-splitting both Y
-and Z. A greedy algorithm that un-splits X first gets stuck at 2 splits.
+- The **upset** = the antichain plus everything above it (all nodes
+  that transitively depend on any node in the antichain)
+- The **downset** = everything below (all remaining nodes)
 
-### Tractable in practice
+Enumerating valid binary cuts reduces to enumerating antichains.
 
-Despite NP-hardness, real compilation DAGs have favorable structure:
+**Example: chain** S1 → S2 → S3 → S4. The antichains are the
+individual nodes {S1}, {S2}, {S3}, {S4}, giving N-1 = 3 non-trivial
+cuts.
 
-1. **Most crates have large slack.** Only crates near the critical path are
-   candidates for over-long paths. The vast majority of crates can be
-   trivially ruled out.
+**Example: diamond** A → B, A → C, B → D, C → D. Five antichains,
+four non-trivial cuts:
 
-2. **Few over-long paths.** The original DAG's paths near `T_opt` length form
-   a small set — the critical path is typically a narrow chain, not a wide
-   front.
+| Antichain | Upset   | Downset |
+|-----------|---------|---------|
+| {A}       | {A}     | {B,C,D} |
+| {B}       | {A,B}   | {C,D}   |
+| {C}       | {A,C}   | {B,D}   |
+| {B,C}     | {A,B,C} | {D}     |
+| {D}       | all     | {}      |
 
-3. **Small candidate set.** After filtering out crates with sufficient slack,
-   the remaining candidates (crates that appear on over-long paths and whose
-   split provides meaningful savings) should number in the tens, not thousands.
+### Antichain enumeration algorithm
 
-For a small candidate set, the hitting set can be solved exactly via brute
-force, ILP, or branch-and-bound.
+1. Compute the target's intra-target SCC DAG
+2. Compute the transitive closure (makes comparability an O(1) lookup)
+3. Enumerate antichains by backtracking: process nodes in a fixed
+   order, include or exclude each, prune branches where including a
+   node would conflict with (be comparable to) an already-included node
+4. For each antichain, compute the upset via upward reachability from
+   the antichain members
+5. Evaluate the upset/downset split by recomputing the global schedule
 
-## Algorithm
+### Complexity
 
-### Step 1: identify over-long paths
+The number of antichains can be exponential in the DAG's width (the
+size of its largest antichain). For chain-like DAGs -- which we expect
+for most targets, since symbol dependencies tend to be roughly linear
+-- the count is linear. For wide DAGs, we may need to truncate the
+search or use heuristics (e.g., only consider antichains up to some
+maximum size).
 
-Compute the critical path of the fully-split graph to get `T_opt`. Then, in
-the original DAG (where every crate is at its merged weight), enumerate paths
-with total weight > `T_opt`.
+### Binary cuts vs N-way partitions
 
-We don't need all paths — only **maximal** over-long paths. Use DFS from
-sources with pruning: abandon a branch when the accumulated weight plus the
-longest possible remaining suffix can't exceed `T_opt`. The longest suffix per
-node can be precomputed in O(V + E).
+The algorithm applies binary cuts greedily: pick the best single cut,
+apply it, recompute the schedule, repeat. Any valid N-way convex
+partition can be decomposed into a sequence of N-1 binary cuts (there
+always exists an antichain separating at least one group from the
+rest), so iterated binary cuts can **reach** any partition.
 
-### Step 2: identify candidate splits
+The issue is **greediness**: the binary cut with the best single-step
+improvement may not be on the path to the best multi-step partition.
+For example, the optimal 3-way split {A}, {B,C}, {D} might require
+first cutting {A}|{B,C,D} (a modest improvement), while the greedy
+choice picks {A,B}|{C,D} (a larger immediate gain) from which
+{A}, {B,C}, {D} is unreachable.
 
-For each over-long path, identify which crates on it are splittable (condense
-recommended a split) and compute the path-specific savings. A crate that
-condense didn't split provides no savings and can be ignored.
+The complexity of enumerating N-way partitions is strictly worse. For
+a chain of length n, binary cuts give n-1 options, but N-way partitions
+give 2^(n-1) (every subset of cut points). For general DAGs, the
+N-way count grows combinatorially on top of the already-exponential
+antichain count.
 
-A quick filter: for each split crate `C`, compute its best-case `merged_cp`
-in the fully-split graph:
+In practice, the greedy binary approach evaluates each cut against the
+current global schedule, so later cuts naturally adapt to earlier ones.
+If greedy suboptimality turns out to matter on real data, limited
+lookahead (evaluating pairs of cuts jointly) is a natural extension.
 
-```
-merged_cp(C) = max(earliest_finish[p] for p ∈ external predecessors of any Cᵢ)
-             + Σ w(Cᵢ)
-             + max(longest_suffix[s] for s ∈ external successors of any Cᵢ)
-```
+### Why intra-target merges can't create cycles with external targets
 
-If `merged_cp(C) > T_opt`, crate `C` **must** stay split — even in the best
-case (all other crates fully split), un-splitting `C` alone exceeds `T_opt`.
-These are unconditionally necessary and can be excluded from the hitting set
-(they're always in the solution).
+Merging SCCs from the same original target never creates cycles with
+external targets. If SCCs C1 and C3 from target T had an external
+target E between them (C1 → E → C3), that would imply T → E → T in
+the original workspace graph -- a cycle that Cargo forbids. Cycles can
+only arise among SCCs of the *same* original target.
 
-### Step 3: solve minimum hitting set
+## Evaluating cuts: schedule DP
 
-With the must-split crates fixed and the remaining candidate crates
-identified, solve the hitting set:
+### Forward/backward DP
 
-```
-minimize  Σ xᵢ
+The critical path and per-node slack are computed in two O(V + E)
+passes over the target-level DAG. This is already implemented in
+`tarjanize-viz/src/schedule.rs` (`forward_pass()` and
+`backward_pass()`), to be extracted into a `tarjanize-schedule` crate:
 
-s.t.      Σ savings(Cᵢ, P) · xᵢ  ≥  excess(P)    for each over-long path P
-          xᵢ ∈ {0, 1}
-```
+1. **Forward pass**: process nodes in topological order. For each
+   target t, `start[t] = max(finish[dep] for dep in dependencies)` and
+   `finish[t] = start[t] + cost[t]`. The maximum finish time across all
+   targets is the critical path length.
 
-Solver options, in order of preference:
+2. **Backward pass**: process in reverse topological order. For each
+   target t, compute `longest_from[t]` -- the longest path from t to
+   any sink. Then
+   `slack[t] = critical_path - (start[t] + cost[t] + longest_from[t])`.
+   Targets with zero slack are on the critical path.
 
-1. **Brute force** (≤ ~20 candidates): enumerate subsets. 2²⁰ ≈ 1M, fast.
-2. **Greedy**: repeatedly pick the split that covers the most remaining excess
-   across uncovered paths. O(log n) approximation ratio.
-3. **ILP**: for larger instances, use an off-the-shelf solver (e.g., the
-   `good_lp` crate).
+Slack tells us how much a target's compilation can shift without
+affecting the overall build time.
 
-Start with greedy; add exact solving if needed.
+### Global effects of splits
 
-### Step 4: output
+A split doesn't just reduce a target's weight -- it restructures the
+DAG. The downset half may have fewer external dependencies than the
+original target, allowing it to start compiling much earlier. This
+creates parallelism: external targets that only need symbols in the
+downset no longer wait for the full target to finish.
 
-The final split set is: must-split crates (from step 2) ∪ hitting set crates
-(from step 3). Produce a pruned symbol graph that applies only these splits,
-leaving all other original crates intact.
+The true effect of a split on the critical path can only be evaluated
+by recomputing the full schedule. Splits interact through the global
+schedule: the benefit of splitting target A depends on whether target B
+was also split.
 
-## Data flow
+## Algorithmic approach
 
-```
-symbol_graph.json ──→ condense ──→ optimized_symbol_graph.json
-       │                                     │
-       │         ┌───────────────────────────┘
-       ▼         ▼
-      prune (needs both graphs)
-       │
-       ▼
-pruned_symbol_graph.json
-```
+### Greedy binary cuts on critical path targets
 
-The pruning step needs both graphs:
-- The **original** graph provides crate weights and the over-long paths
-- The **optimized** graph provides `T_opt` and the per-piece weights after
-  splitting
+Start from the original target-level DAG and apply greedy binary cuts:
 
-## Open questions
+1. Compute the critical path on the current target-level graph
+2. Identify zero-slack targets, sorted by decreasing predicted
+   compilation time (from the cost model)
+3. For each zero-slack target (slowest first):
+   a. Compute its intra-target SCC DAG (condense just this target's
+      symbols). If the target is a single SCC, skip -- it can't be
+      split.
+   b. Enumerate valid binary cuts via antichains
+   c. For each candidate cut, tentatively replace the target with two
+      nodes in the target graph, recompute the schedule, record the
+      critical path improvement
+   d. **Short-circuit**: if the best improvement found so far exceeds
+      the predicted compilation time of the next target in the queue,
+      stop -- no remaining target can beat it (since improvement is
+      bounded by target cost)
+4. Apply the best cut across all targets
+5. Repeat from step 1 until no cut improves the critical path
 
-1. **Weight model for merged crates.** Is the merged weight exactly the sum of
-   piece weights, or does compiling together have additional overhead? Assume
-   sum for now — this is conservative (overestimates merged weight, so we keep
-   more splits than strictly necessary).
+**Why cost bounds improvement**: the critical path runs through the
+target being split. After splitting, it must still run through at least
+one of the two halves (the external dependencies that put the target on
+the critical path still exist). So the improvement is at most
+`cost(T) - cost(slower half) ≤ cost(T)`.
 
-2. **Over-long path enumeration.** How many over-long paths exist in practice?
-   If the number is manageable (hundreds), the hitting set is easy. If
-   exponential, we need constraint generation (enumerate paths lazily, adding
-   constraints as the solver finds violations).
+**DP caching**: when evaluating N candidate cuts for the same target T,
+every node upstream of T in topological order has identical finish
+times across all candidates. Compute the forward pass up to T once,
+then for each antichain only recompute from the split point onward. The
+downset half inherits a subset of T's original external dependencies,
+so its start time is computed from a smaller set of cached finish
+times -- potentially much earlier than T's original start time. This is
+exactly the parallelism benefit we're evaluating. The upstream cache
+provides the correct inputs; the partial recomputation captures the
+reduced dependency set. This turns N full O(V+E) passes into one full
+pass plus N partial passes over the downstream subgraph.
 
-3. **Path-dependent savings computation.** When crate `C` is split and path
-   `P` goes through `C`, which piece does `P` route through? This requires
-   tracing the dependency chain through `C`'s pieces — a path that entered via
-   a dependency on `C₁` only needs `C₁`, not all of `C`. The savings are
-   `w(C) - w(C₁)`.
+### Output
 
-4. **User experience.** How to present the results:
-   - A report: "split these N crates to reduce critical path from X ms to Y ms"
-   - A pruned symbol graph (current optimized output with unnecessary splits
-     merged back)
-   - Ranked by impact (biggest critical path reduction first) for incremental
-     application
+Produce a `split_plan.json` containing the recommended splits. Most
+original targets remain unchanged. Targets on the critical path that
+benefit from splitting appear as a small number of output targets.
+
+## Limitations and open questions
+
+### Coordinated multi-target splits
+
+The greedy per-target algorithm evaluates one split at a time. This
+misses improvements that require coordinated splits across multiple
+targets.
+
+Consider a critical path chain: `db-model(10s) → db-queries(10s) →
+app(10s)`, total 30s. Splitting `db-model` alone into an upset and
+downset doesn't help -- `db-queries` depends on both halves, so it
+still waits for the slower half. The greedy search sees zero
+improvement and skips the split. But if all three targets are split
+along aligned feature boundaries (feature-A symbols vs feature-B
+symbols), each feature's chain compiles independently:
+`model-A(5s) → queries-A(5s) → app-A(5s)` = 15s, a 50% reduction.
+The benefit only appears when multiple targets are split in concert.
+
+### Semantic coherence and clustering
+
+A second concern beyond discoverability: **semantic coherence**. The
+developer implementing a split needs to understand it. A cut that
+groups "all disk-related types" in one half and "all network-related
+types" in the other is actionable. An arbitrary antichain that mixes
+concerns is harder to implement and maintain, even if it produces a
+shorter critical path.
+
+**Clustering** could address both coordinated splits and semantic
+coherence. Community detection on the symbol dependency graph (e.g.,
+modularity-based partitioning) identifies groups of tightly-connected
+symbols -- which often correspond to features or subsystems. Aligning
+clusters across neighboring targets in a chain enables coordinated
+multi-target evaluation: split all targets along the same feature
+boundary and recompute the schedule once to see the combined effect.
+
+A possible hybrid: use clustering to *propose* candidate cuts (aligned
+across the critical path chain), then use the schedule DP to *evaluate*
+them. This keeps the rigorous evaluation framework but uses clustering
+to navigate the search space instead of blind antichain enumeration.
+
+Not yet designed in detail. Worth revisiting after validating the basic
+algorithm on real data.
+
+### Cost model for merged targets
+
+The cost model predicts wall time from structural predictors
+(attributed cost, metadata, other). When SCCs merge, the predictors
+sum. The cost model's per-target overhead is implicit in its
+coefficients. This means merging a chain of tiny targets can reduce
+total predicted cost -- which is correct and desirable.
+
+### Optimization framing
+
+The problem can be framed as pure optimization: for each target, choose
+one of its valid partitions (precomputed from upset/downset cuts). Any
+combination of per-target partition choices produces a valid DAG --
+there are no cross-target validity constraints. The challenge is finding
+the combination that minimizes total splits while keeping the critical
+path short. Known approximation techniques (greedy, LP relaxation,
+etc.) may apply, but global schedule interactions between splits
+complicate direct application.
+
+### Budget mode
+
+A future `tarjanize split --max-splits N` would output the graph
+with at most N splits, choosing the N most impactful ones. The greedy
+algorithm naturally supports this: stop after N cuts.
+
+## Architectural changes
+
+### Extract `tarjanize-schedule` crate
+
+The scheduling primitives needed for pruning (forward/backward DP,
+critical path computation, `TargetGraph` construction) currently live in
+`tarjanize-viz` as `pub(crate)` items. Both viz and the pruning logic
+within `tarjanize split` need these. Extract them into a shared
+`tarjanize-schedule` crate:
+
+- `TargetGraph` (target-level DAG with costs)
+- `build_target_graph()` (SymbolGraph + CostModel → TargetGraph)
+- `forward_pass()` / `backward_pass()` (DP for critical path and slack)
+- `compute_schedule()` (full scheduling computation)
+
+Both `tarjanize-viz` and the new `tarjanize-split` crate depend on
+`tarjanize-schedule`.
 
 ## References
 
-- [PLAN.md](../PLAN.md) — full project specification
-- [docs/cost-model-validation.md](cost-model-validation.md) — cost model
-  accuracy and validation methodology
-- Minimum hitting set: Karp (1972), one of the original 21 NP-complete problems
+- [PLAN.md](../PLAN.md) -- full project specification
+- [docs/cost-model-validation.md](cost-model-validation.md) -- cost
+  model accuracy and validation methodology

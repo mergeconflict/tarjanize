@@ -1,9 +1,12 @@
-/* style.css — Layout and theme for the tarjanize build schedule visualization.
+/* style.css -- Layout and theme for the tarjanize build schedule visualization.
  *
- * Design: dark theme with a fixed left sidebar for summary stats and search,
- * and a full-bleed PixiJS canvas on the right. The sidebar uses #16213e as
- * its background (slightly lighter than the canvas area at #1a1a2e) to give
- * a subtle visual separation without a hard border.
+ * Single-panel layout: sidebar (250px) + full-width PixiJS Gantt chart canvas.
+ * Split recommendations appear in the sidebar when a target is clicked.
+ *
+ * Layout:
+ *   | Sidebar (250px) | Gantt Viewport                              |
+ *   | Stats, Search   | PixiJS canvas                               |
+ *   | Recommendations |                                             |
  *
  * The tooltip floats above everything (z-index 100) and follows the cursor.
  * It has pointer-events:none so it never intercepts mouse events meant for
@@ -17,6 +20,19 @@ body {
   background: #1a1a2e;
 }
 
+/* ---------------------------------------------------------------------------
+ * Panel layout (app mode only -- the static viz.html has no panels)
+ * ------------------------------------------------------------------------ */
+
+/* Main panel: sidebar + Gantt viewport. Takes the full viewport width. */
+#right-panel {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+}
+
 /* The PixiJS canvas mounts into this div. It fills the space to the right
  * of the sidebar. */
 #viewport {
@@ -27,9 +43,10 @@ body {
   bottom: 0;
 }
 
-/* Fixed sidebar: always visible, scrollable if content overflows. */
+/* Fixed sidebar: always visible, scrollable if content overflows.
+ * Positioned at the left edge. */
 #sidebar {
-  position: fixed;
+  position: absolute;
   top: 0;
   left: 0;
   width: 250px;
@@ -58,7 +75,7 @@ body {
   font-weight: bold;
 }
 
-/* Search input: matches the dark theme and sits above the legend. */
+/* Search input: matches the dark theme and sits above the recommendations. */
 #search-input {
   width: 100%;
   padding: 8px;
@@ -68,6 +85,72 @@ body {
   border-radius: 4px;
   margin-bottom: 12px;
   box-sizing: border-box;
+}
+
+/* ---------------------------------------------------------------------------
+ * Split recommendations (shown when a target is clicked)
+ * ------------------------------------------------------------------------ */
+
+#recommendations {
+  margin-top: 12px;
+  border-top: 1px solid #333;
+  padding-top: 12px;
+}
+
+#rec-header {
+  font-size: 13px;
+  margin-bottom: 8px;
+}
+
+#rec-header .rec-target-name {
+  color: #00d4ff;
+  font-weight: bold;
+}
+
+#rec-header .rec-cost {
+  color: #888;
+  font-size: 12px;
+}
+
+.split-candidate {
+  padding: 8px;
+  margin-bottom: 6px;
+  background: #1a1a2e;
+  border: 1px solid #333;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.split-candidate:hover {
+  border-color: #00d4ff;
+}
+
+.split-candidate.active {
+  border-color: #4caf50;
+  background: #1a2e1a;
+}
+
+.candidate-improvement {
+  color: #4caf50;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+
+.candidate-improvement .local-save {
+  color: #888;
+  font-weight: normal;
+  margin-left: 8px;
+}
+
+.candidate-detail {
+  color: #aaa;
+}
+
+.candidate-warning {
+  color: #ff9800;
+  margin-top: 4px;
+  font-size: 11px;
 }
 
 /* Floating tooltip: positioned via JS, hidden by default. */
@@ -107,7 +190,7 @@ body {
 .legend-gradient {
   height: 12px;
   border-radius: 3px;
-  /* Hue stops matching slackColor(): 0 (red) → 220 (blue) through the
+  /* Hue stops matching slackColor(): 0 (red) -> 220 (blue) through the
    * hue wheel. A two-stop gradient would interpolate in RGB and miss
    * the yellow/green/cyan range entirely. */
   background: linear-gradient(to right,
@@ -123,6 +206,46 @@ body {
   justify-content: space-between;
   font-size: 11px;
   color: #888;
+}
+
+/* "Save Symbol Graph" button in the sidebar. Downloads the modified
+ * SymbolGraph JSON reflecting all current split operations. */
+#save-btn {
+  width: 100%;
+  margin-top: 12px;
+  padding: 8px;
+  background: #4caf50;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: monospace;
+}
+
+#save-btn:hover {
+  background: #66bb6a;
+}
+
+/* "Shatter by horizon" button in the recommendations panel. Groups the
+ * target's SCCs by effective horizon and replaces the original target
+ * with one target per horizon group. Orange to distinguish from green save. */
+#shatter-btn {
+  width: 100%;
+  margin-top: 8px;
+  margin-bottom: 8px;
+  padding: 8px;
+  background: #e67e22;
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 13px;
+  font-family: monospace;
+}
+
+#shatter-btn:hover {
+  background: #f39c12;
 }
 
 /* Help icon: small circled "?" that shows a tooltip on hover. */

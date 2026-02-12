@@ -1,9 +1,11 @@
 //! Build script for tarjanize-viz.
 //!
-//! Runs esbuild to bundle `renderer.js` (which imports `logic.js`) into a
-//! single ES module. The pixi.js import is kept as an external — the HTML
-//! import map resolves it at runtime. The bundled output goes to `OUT_DIR`
-//! where `html.rs` picks it up via `include_str!`.
+//! Runs esbuild to bundle `renderer.ts` (imports `logic.ts`) -- the Gantt
+//! chart renderer, shared between static HTML and web server modes.
+//!
+//! External imports (pixi.js) are kept external -- the HTML import map
+//! resolves them at runtime from CDN. The bundled output goes to `OUT_DIR`
+//! where `html.rs` and `server.rs` pick it up via `include_str!`.
 
 use std::env;
 use std::path::PathBuf;
@@ -18,11 +20,15 @@ fn main() {
         .canonicalize()
         .expect("could not resolve project root");
 
-    let entry = PathBuf::from(&manifest_dir).join("templates/renderer.js");
-    let output = PathBuf::from(&out_dir).join("bundle.js");
-
     // Prefer the project-local esbuild binary installed via `npm install`.
     let esbuild = project_root.join("node_modules/.bin/esbuild");
+
+    // -----------------------------------------------------------------------
+    // Bundle: renderer.ts (Gantt chart)
+    // -----------------------------------------------------------------------
+
+    let entry = PathBuf::from(&manifest_dir).join("templates/renderer.ts");
+    let output = PathBuf::from(&out_dir).join("bundle.js");
 
     let status = Command::new(&esbuild)
         .arg(entry.to_str().expect("non-UTF8 path"))
@@ -40,9 +46,9 @@ fn main() {
             );
         });
 
-    assert!(status.success(), "esbuild bundling failed");
+    assert!(status.success(), "esbuild bundling of renderer.ts failed");
 
-    // Rerun when the JS source files change.
-    println!("cargo:rerun-if-changed=templates/logic.js");
-    println!("cargo:rerun-if-changed=templates/renderer.js");
+    // Rerun when the TS source files change.
+    println!("cargo:rerun-if-changed=templates/logic.ts");
+    println!("cargo:rerun-if-changed=templates/renderer.ts");
 }

@@ -8,6 +8,7 @@ tarjanize-condense = { path = "crates/tarjanize-condense" }
 tarjanize-cost = { path = "crates/tarjanize-cost" }
 tarjanize-magsac = { path = "crates/tarjanize-magsac" }
 tarjanize-schemas = { path = "crates/tarjanize-schemas" }
+tarjanize-schedule = { path = "crates/tarjanize-schedule" }
 tarjanize-viz = { path = "crates/tarjanize-viz" }
 
 # Serialization
@@ -43,11 +44,20 @@ cargo_metadata = "0.23"
 regex = "1.11"
 tempfile = "3"
 
+# Web server
+axum = "0.8"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tower-http = { version = "0.6", features = ["fs"] }
+open = "5"
+
 # Performance
 mimalloc = { version = "0.1", features = ["v3"] }
 
 # Testing
+http = "1"
+http-body-util = "0.1"
 proptest = "1.9"
+tower = { version = "0.5", features = ["util"] }
 
 [workspace.package]
 version = "0.1.0"

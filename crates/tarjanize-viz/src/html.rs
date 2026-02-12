@@ -1,6 +1,6 @@
 //! HTML generation via askama template rendering.
 //!
-//! The JS source files (`logic.js`, `renderer.js`) are proper ES modules for
+//! The TS source files (`logic.ts`, `renderer.ts`) are proper ES modules for
 //! testability. At build time, `build.rs` runs esbuild to bundle them into a
 //! single module (`bundle.js`). This module inlines the bundle and CSS into
 //! the askama template, producing a self-contained HTML file whose only
@@ -13,8 +13,8 @@ use askama::Template;
 use crate::data::ScheduleData;
 use crate::error::VizError;
 
-/// Bundled JS produced by esbuild during `build.rs`. Contains renderer.js
-/// with logic.js inlined, pixi.js kept as an external import.
+/// Bundled JS produced by esbuild during `build.rs`. Contains renderer.ts
+/// with logic.ts inlined, pixi.js kept as an external import.
 const BUNDLE_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/bundle.js"));
 
 /// Raw CSS, included at compile time. A single file with no imports, so no

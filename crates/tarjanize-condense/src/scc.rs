@@ -7,6 +7,7 @@
 //! 4. Build output `SymbolGraph` with new crate structure
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use indexmap::IndexSet;
 use petgraph::algo::condensation;
@@ -656,7 +657,7 @@ fn build_output_graph(
         let mut regression_data: Vec<Vec<f64>> = Vec::new();
         for (pkg, p) in &original_graph.packages {
             for (tgt, crate_data) in &p.targets {
-                let wall = crate_data.timings.wall_time_ms;
+                let wall = crate_data.timings.wall_time.as_secs_f64() * 1000.0;
                 if wall <= 0.0 {
                     continue;
                 }
@@ -745,7 +746,7 @@ fn build_output_graph(
 
         let crate_data = Crate {
             timings: TargetTimings {
-                wall_time_ms,
+                wall_time: Duration::from_secs_f64(wall_time_ms / 1000.0),
                 ..Default::default()
             },
             root: root_module,
@@ -1651,11 +1652,11 @@ mod tests {
         let pkg = result.packages.values().next().unwrap();
         let timings = &get_synthetic(pkg).timings;
 
-        // wall_time_ms = sum of all symbol event_times_ms = 100 + 200 = 300
+        // wall_time = sum of all symbol event_times_ms = 100 + 200 = 300
+        let wall_ms = timings.wall_time.as_secs_f64() * 1000.0;
         assert!(
-            (timings.wall_time_ms - 300.0).abs() < 0.01,
-            "Expected wall_time_ms ~300, got {}",
-            timings.wall_time_ms
+            (wall_ms - 300.0).abs() < 0.01,
+            "Expected wall_time ~300ms, got {wall_ms}",
         );
     }
 
@@ -1730,12 +1731,11 @@ mod tests {
             assert_eq!(root.symbols.len(), 1);
 
             let symbol = root.symbols.values().next().unwrap();
+            let wall_ms = timings.wall_time.as_secs_f64() * 1000.0;
             assert!(
-                (timings.wall_time_ms
-                    - sum_event_times(&symbol.event_times_ms))
-                .abs()
+                (wall_ms - sum_event_times(&symbol.event_times_ms)).abs()
                     < 0.01,
-                "wall_time_ms should match symbol total event_times_ms"
+                "wall_time should match symbol total event_times_ms"
             );
         }
     }
@@ -1788,7 +1788,7 @@ mod tests {
             );
             let crate_data = Crate {
                 timings: TargetTimings {
-                    wall_time_ms: wall,
+                    wall_time: Duration::from_secs_f64(wall / 1000.0),
                     event_times_ms: HashMap::from([
                         ("metadata_decode_entry_foo".to_string(), meta),
                         ("check_mod_type_wf".to_string(), other),
@@ -1835,7 +1835,7 @@ mod tests {
             timings: TargetTimings {
                 // attr = 100 + 50 = 150, meta = 20, other = 10
                 // wall = 2*150 + 3*20 + 1.5*10 = 375
-                wall_time_ms: 375.0,
+                wall_time: Duration::from_secs_f64(375.0 / 1000.0),
                 event_times_ms: HashMap::from([
                     ("metadata_decode_entry_foo".to_string(), 20.0),
                     ("check_mod_type_wf".to_string(), 10.0),
@@ -1896,17 +1896,16 @@ mod tests {
         //
         // Without the model, wall would just be attr = 150. Verify we get
         // the model-based prediction instead.
+        let wall_ms = timings.wall_time.as_secs_f64() * 1000.0;
         assert!(
-            timings.wall_time_ms > 200.0,
+            wall_ms > 200.0,
             "Model-based prediction should be higher than raw attr (150); \
-             got {}",
-            timings.wall_time_ms
+             got {wall_ms}",
         );
         assert!(
-            (timings.wall_time_ms - 375.0).abs() < 1.0,
-            "Expected wall_time_ms ~375 from model \
-             (2*150 + 3*20 + 1.5*10), got {}",
-            timings.wall_time_ms
+            (wall_ms - 375.0).abs() < 1.0,
+            "Expected wall_time ~375ms from model \
+             (2*150 + 3*20 + 1.5*10), got {wall_ms}",
         );
     }
 
@@ -1994,10 +1993,10 @@ mod tests {
             let root = get_root(pkg);
             if root.symbols.contains_key("c") {
                 let timings = &get_synthetic(pkg).timings;
+                let wall_ms = timings.wall_time.as_secs_f64() * 1000.0;
                 assert!(
-                    (timings.wall_time_ms - 60.0).abs() < 1.0,
-                    "Expected wall_time_ms ~60 from CostModel, got {}",
-                    timings.wall_time_ms
+                    (wall_ms - 60.0).abs() < 1.0,
+                    "Expected wall_time ~60ms from CostModel, got {wall_ms}",
                 );
             }
         }

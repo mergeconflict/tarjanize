@@ -378,7 +378,7 @@ fn extract_predictors(symbol_graph: &SymbolGraph) -> Vec<TargetPredictors> {
                 .filter(|(k, _)| !k.starts_with("metadata_decode_"))
                 .map(|(_, v)| v)
                 .sum();
-            let wall = target_data.timings.wall_time_ms;
+            let wall = target_data.timings.wall_time.as_secs_f64() * 1000.0;
             let symbol_count = count_symbols_in_module(&target_data.root);
 
             targets.push(TargetPredictors {
@@ -461,6 +461,7 @@ fn truncate_name(name: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use tarjanize_schemas::{
         Package, Symbol, SymbolKind, TargetTimings, Visibility,
@@ -525,7 +526,7 @@ mod tests {
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time_ms: wall,
+                        wall_time: Duration::from_secs_f64(wall / 1000.0),
                         event_times_ms,
                     },
                 ),
@@ -679,7 +680,7 @@ mod tests {
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time_ms: wall,
+                        wall_time: Duration::from_secs_f64(wall / 1000.0),
                         event_times_ms,
                     },
                 ),
@@ -699,7 +700,7 @@ mod tests {
             "test".to_string(),
             tarjanize_schemas::Crate {
                 timings: TargetTimings {
-                    wall_time_ms: 250.0,
+                    wall_time: Duration::from_secs_f64(250.0 / 1000.0),
                     event_times_ms: test_event_times,
                 },
                 root: Module {
@@ -956,7 +957,7 @@ mod tests {
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time_ms: wall,
+                        wall_time: Duration::from_secs_f64(wall / 1000.0),
                         event_times_ms,
                     },
                 ),
@@ -976,7 +977,7 @@ mod tests {
             "test".to_string(),
             tarjanize_schemas::Crate {
                 timings: TargetTimings {
-                    wall_time_ms: 250.0,
+                    wall_time: Duration::from_secs_f64(250.0 / 1000.0),
                     event_times_ms: test_event_times,
                 },
                 root: Module {
