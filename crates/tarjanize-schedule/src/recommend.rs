@@ -17,7 +17,9 @@ use std::hash::BuildHasher;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tarjanize_schemas::{CostModel, Module, SymbolGraph, serde_duration};
+use tarjanize_schemas::{
+    CostModel, Module, SymbolGraph, Target, TargetTimings, serde_duration,
+};
 
 use crate::data::ScheduleData;
 use crate::schedule::{TargetGraph, compute_schedule};
@@ -552,7 +554,7 @@ pub fn shatter_target(
     symbol_graph: &SymbolGraph,
     target_id: &str,
     schedule: &ScheduleData,
-) -> Option<ScheduleData> {
+) -> Option<(ScheduleData, SymbolGraph)> {
     let intra = condense_target(symbol_graph, target_id).or_else(|| {
         eprintln!("shatter {target_id}: condense_target returned None");
         None
@@ -619,6 +621,18 @@ pub fn shatter_target(
         .saturating_sub(scc_syms);
     group_sym_counts[0] += extra;
 
+    // Build a modified SymbolGraph with group targets so that
+    // /api/tree can resolve shattered names like `lib::group_0`.
+    let modified_graph = build_shattered_symbol_graph(
+        symbol_graph,
+        target_id,
+        &target_prefix,
+        &intra,
+        &scc_to_group,
+        group_count,
+        &group_costs,
+    );
+
     let tg = build_shattered_target_graph(
         symbol_graph,
         target_id,
@@ -641,7 +655,7 @@ pub fn shatter_target(
         "shatter {target_id}: success, new schedule has {} targets",
         tg.names.len()
     );
-    Some(compute_schedule(&tg))
+    Some((compute_schedule(&tg), modified_graph))
 }
 
 /// Builds the `TargetGraph` for a horizon-shattered target.
@@ -822,6 +836,92 @@ fn group_sccs_by_horizon(horizons: &[Duration]) -> (Vec<usize>, usize) {
 
     let group_count = distinct.len();
     (scc_to_group, group_count)
+}
+
+/// Builds a modified `SymbolGraph` reflecting a horizon-shattered target.
+///
+/// Clones the original graph, then replaces the shattered target with
+/// one target per horizon group. Each group target contains only the
+/// symbols from its member SCCs, moved from the original target's module
+/// tree using the `export` helpers. The original target is removed.
+///
+/// This ensures `/api/tree/{pkg}/{target}::group_N` resolves correctly
+/// after shattering.
+fn build_shattered_symbol_graph(
+    symbol_graph: &SymbolGraph,
+    target_id: &str,
+    target_prefix: &str,
+    intra: &IntraTargetGraph,
+    scc_to_group: &[usize],
+    group_count: usize,
+    group_costs: &[Duration],
+) -> SymbolGraph {
+    use crate::export::{
+        insert_symbol_into_module, parse_symbol_path,
+        remove_symbol_from_module,
+    };
+
+    let mut graph = symbol_graph.clone();
+
+    let Some((pkg_name, target_key)) = target_id.split_once('/') else {
+        return graph;
+    };
+
+    // Create empty group targets up front.
+    let mut group_roots: Vec<Module> = (0..group_count)
+        .map(|_| Module::default())
+        .collect();
+
+    // Move symbols from the original target into group module trees.
+    let Some(pkg) = graph.packages.get_mut(pkg_name) else {
+        return graph;
+    };
+    let Some(source_target) = pkg.targets.get_mut(target_key) else {
+        return graph;
+    };
+
+    for node in &intra.nodes {
+        let group = scc_to_group[node.id];
+        for sym_path in &node.symbols {
+            let Some((mod_segments, sym_name)) =
+                parse_symbol_path(sym_path, target_prefix)
+            else {
+                continue;
+            };
+            // Remove from original target and insert into group target.
+            if let Some(symbol) = remove_symbol_from_module(
+                &mut source_target.root,
+                &mod_segments,
+                &sym_name,
+            ) {
+                insert_symbol_into_module(
+                    &mut group_roots[group],
+                    &mod_segments,
+                    sym_name,
+                    symbol,
+                );
+            }
+        }
+    }
+
+    // Remove the original target and insert group targets.
+    let original_deps = source_target.dependencies.clone();
+    pkg.targets.remove(target_key);
+
+    for (g, root) in group_roots.into_iter().enumerate() {
+        let group_key = format!("{target_key}::group_{g}");
+        let group_target = Target {
+            timings: TargetTimings {
+                wall_time: group_costs[g],
+                event_times_ms: HashMap::new(),
+            },
+            dependencies: original_deps.clone(),
+            root,
+        };
+        pkg.targets.insert(group_key, group_target);
+    }
+
+    graph
 }
 
 /// Adds inter-group edges derived from the SCC DAG.

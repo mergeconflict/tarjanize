@@ -51,7 +51,7 @@ pub async fn run_server(mut input: impl Read) -> Result<(), VizError> {
         tarjanize_schedule::schedule::compute_schedule(&target_graph);
 
     let state = Arc::new(server::AppState {
-        symbol_graph,
+        symbol_graph: RwLock::new(symbol_graph),
         base_target_graph: target_graph,
         cost_model,
         schedule: RwLock::new(schedule),

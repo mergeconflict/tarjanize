@@ -176,7 +176,7 @@ pub fn export_symbol_graph(
 ///
 /// Returns `None` if the path doesn't start with the expected prefix or
 /// has no symbol name after stripping the prefix.
-fn parse_symbol_path(
+pub(crate) fn parse_symbol_path(
     path: &str,
     target_prefix: &str,
 ) -> Option<(Vec<String>, String)> {
@@ -198,7 +198,7 @@ fn parse_symbol_path(
 /// Returns the removed `Symbol` if found, or `None` if the module path
 /// or symbol name doesn't exist. This is a destructive operation on the
 /// source tree — the symbol is gone after removal.
-fn remove_symbol_from_module(
+pub(crate) fn remove_symbol_from_module(
     root: &mut Module,
     mod_segments: &[String],
     sym_name: &str,
@@ -216,7 +216,7 @@ fn remove_symbol_from_module(
 /// This mirrors the module path structure from the source target so the
 /// new target's module tree matches the original layout of the moved
 /// symbols.
-fn insert_symbol_into_module(
+pub(crate) fn insert_symbol_into_module(
     root: &mut Module,
     mod_segments: &[String],
     sym_name: String,

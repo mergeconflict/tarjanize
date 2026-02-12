@@ -27,8 +27,7 @@ const STYLE_CSS: &str = include_str!("../templates/style.css");
 /// Sidebar JS bundle produced by esbuild during `build.rs`. Contains
 /// sidebar.ts with tree.ts inlined, IIFE format to avoid variable
 /// collisions with the ESM renderer bundle.
-const SIDEBAR_JS: &str =
-    include_str!(concat!(env!("OUT_DIR"), "/sidebar.js"));
+const SIDEBAR_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/sidebar.js"));
 
 /// The index HTML page, served as-is. Contains no template syntax -- all
 /// assets are loaded via `<link>` and `<script>` tags pointing to the
@@ -44,7 +43,9 @@ const INDEX_HTML: &str = include_str!("../templates/app.html");
 pub struct AppState {
     /// The original symbol graph, retained for intra-target SCC
     /// condensation when the user drills into a specific target.
-    pub symbol_graph: SymbolGraph,
+    /// Wrapped in `RwLock` because `shatter_handler` updates it with
+    /// group targets so that `/api/tree` can resolve shattered names.
+    pub symbol_graph: RwLock<SymbolGraph>,
     /// The base target graph (unsplit), built once at startup from the
     /// symbol graph and cost model.
     pub base_target_graph: TargetGraph,
@@ -63,7 +64,15 @@ pub struct AppState {
 impl std::fmt::Debug for AppState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
-            .field("symbol_graph_packages", &self.symbol_graph.packages.len())
+            .field(
+                "symbol_graph_packages",
+                &self
+                    .symbol_graph
+                    .read()
+                    .expect("symbol_graph lock poisoned")
+                    .packages
+                    .len(),
+            )
             .field(
                 "base_target_graph_targets",
                 &self.base_target_graph.names.len(),
@@ -121,10 +130,8 @@ async fn css_handler() -> ([(&'static str, &'static str); 1], &'static str) {
 }
 
 /// Serves the Gantt renderer JS bundle (ESM) with the correct content type.
-async fn bundle_js_handler() -> (
-    [(&'static str, &'static str); 1],
-    &'static str,
-) {
+async fn bundle_js_handler() -> ([(&'static str, &'static str); 1], &'static str)
+{
     (
         [("content-type", "application/javascript; charset=utf-8")],
         BUNDLE_JS,
@@ -132,10 +139,8 @@ async fn bundle_js_handler() -> (
 }
 
 /// Serves the sidebar JS bundle (IIFE) with the correct content type.
-async fn sidebar_js_handler() -> (
-    [(&'static str, &'static str); 1],
-    &'static str,
-) {
+async fn sidebar_js_handler()
+-> ([(&'static str, &'static str); 1], &'static str) {
     (
         [("content-type", "application/javascript; charset=utf-8")],
         SIDEBAR_JS,
@@ -168,10 +173,11 @@ async fn splits_handler(
     )>,
 ) -> Json<tarjanize_schedule::recommend::SplitRecommendation> {
     let target_id = format!("{package}/{target}");
+    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
     let schedule = state.schedule.read().expect("schedule lock poisoned");
     Json(
         tarjanize_schedule::recommend::compute_split_recommendations(
-            &state.symbol_graph,
+            &sg,
             &target_id,
             &schedule,
             state.cost_model.as_ref(),
@@ -194,8 +200,8 @@ async fn tree_handler(
         String,
     )>,
 ) -> Result<Json<tarjanize_schemas::Target>, axum::http::StatusCode> {
-    let pkg = state
-        .symbol_graph
+    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
+    let pkg = sg
         .packages
         .get(&package)
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
@@ -219,19 +225,29 @@ async fn shatter_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShatterRequest>,
 ) -> Result<Json<ScheduleData>, axum::http::StatusCode> {
-    let new_schedule = {
+    let (new_schedule, new_graph) = {
+        let sg = state
+            .symbol_graph
+            .read()
+            .expect("symbol_graph lock poisoned");
         let schedule = state.schedule.read().expect("schedule lock poisoned");
         tarjanize_schedule::recommend::shatter_target(
-            &state.symbol_graph,
+            &sg,
             &req.target_id,
             &schedule,
         )
         .ok_or(axum::http::StatusCode::NOT_FOUND)?
     };
 
-    // Persist the shattered schedule so subsequent operations build on it.
+    // Persist both the shattered schedule and the updated symbol graph
+    // so subsequent operations (including /api/tree) resolve group names.
     let mut schedule = state.schedule.write().expect("schedule lock poisoned");
     *schedule = new_schedule.clone();
+    let mut sg = state
+        .symbol_graph
+        .write()
+        .expect("symbol_graph lock poisoned");
+    *sg = new_graph;
 
     Ok(Json(new_schedule))
 }
@@ -243,7 +259,8 @@ async fn shatter_handler(
 async fn export_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<SymbolGraph> {
-    Json(state.symbol_graph.clone())
+    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
+    Json(sg.clone())
 }
 
 #[cfg(test)]
@@ -274,7 +291,7 @@ mod tests {
             },
         };
         let state = Arc::new(AppState {
-            symbol_graph: SymbolGraph::default(),
+            symbol_graph: RwLock::new(SymbolGraph::default()),
             base_target_graph: tarjanize_schedule::schedule::TargetGraph {
                 names: Default::default(),
                 costs: Vec::new(),
@@ -344,7 +361,7 @@ mod tests {
         let schedule = tarjanize_schedule::schedule::compute_schedule(&tg);
 
         Arc::new(AppState {
-            symbol_graph: sg,
+            symbol_graph: RwLock::new(sg),
             base_target_graph: tg,
             cost_model: None,
             schedule: RwLock::new(schedule),
@@ -608,7 +625,7 @@ mod tests {
         let schedule = tarjanize_schedule::schedule::compute_schedule(&tg);
 
         let state = Arc::new(AppState {
-            symbol_graph: sg,
+            symbol_graph: RwLock::new(sg),
             base_target_graph: tg,
             cost_model: None,
             schedule: RwLock::new(schedule),
@@ -635,5 +652,97 @@ mod tests {
             tgt.root.symbols.contains_key("main"),
             "should return the bin/main target's symbols"
         );
+    }
+
+    /// After shattering a target, `GET /api/tree/{pkg}/{target}::group_N`
+    /// should return 200 with the symbols that belong to that group.
+    ///
+    /// This is the core regression test: before the fix, shattered group
+    /// names were not present in the `SymbolGraph`, causing 404 errors
+    /// when the frontend tried to display the module tree for a group.
+    #[tokio::test]
+    async fn api_tree_returns_group_after_shatter() {
+        let state = test_state();
+
+        // Step 1: Shatter test-pkg/lib into horizon groups.
+        let shatter_body = serde_json::json!({
+            "target_id": "test-pkg/lib",
+        });
+        let app = build_router(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/shatter")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::to_vec(&shatter_body).unwrap(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "shatter should succeed");
+
+        // Step 2: Find the group target names from the shattered schedule.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let schedule: tarjanize_schedule::data::ScheduleData =
+            serde_json::from_slice(&body).unwrap();
+        let group_targets: Vec<&str> = schedule
+            .targets
+            .iter()
+            .filter(|t| t.name.contains("::group_"))
+            .map(|t| t.name.as_str())
+            .collect();
+        assert!(
+            !group_targets.is_empty(),
+            "shattered schedule must contain group targets"
+        );
+
+        // Step 3: Request /api/tree for the first group target.
+        // Group names are like "test-pkg/lib::group_0". The URL
+        // splits as package="test-pkg", target="lib::group_0".
+        let group_name = group_targets[0];
+        let tree_uri = format!("/api/tree/{group_name}");
+        let app = build_router(Arc::clone(&state));
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(&tree_uri)
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resp.status(),
+            200,
+            "GET /api/tree for group target '{group_name}' should return 200"
+        );
+
+        // Step 4: Verify the response is a valid Target with symbols.
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let target: tarjanize_schemas::Target =
+            serde_json::from_slice(&body)
+                .expect("response should be valid Target JSON");
+
+        // The group should have at least one symbol (the test fixture
+        // has Foo and Bar; they share horizon 0 so both land in group_0).
+        let sym_count = count_symbols_in_module(&target.root);
+        assert!(
+            sym_count > 0,
+            "group target should contain symbols, got 0"
+        );
+    }
+
+    /// Recursively counts symbols in a module tree.
+    fn count_symbols_in_module(module: &tarjanize_schemas::Module) -> usize {
+        module.symbols.len()
+            + module
+                .submodules
+                .values()
+                .map(count_symbols_in_module)
+                .sum::<usize>()
     }
 }

@@ -2,13 +2,12 @@
 //!
 //! The build process has two steps:
 //!
-//! 1. **Profile build** (optional, skipped with `--no-profile`):
-//!    Run `cargo +nightly check` with `-Zself-profile` but NO `RUSTC_WRAPPER`.
-//!    Produces clean profile data without extraction overhead.
-//!
-//! 2. **Extraction check**:
-//!    Run `cargo check` with `RUSTC_WRAPPER` to extract symbols.
-//!    Profile data (if collected) is merged with extracted symbols.
+//! 1. Run `cargo check --all-targets` with `RUSTC_WRAPPER` set to our binary.
+//! 2. For each workspace crate, the driver adds `-Zself-profile` flags,
+//!    extracts symbols via `after_analysis`, applies costs from profile data,
+//!    and deletes raw profile files immediately.
+//! 3. After all crates compile, the orchestrator aggregates per-crate JSON
+//!    results into a single `SymbolGraph`.
 //!
 //! We use `cargo check` instead of `cargo build` because we only need frontend
 //! compilation data (type checking, trait resolution, MIR optimization). The
@@ -30,7 +29,7 @@ use crate::driver::CrateResult;
 use crate::{Cli, ENV_VERBOSITY};
 
 /// Configuration for running cargo check.
-/// Bundles all the parameters needed by `run_profile_build` and `run_extraction_build`.
+/// Bundles all the parameters needed by `run_build`.
 struct BuildConfig<'a> {
     manifest_path: &'a Path,
     manifest_dir: &'a Path,

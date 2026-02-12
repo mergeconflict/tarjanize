@@ -44,7 +44,6 @@ tempfile = "3"
 # Web server
 axum = "0.8"
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
-tower-http = { version = "0.6", features = ["fs"] }
 open = "5"
 
 # Performance

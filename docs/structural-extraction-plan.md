@@ -1,5 +1,12 @@
 # Structural Extraction Plan
 
+**Status: Implemented.** All implementation steps (1-6) below have been
+completed. The event-based cost model is the production approach. This
+document is retained as design rationale — it explains *why* the cost model
+works and documents the validation results.
+
+---
+
 Extract per-symbol structural properties during `cargo tarjanize` that predict
 compilation wall-clock time, enabling cost prediction for synthetic targets
 produced by `tarjanize condense`.
@@ -71,9 +78,8 @@ Where:
 - `b` ≈ 2.8x (median across workspaces, range 1.2-5.2)
 
 Note: the `a` and `b` coefficients above were fitted against target-level
-event sums (correct per-target totals). Once the descendant aggregation bug
-is fixed, `Σ(symbol_attr)` should match those sums, and the fitted
-coefficients should be similar.
+event sums (correct per-target totals). The descendant aggregation bug has
+been fixed, so `Σ(symbol_attr)` now matches those sums.
 
 No constant term is needed — a target with zero code and zero dependencies
 has zero compilation time. The two coefficients `a` and `b` are fitted
@@ -112,11 +118,8 @@ they're correlated overhead. The two coefficients `a` and `b` absorb this
 proportional overhead.
 
 Note: The validation above used target-level event sums (correct per-target
-totals), not per-symbol `event_times_ms` (which is currently broken due to
-the descendant aggregation bug — see "Descendant DefPath aggregation" in
-Resolved Questions). Fixing the bug will make per-symbol attribution accurate,
-but the per-target regression results above remain valid regardless since they
-use the correct event-level sums.
+totals). The descendant aggregation bug has since been fixed, so per-symbol
+`event_times_ms` attribution is now accurate.
 
 ### Schema
 
@@ -181,7 +184,7 @@ and `tarjanize condense` can use it. The function takes a slice of
 `(symbol_attr_sum, metadata_decode_sum, wall_time_ms)` triples and returns
 `(a, b, r_squared)`.
 
-## Implementation Order
+## Implementation Order (all completed)
 
 1. **Fix descendant DefPath aggregation** (`profile.rs`): Rewrite
    `normalize_frontend_path` to peel all internal DefPath segments (generic
@@ -237,10 +240,9 @@ in `event_times_ms` at query time — no dedicated field needed. For synthetic
 targets after condense, use the max across constituent targets. This replaces
 the earlier `dep_count` proxy approach and is both simpler and more accurate.
 
-### Descendant DefPath aggregation (bug fix required)
+### Descendant DefPath aggregation (fixed)
 
-The entire cost model depends on `Symbol.event_times_ms` (currently
-Symbol.frontend_cost_ms) being the correct
+The entire cost model depends on `Symbol.event_times_ms` being the correct
 attribution of DefPath-bearing event self-times per symbol.
 `normalize_frontend_path` in
 `profile.rs` is responsible for rolling descendant DefPaths up to their parent
@@ -362,12 +364,10 @@ Tests should assert on **specific event keys**, not just the sum:
 This catches regressions where a rustc update adds/removes/renames
 events — the test will fail if expected events disappear.
 
-### Integration tests: schema changes
+### Integration tests: schema changes (done)
 
-Existing integration tests reference `frontend_cost_ms`. After replacing
-it with `event_times_ms: HashMap<String, f64>`, these references must be
-updated to check the map instead. Same for `tarjanize-cost` unit tests
-referencing `frontend_cost_ms`, `frontend_wall_ms`, and `event_costs`.
+Schema migration from `frontend_cost_ms` to `event_times_ms: HashMap<String,
+f64>` is complete. All integration tests use the new field names.
 
 ### Cross-workspace validation
 

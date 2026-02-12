@@ -29,14 +29,11 @@ This project uses [jj (Jujutsu)](https://github.com/martinvonz/jj) for version c
 ```
 cargo tarjanize        → symbol_graph.json             Extract symbol graph from workspace
 tarjanize cost         → report + cost_model.json       Fit cost model, critical path analysis
-tarjanize viz          → interactive HTML               Visualize the original build schedule
+tarjanize viz          → localhost web server            Interactive split explorer
 tarjanize condense     → optimized_symbol_graph.json    SCC + partition + reorganize
-tarjanize viz          → interactive HTML               Visualize the condensed build schedule
 ```
 
-`cargo tarjanize` extracts symbols and dependencies from a Rust workspace via a custom rustc driver. `tarjanize cost` fits a MAGSAC++ regression model to profile data and reports the critical path. `tarjanize viz` generates an interactive PixiJS Gantt chart of the build schedule. `tarjanize condense` computes SCCs, merges them via union-find (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`.
-
-See PLAN.md for the full specification and future phases.
+`cargo tarjanize` extracts symbols and dependencies from a Rust workspace via a custom rustc driver. `tarjanize cost` fits a MAGSAC++ regression model to profile data and reports the critical path. `tarjanize viz` starts an interactive web server for exploring the build schedule and evaluating split recommendations. `tarjanize condense` computes SCCs, merges them via union-find (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`.
 
 ## Code Style
 
@@ -89,20 +86,30 @@ tarjanize/
     │   └── src/
     │       └── lib.rs         # fit_magsac(), fit_magsac_with_params()
     │
-    └── tarjanize-viz/         # Interactive HTML build schedule visualization
+    ├── tarjanize-schedule/    # Build schedule computation (shared primitives)
+    │   └── src/
+    │       ├── lib.rs         # auto_fit_cost_model(), build_target_graph()
+    │       ├── data.rs        # ScheduleData, Summary, TargetData
+    │       ├── schedule.rs    # Forward/backward DP, critical path, swim lanes
+    │       ├── target_graph.rs # TargetGraph construction from SymbolGraph
+    │       ├── split.rs       # Target splitting (shatter) analysis
+    │       ├── recommend.rs   # Split recommendations
+    │       ├── heatmap.rs     # Cost heatmap data
+    │       └── export.rs      # Export modified SymbolGraph
+    │
+    └── tarjanize-viz/         # Interactive split explorer web server
         └── src/
-            ├── lib.rs         # Public API: run()
-            ├── data.rs        # ScheduleData, TargetData structures
+            ├── lib.rs         # Public API: run_server()
+            ├── data.rs        # Re-exports from tarjanize-schedule
             ├── error.rs       # VizError
-            ├── html.rs        # Askama HTML template generation
-            └── schedule.rs    # Forward/backward DP, swim lane packing
+            └── server.rs      # Axum HTTP server, JSON API handlers
 ```
 
 ## Crate Details
 
 **cargo-tarjanize** (binary)
 - **main.rs** - Detects mode (orchestrator vs driver) and dispatches
-- **orchestrator.rs** - Runs `cargo check` with `RUSTC_WRAPPER` set to this binary. Two-pass strategy: clean profile pass with `-Zself-profile`, then extraction pass
+- **orchestrator.rs** - Runs `cargo check` with `RUSTC_WRAPPER` set to this binary. Single-pass: profiling, extraction, and cleanup all happen in one invocation
 - **driver.rs** - Custom rustc driver that runs extraction callbacks in `after_analysis`
 - **extract.rs** - Walks rustc's HIR and THIR to extract symbols and dependencies
 - **profile.rs** - Parses `-Zself-profile` output for accurate compilation costs
@@ -126,15 +133,25 @@ tarjanize/
 **tarjanize-magsac** (library)
 - **lib.rs** - MAGSAC++ robust regression: `fit_magsac()`, `fit_magsac_with_params()`. Sigma consensus for outlier-robust fitting without manual threshold tuning
 
+**tarjanize-schedule** (library)
+- **lib.rs** - `auto_fit_cost_model()`, `build_target_graph()`, `collect_frontend_cost()`
+- **data.rs** - `ScheduleData`, `Summary`, `TargetData` structures
+- **schedule.rs** - Forward/backward DP for critical path, swim lane packing
+- **target_graph.rs** - `TargetGraph` construction from `SymbolGraph` + `CostModel`
+- **split.rs** - Target splitting (shatter) analysis for what-if scenarios
+- **recommend.rs** - Horizon-based split recommendations for critical path reduction
+- **heatmap.rs** - Cost heatmap data for visualization
+- **export.rs** - Export modified `SymbolGraph` after splits
+
 **tarjanize-viz** (library)
-- **lib.rs** - `run()` generates self-contained HTML with PixiJS canvas Gantt chart
-- **schedule.rs** - Forward/backward DP for critical path, swim lane packing for parallelism visualization
+- **lib.rs** - `run_server()` starts interactive split explorer web server
+- **server.rs** - Axum HTTP server with JSON API (schedule, splits, shatter, tree, export endpoints)
 
 ## Key Patterns
 
 **Rustc Driver**: `cargo-tarjanize` acts as a `RUSTC_WRAPPER`, intercepting rustc invocations. For workspace crates, it runs our extraction callbacks in `after_analysis`. For external crates, it passes through to normal compilation.
 
-**Two-Pass Profiling**: The orchestrator runs two separate `cargo check` passes — first a clean nightly build with `-Zself-profile` (no extraction overhead), then an extraction pass with the RUSTC_WRAPPER. This avoids 10-15x cost inflation from extraction callbacks.
+**Inline Profiling**: The driver adds `-Zself-profile` flags to rustc for workspace crates, then processes profile data after compilation completes in the same pass. This avoids two separate cargo check invocations while still getting clean per-event timing data.
 
 **THIR Analysis**: Uses THIR (Typed High-level IR) for body analysis because it preserves source-level information (static refs, named consts, const patterns) that MIR loses.
 
@@ -166,10 +183,8 @@ Workspace-level lint configuration follows [M-STATIC-VERIFICATION](https://micro
 
 Read these docs for deeper context on specific topics:
 
-- **[PLAN.md](PLAN.md)** — Full project specification: algorithm details, optimality proofs, phase design
 - **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R^2=0.856 accuracy, per-symbol cost skew, and why only lib targets matter for critical path
 - **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). tarjanize only tracks frontend costs
 - **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties drive compilation time
-- **[docs/external-profile-plan.md](docs/external-profile-plan.md)** — Two-pass profiling plan to fix extraction callback overhead
-- **[docs/critical-path-pruning.md](docs/critical-path-pruning.md)** — Algorithm for identifying unnecessary edges in dependency DAG
-- **[scripts/README.md](scripts/README.md)** — Python analysis scripts for comparing model predictions vs actual cargo build times
+- **[docs/structural-extraction-plan.md](docs/structural-extraction-plan.md)** — Event-based cost model design: per-symbol attribution, two-term regression, validation results
+
