@@ -80,23 +80,60 @@ window.addEventListener('target-click', async (event: Event) => {
     const treeResp = await fetch(treeUrl);
     if (!treeResp.ok) return;
 
-    const targetData = await treeResp.json();
+    const { target, symbol_costs } = await treeResp.json();
 
     // Show the panel.
     const recsDiv = document.getElementById('recommendations')!;
     recsDiv.style.display = '';
 
-    // Compute total cost from the module tree.
-    const totalCost = moduleCost(targetData.root);
+    // Compute total cost components.
+    // Attr: Sum of all symbol costs in the tree.
+    // Meta: Sum of metadata_decode_* events in the target timings.
+    // Other: Sum of remaining events in the target timings.
+    
+    // Helper to calculate attr cost from the module tree
+    function calculateAttrCost(mod: any): number {
+      let cost = 0;
+      for (const sym of Object.values(mod.symbols || {})) {
+        if ((sym as any).event_times_ms) {
+          cost += Object.values((sym as any).event_times_ms).reduce((a: any, b: any) => a + b, 0);
+        }
+      }
+      for (const sub of Object.values(mod.submodules || {})) {
+        cost += calculateAttrCost(sub);
+      }
+      return cost;
+    }
+    const totalAttr = calculateAttrCost(target.root);
 
-    // Render the header with target name and cost.
+    // Calculate Meta and Other from target timings
+    let totalMeta = 0;
+    let totalOther = 0;
+    if (target.timings && target.timings.event_times_ms) {
+      for (const [key, val] of Object.entries(target.timings.event_times_ms)) {
+        const v = val as number;
+        if (key.startsWith('metadata_decode_')) {
+          totalMeta += v;
+        } else {
+          totalOther += v;
+        }
+      }
+    }
+    
+    // Total cost is the sum of components.
+    const totalCost = totalAttr + totalMeta + totalOther;
+
+    // Render the header with target name and detailed cost breakdown.
     document.getElementById('rec-header')!.innerHTML =
       `<span class="rec-target-name">${name}</span>` +
-      `<br><span class="rec-cost">Cost: ${fmt(totalCost)}</span>`;
+      `<br><span class="rec-cost">Total: ${fmt(totalCost)}</span>` +
+      `<br><span class="rec-cost-detail" title="Attribute Cost">Attr: ${fmt(totalAttr)}</span>` +
+      `<br><span class="rec-cost-detail" title="Metadata Cost">Meta: ${fmt(totalMeta)}</span>` +
+      `<br><span class="rec-cost-detail" title="Other Cost">Other: ${fmt(totalOther)}</span>`;
 
     // Render the module/symbol tree.
     const listDiv = document.getElementById('rec-list')!;
-    listDiv.innerHTML = renderModuleTree('', targetData.root, 0);
+    listDiv.innerHTML = renderModuleTree('', target.root, 0, '', symbol_costs);
     wireTreeToggles(listDiv);
   } catch (_err) {
     // Network error -- silently ignore.

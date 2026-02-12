@@ -134,6 +134,12 @@ body {
   font-size: 12px;
 }
 
+#rec-header .rec-cost-detail {
+  color: #666;
+  font-size: 11px;
+  margin-left: 8px;
+}
+
 /* ---------------------------------------------------------------------------
  * Module/symbol tree
  * ------------------------------------------------------------------------ */
@@ -306,7 +312,7 @@ body {
   background: #66bb6a;
 }
 
-/* "Shatter by horizon" button in the recommendations panel. Groups the
+/* "Shatter" button in the recommendations panel. Groups the
  * target's SCCs by effective horizon and replaces the original target
  * with one target per horizon group. Orange to distinguish from green save. */
 #shatter-btn {

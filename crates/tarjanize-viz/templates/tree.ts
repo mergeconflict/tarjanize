@@ -8,8 +8,19 @@
 // Cost and count helpers
 // -----------------------------------------------------------------------
 
-/** Compute total cost for a symbol by summing its event_times_ms values. */
-export function symbolCost(sym: any): number {
+/** Compute total cost for a symbol using the breakdown map if available. */
+export function symbolTotalCost(
+  name: string,
+  sym: any,
+  path: string,
+  costs: any
+): number {
+  if (costs) {
+    const fullPath = path ? `${path}::${name}` : name;
+    const c = costs[fullPath];
+    if (c) return c.attr + c.meta_share + c.other_share;
+  }
+  // Fallback: sum raw events (attr only)
   if (!sym.event_times_ms) return 0;
   return Object.values(sym.event_times_ms).reduce(
     (a: number, b: number) => a + b,
@@ -17,14 +28,15 @@ export function symbolCost(sym: any): number {
   );
 }
 
-/** Compute aggregate cost for a module (recursive sum of all symbols). */
-export function moduleCost(mod_: any): number {
+/** Compute aggregate cost for a module using the breakdown map. */
+export function moduleCost(mod_: any, path: string, costs: any): number {
   let cost = 0;
-  for (const sym of Object.values(mod_.symbols || {})) {
-    cost += symbolCost(sym);
+  for (const [name, sym] of Object.entries(mod_.symbols || {})) {
+    cost += symbolTotalCost(name as string, sym, path, costs);
   }
-  for (const sub of Object.values(mod_.submodules || {})) {
-    cost += moduleCost(sub);
+  for (const [name, sub] of Object.entries(mod_.submodules || {})) {
+    const childPath = path ? `${path}::${name}` : name;
+    cost += moduleCost(sub, childPath, costs);
   }
   return cost;
 }
@@ -90,19 +102,53 @@ export function fmt(ms: number): string {
 export function renderModuleTree(
   name: string,
   mod_: any,
-  depth: number
+  depth: number,
+  path: string,
+  costs: any
 ): string {
-  const cost = moduleCost(mod_);
+  const currentPath = path
+    ? (name ? `${path}::${name}` : path) // If name is empty (root), keep path (empty)
+    : name;
+
+  // Root case handling: if depth is 0, path passed in is "", name is "".
+  // Recursion passes child name.
+  // Actually sidebar passes: renderModuleTree('', root, 0, '', costs)
+  // Inside: name='', path=''. currentPath=''
+  // Children: name='foo', path='' -> currentPath='foo'
+  // Grandchildren: name='bar', path='foo' -> currentPath='foo::bar'
+
+  // Correct path logic for recursion:
+  // If we are at root (depth 0), the symbols are at "Sym".
+  // If we are at "mod", symbols are at "mod::Sym".
+  // The `path` arg represents the parent's path.
+  // BUT `renderModuleTree` is called for the *current* module.
+  // If `name` is provided, it appends to `path`.
+  // Wait, the caller loop appends.
+  // Let's look at the recursion below.
+
+  // Re-evaluating path logic based on recursion:
+  // Root call: name='', path=''.
+  // We want to pass the *prefix* for children.
+  // If name is present, prefix is `path::name` (or just `name` if path empty).
+  // If name is empty (root), prefix is just `path` (empty).
+
+  const prefix = path
+    ? (name ? `${path}::${name}` : path)
+    : name;
+
+  const cost = moduleCost(mod_, prefix, costs);
   const symCount = moduleSymbolCount(mod_);
-  // Sort submodules and symbols by cost descending. Submodules
-  // always appear before symbols regardless of cost.
+
+  // Sort submodules and symbols by cost descending.
   const subs = mod_.submodules || {};
   const syms = mod_.symbols || {};
   const subKeys = Object.keys(subs).sort(
-    (a, b) => moduleCost(subs[b]) - moduleCost(subs[a])
+    (a, b) => moduleCost(subs[b], prefix ? `${prefix}::${b}` : b, costs) -
+              moduleCost(subs[a], prefix ? `${prefix}::${a}` : a, costs)
   );
   const symKeys = Object.keys(syms).sort(
-    (a, b) => symbolCost(syms[b]) - symbolCost(syms[a])
+    (a, b) => symbolTotalCost(b, syms[b], prefix, costs) -
+              symbolTotalCost(a, syms[a], prefix, costs)
   );
   const hasChildren = subKeys.length > 0 || symKeys.length > 0;
 
@@ -126,21 +172,34 @@ export function renderModuleTree(
     childrenHtml += renderModuleTree(
       subName,
       mod_.submodules[subName],
-      depth + 1
+      depth + 1,
+      prefix,
+      costs
     );
   }
   for (const symName of symKeys) {
     const sym = mod_.symbols[symName];
-    const cost_ = symbolCost(sym);
+    const total = symbolTotalCost(symName, sym, prefix, costs);
     const depCount = sym.dependencies ? sym.dependencies.length : 0;
     const kind = symbolKindLabel(sym);
     const vis = visBadge(sym);
+
+    // Format breakdown tooltips or extra text
+    let breakdown = '';
+    if (costs) {
+      const fullPath = prefix ? `${prefix}::${symName}` : symName;
+      const c = costs[fullPath];
+      if (c) {
+        breakdown = ` title="Attr: ${fmt(c.attr)}, Meta: ${fmt(c.meta_share)}, Other: ${fmt(c.other_share)}"`;
+      }
+    }
+
     childrenHtml +=
-      `<div class="tree-symbol" style="padding-left:${(depth + 1) * 14}px">` +
+      `<div class="tree-symbol" style="padding-left:${(depth + 1) * 14}px"${breakdown}>` +
       `<span class="tree-sym-kind">${kind}</span>` +
       `${vis}` +
       `<span class="tree-sym-name">${symbolDisplayName(symName, sym)}</span>` +
-      `<span class="tree-cost">${fmt(cost_)}</span>` +
+      `<span class="tree-cost">${fmt(total)}</span>` +
       (depCount > 0
         ? `<span class="tree-deps">${depCount} dep${depCount !== 1 ? 's' : ''}</span>`
         : '') +

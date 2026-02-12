@@ -6,6 +6,7 @@
 //! `/api/schedule` at load time. Split recommendations and preview
 //! endpoints let users explore split candidates without mutating server state.
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use axum::Router;
@@ -13,6 +14,7 @@ use axum::extract::State;
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use tarjanize_schedule::data::ScheduleData;
+use tarjanize_schedule::recommend::collect_symbol_external_targets;
 use tarjanize_schedule::schedule::TargetGraph;
 use tarjanize_schemas::{CostModel, SymbolGraph};
 
@@ -91,6 +93,30 @@ impl std::fmt::Debug for AppState {
 struct ShatterRequest {
     /// Target identifier in `{package}/{target}` format.
     target_id: String,
+}
+
+/// Response for the tree endpoint.
+///
+/// Contains the full target structure and a map of per-symbol cost
+/// breakdowns (attributed vs. shared meta/other costs).
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct TreeResponse {
+    target: tarjanize_schemas::Target,
+    /// Map from symbol path to cost breakdown.
+    /// Key format matches `collect_symbol_external_targets` with empty prefix:
+    /// e.g. `mod::SymbolName`.
+    symbol_costs: HashMap<String, SymbolCostBreakdown>,
+}
+
+/// Cost breakdown for a single symbol.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct SymbolCostBreakdown {
+    /// Direct attribute cost (sum of event times).
+    attr: f64,
+    /// Share of metadata cost based on dependency ratio.
+    meta_share: f64,
+    /// Share of other cost based on dependency ratio.
+    other_share: f64,
 }
 
 /// Builds the axum router with all API routes.
@@ -173,7 +199,10 @@ async fn splits_handler(
     )>,
 ) -> Json<tarjanize_schedule::recommend::SplitRecommendation> {
     let target_id = format!("{package}/{target}");
-    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
+    let sg = state
+        .symbol_graph
+        .read()
+        .expect("symbol_graph lock poisoned");
     let schedule = state.schedule.read().expect("schedule lock poisoned");
     Json(
         tarjanize_schedule::recommend::compute_split_recommendations(
@@ -185,22 +214,100 @@ async fn splits_handler(
     )
 }
 
-/// Returns the full `Target` struct for the given package/target.
+/// Returns the full `Target` struct and per-symbol cost breakdowns.
 ///
 /// The frontend uses this to render the module/symbol tree in the
-/// sidebar when a target is clicked. Returns the `Target` directly
-/// from the `SymbolGraph`, including the full module hierarchy with
-/// symbols, costs, dependencies, and kind metadata.
+/// sidebar. Returns `TreeResponse` containing the `Target` and a map
+/// of distributed costs (meta/other shares based on dependencies).
 ///
 /// Returns 404 if the package or target doesn't exist.
+#[expect(
+    clippy::too_many_lines,
+    reason = "handler keeps parsing, cost aggregation, and response assembly in one place"
+)]
 async fn tree_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((package, target)): axum::extract::Path<(
         String,
         String,
     )>,
-) -> Result<Json<tarjanize_schemas::Target>, axum::http::StatusCode> {
-    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
+) -> Result<Json<TreeResponse>, axum::http::StatusCode> {
+    /// Walks a module tree and records per-symbol cost breakdowns.
+    ///
+    /// Recurses through submodules so the sidebar can resolve fully-qualified
+    /// symbol paths against the cost map.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "local helper keeps tree traversal close to handler data flow"
+    )]
+    fn populate_costs(
+        module: &tarjanize_schemas::Module,
+        path: &str,
+        meta: f64,
+        other: f64,
+        total_deps: u32,
+        ext_deps: &HashMap<String, Vec<String>>,
+        tgt_deps: &std::collections::HashSet<String>,
+        costs: &mut HashMap<String, SymbolCostBreakdown>,
+    ) {
+        for (name, sym) in &module.symbols {
+            let full_path = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}::{name}")
+            };
+
+            let attr: f64 = sym.event_times_ms.values().sum();
+
+            let mut meta_share = 0.0;
+            let mut other_share = 0.0;
+
+            // Only allocate shared costs when dependency ratios are defined.
+            if total_deps > 0
+                && let Some(deps) = ext_deps.get(&full_path)
+            {
+                let count_u32 = u32::try_from(
+                    deps.iter().filter(|d| tgt_deps.contains(*d)).count(),
+                )
+                .expect("dependency count fits u32");
+                let ratio = f64::from(count_u32) / f64::from(total_deps);
+                meta_share = meta * ratio;
+                other_share = other * ratio;
+            }
+
+            costs.insert(
+                full_path,
+                SymbolCostBreakdown {
+                    attr,
+                    meta_share,
+                    other_share,
+                },
+            );
+        }
+
+        for (name, sub) in &module.submodules {
+            let child_path = if path.is_empty() {
+                name.clone()
+            } else {
+                format!("{path}::{name}")
+            };
+            populate_costs(
+                sub,
+                &child_path,
+                meta,
+                other,
+                total_deps,
+                ext_deps,
+                tgt_deps,
+                costs,
+            );
+        }
+    }
+
+    let sg = state
+        .symbol_graph
+        .read()
+        .expect("symbol_graph lock poisoned");
     let pkg = sg
         .packages
         .get(&package)
@@ -209,7 +316,47 @@ async fn tree_handler(
         .targets
         .get(&target)
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-    Ok(Json(tgt.clone()))
+
+    // Calculate total meta/other costs for the target.
+    let meta: f64 = tgt
+        .timings
+        .event_times_ms
+        .iter()
+        .filter(|(k, _)| k.starts_with("metadata_decode_"))
+        .map(|(_, v)| v)
+        .sum();
+    let other: f64 = tgt
+        .timings
+        .event_times_ms
+        .iter()
+        .filter(|(k, _)| !k.starts_with("metadata_decode_"))
+        .map(|(_, v)| v)
+        .sum();
+
+    // Calculate dependency ratios and distribute costs.
+    // Dependency counts are bounded by workspace size; convert through u32
+    // to avoid clippy's precision-loss lint while keeping ratios stable.
+    let total_deps = u32::try_from(tgt.dependencies.len())
+        .expect("dependency count fits u32");
+    let symbol_ext_deps = collect_symbol_external_targets(&tgt.root, "", "");
+
+    let mut symbol_costs = HashMap::new();
+
+    populate_costs(
+        &tgt.root,
+        "",
+        meta,
+        other,
+        total_deps,
+        &symbol_ext_deps,
+        &tgt.dependencies,
+        &mut symbol_costs,
+    );
+
+    Ok(Json(TreeResponse {
+        target: tgt.clone(),
+        symbol_costs,
+    }))
 }
 
 /// Shatters a target by horizon, persisting the result.
@@ -235,6 +382,7 @@ async fn shatter_handler(
             &sg,
             &req.target_id,
             &schedule,
+            state.cost_model.as_ref(),
         )
         .ok_or(axum::http::StatusCode::NOT_FOUND)?
     };
@@ -259,7 +407,10 @@ async fn shatter_handler(
 async fn export_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<SymbolGraph> {
-    let sg = state.symbol_graph.read().expect("symbol_graph lock poisoned");
+    let sg = state
+        .symbol_graph
+        .read()
+        .expect("symbol_graph lock poisoned");
     Json(sg.clone())
 }
 
@@ -308,7 +459,7 @@ mod tests {
     // API contract tests -- exercises each endpoint via tower::oneshot
     // =================================================================
 
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     use http::Request;
     use http_body_util::BodyExt;
@@ -555,8 +706,10 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let target: tarjanize_schemas::Target = serde_json::from_slice(&body)
-            .expect("response should be valid Target JSON");
+        let response: TreeResponse = serde_json::from_slice(&body)
+            .expect("response should be valid TreeResponse JSON");
+
+        let target = response.target;
 
         // The test fixture has 2 symbols (Foo and Bar) in the root module.
         assert_eq!(target.root.symbols.len(), 2);
@@ -645,8 +798,10 @@ mod tests {
         assert_eq!(resp.status(), 200);
 
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let tgt: tarjanize_schemas::Target = serde_json::from_slice(&body)
-            .expect("response should be valid Target JSON");
+        let response: TreeResponse = serde_json::from_slice(&body)
+            .expect("response should be valid TreeResponse JSON");
+
+        let tgt = response.target;
 
         assert!(
             tgt.root.symbols.contains_key("main"),
@@ -723,17 +878,15 @@ mod tests {
 
         // Step 4: Verify the response is a valid Target with symbols.
         let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let target: tarjanize_schemas::Target =
-            serde_json::from_slice(&body)
-                .expect("response should be valid Target JSON");
+        let response: TreeResponse = serde_json::from_slice(&body)
+            .expect("response should be valid TreeResponse JSON");
+
+        let target = response.target;
 
         // The group should have at least one symbol (the test fixture
         // has Foo and Bar; they share horizon 0 so both land in group_0).
         let sym_count = count_symbols_in_module(&target.root);
-        assert!(
-            sym_count > 0,
-            "group target should contain symbols, got 0"
-        );
+        assert!(sym_count > 0, "group target should contain symbols, got 0");
     }
 
     /// Recursively counts symbols in a module tree.

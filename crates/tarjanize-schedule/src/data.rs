@@ -21,7 +21,7 @@ pub struct ScheduleData {
 }
 
 /// Summary statistics for the build schedule.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Summary {
     /// Critical path length (minimum build time).
     #[serde(rename = "critical_path_ms", with = "serde_duration")]

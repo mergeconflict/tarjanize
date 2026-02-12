@@ -550,10 +550,12 @@ fn collect_modules(
 /// - Dependents are rewired to the specific groups they reference.
 ///
 /// Returns `None` if the target doesn't exist or has no symbols.
+#[expect(clippy::too_many_lines)]
 pub fn shatter_target(
     symbol_graph: &SymbolGraph,
     target_id: &str,
     schedule: &ScheduleData,
+    cost_model: Option<&CostModel>,
 ) -> Option<(ScheduleData, SymbolGraph)> {
     let intra = condense_target(symbol_graph, target_id).or_else(|| {
         eprintln!("shatter {target_id}: condense_target returned None");
@@ -586,13 +588,76 @@ pub fn shatter_target(
         }
     }
 
+    // Look up target-level timing data for cost model predictions.
+    // Each group inherits the full target's meta/other overhead.
+    let (meta, other) = extract_meta_other(symbol_graph, target_id);
+
+    // Calculate dependency scaling ratios.
+    // The "Scaled Metadata Cost" hypothesis assumes metadata decode cost is
+    // proportional to the number of dependencies loaded.
+    let (pkg_name, tgt_key) = target_id
+        .split_once('/')
+        .expect("target_id checked in condense_target");
+    let target_obj = &symbol_graph.packages[pkg_name].targets[tgt_key];
+    let dep_set = &target_obj.dependencies;
+    let total_deps = dep_set.len();
+
+    let mut group_ratios = vec![1.0; group_count];
+    let mut group_ext: Vec<std::collections::HashSet<String>> =
+        vec![std::collections::HashSet::new(); group_count];
+
+    if total_deps > 0 {
+        let root = &target_obj.root;
+        let all_sym_deps =
+            collect_symbol_external_targets(root, &target_prefix, "");
+
+        for node in &intra.nodes {
+            let g = scc_to_group[node.id];
+            for sym in &node.symbols {
+                if let Some(targets) = all_sym_deps.get(sym.as_str()) {
+                    for t in targets {
+                        if dep_set.contains(t.as_str()) {
+                            group_ext[g].insert(t.clone());
+                        }
+                    }
+                }
+            }
+        }
+        // Dependency counts are bounded by workspace size; use u32 to
+        // avoid clippy's precision-loss lint while keeping ratios stable.
+        let total_deps_u32 =
+            u32::try_from(total_deps).expect("dependency count fits u32");
+        let total_deps_f = f64::from(total_deps_u32);
+
+        for (g, ext) in group_ext.iter().enumerate() {
+            let ext_len_u32 =
+                u32::try_from(ext.len()).expect("dependency count fits u32");
+            group_ratios[g] = f64::from(ext_len_u32) / total_deps_f;
+        }
+    }
+
     // Aggregate per-group cost and symbol count from member SCCs.
     let mut group_costs = vec![Duration::ZERO; group_count];
+    let mut group_attr = vec![0.0; group_count];
     let mut group_sym_counts = vec![0_usize; group_count];
     for node in &intra.nodes {
         let g = scc_to_group[node.id];
-        group_costs[g] += node.cost;
+        group_attr[g] += node.cost.as_secs_f64() * 1000.0;
         group_sym_counts[g] += node.symbols.len();
+    }
+
+    // Compute final group costs using the cost model if available.
+    for g in 0..group_count {
+        if let Some(model) = cost_model {
+            let ratio = group_ratios[g];
+            // Metadata cost scales with dependencies. Other overhead (linking, etc.)
+            // is per-crate, so it is retained (duplicated) for each new group.
+            group_costs[g] = Duration::from_secs_f64(
+                model.predict(group_attr[g], meta * ratio, other) / 1000.0,
+            );
+        } else {
+            group_costs[g] = Duration::from_secs_f64(group_attr[g] / 1000.0);
+        }
     }
 
     // The SCC DAG excludes Use/ExternCrate symbols (they're re-exports,
@@ -631,6 +696,7 @@ pub fn shatter_target(
         &scc_to_group,
         group_count,
         &group_costs,
+        &group_ratios,
     );
 
     let tg = build_shattered_target_graph(
@@ -644,6 +710,7 @@ pub fn shatter_target(
         group_count,
         &group_costs,
         &group_sym_counts,
+        &group_ext,
     )
     .or_else(|| {
         eprintln!(
@@ -679,6 +746,7 @@ fn build_shattered_target_graph(
     group_count: usize,
     group_costs: &[Duration],
     group_sym_counts: &[usize],
+    group_ext_deps: &[std::collections::HashSet<String>],
 ) -> Option<TargetGraph> {
     use indexmap::IndexSet;
     use petgraph::graph::{DiGraph, NodeIndex};
@@ -773,17 +841,7 @@ fn build_shattered_target_graph(
     wire_inter_group_edges(intra, scc_to_group, group_base, &mut graph);
 
     // Wire group external deps.
-    wire_group_external_deps(
-        symbol_graph,
-        target_id,
-        target_prefix,
-        intra,
-        scc_to_group,
-        group_count,
-        group_base,
-        &names,
-        &mut graph,
-    );
+    wire_group_external_deps(group_ext_deps, group_base, &names, &mut graph);
 
     // Rewire dependents to groups.
     wire_dependent_to_groups(
@@ -847,6 +905,10 @@ fn group_sccs_by_horizon(horizons: &[Duration]) -> (Vec<usize>, usize) {
 ///
 /// This ensures `/api/tree/{pkg}/{target}::group_N` resolves correctly
 /// after shattering.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "helper mirrors shatter inputs; bundling into a struct would obscure call sites"
+)]
 fn build_shattered_symbol_graph(
     symbol_graph: &SymbolGraph,
     target_id: &str,
@@ -855,10 +917,10 @@ fn build_shattered_symbol_graph(
     scc_to_group: &[usize],
     group_count: usize,
     group_costs: &[Duration],
+    group_ratios: &[f64],
 ) -> SymbolGraph {
     use crate::export::{
-        insert_symbol_into_module, parse_symbol_path,
-        remove_symbol_from_module,
+        insert_symbol_into_module, parse_symbol_path, remove_symbol_from_module,
     };
 
     let mut graph = symbol_graph.clone();
@@ -868,9 +930,8 @@ fn build_shattered_symbol_graph(
     };
 
     // Create empty group targets up front.
-    let mut group_roots: Vec<Module> = (0..group_count)
-        .map(|_| Module::default())
-        .collect();
+    let mut group_roots: Vec<Module> =
+        (0..group_count).map(|_| Module::default()).collect();
 
     // Move symbols from the original target into group module trees.
     let Some(pkg) = graph.packages.get_mut(pkg_name) else {
@@ -904,16 +965,33 @@ fn build_shattered_symbol_graph(
         }
     }
 
-    // Remove the original target and insert group targets.
+    // Capture original timings for distribution before removing the target.
+    let original_timings = source_target.timings.clone();
     let original_deps = source_target.dependencies.clone();
     pkg.targets.remove(target_key);
 
     for (g, root) in group_roots.into_iter().enumerate() {
         let group_key = format!("{target_key}::group_{g}");
+        let ratio = group_ratios[g];
+
+        // Populate event_times_ms by iterating original events.
+        // - Metadata events are scaled by ratio.
+        // - Other events are retained (unscaled).
+        let mut event_times = HashMap::new();
+        for (key, &val) in &original_timings.event_times_ms {
+            if key.starts_with("metadata_decode_") {
+                if ratio > 0.0 {
+                    event_times.insert(key.clone(), val * ratio);
+                }
+            } else {
+                event_times.insert(key.clone(), val);
+            }
+        }
+
         let group_target = Target {
             timings: TargetTimings {
                 wall_time: group_costs[g],
-                event_times_ms: HashMap::new(),
+                event_times_ms: event_times,
             },
             dependencies: original_deps.clone(),
             root,
@@ -955,61 +1033,19 @@ fn wire_inter_group_edges(
 
 /// Wires each group target to the external targets its SCCs reference.
 ///
-/// Walks the shattered target's module tree to find per-symbol external
-/// deps, aggregates them by group, then adds edges from those external
-/// targets to the group targets.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "wiring helper needs symbol graph, SCC mapping, and graph builder context"
-)]
+/// Iterates over the pre-computed external dependencies for each group
+/// and adds edges from those external targets to the group target.
 fn wire_group_external_deps(
-    symbol_graph: &SymbolGraph,
-    target_id: &str,
-    target_prefix: &str,
-    intra: &IntraTargetGraph,
-    scc_to_group: &[usize],
-    group_count: usize,
+    group_ext_deps: &[std::collections::HashSet<String>],
     group_base: usize,
     names: &indexmap::IndexSet<String>,
     graph: &mut petgraph::graph::DiGraph<usize, ()>,
 ) {
-    use std::collections::HashSet;
-
     use petgraph::graph::NodeIndex;
 
-    let Some((pkg_name, tgt_key)) = target_id.split_once('/') else {
-        return;
-    };
-    let target_obj = &symbol_graph.packages[pkg_name].targets[tgt_key];
-    let dep_set = &target_obj.dependencies;
-    let root = &target_obj.root;
-    let all_sym_deps = collect_symbol_external_targets(root, target_prefix, "");
-
-    // Collect external targets per group from member SCCs' symbols.
-    // Only include targets that are actual dependencies of the shattered
-    // target. Symbol paths can reference non-dependency targets (via
-    // re-exports, test/bench targets in the same package, etc.). Adding
-    // edges from those targets would create cycles: a dependent of the
-    // shattered target could get an incoming edge from a group AND an
-    // outgoing edge to a group (via the last-group fallback), forming a
-    // loop through the inter-group chain.
-    let mut group_ext: Vec<HashSet<&str>> = vec![HashSet::new(); group_count];
-    for node in &intra.nodes {
-        let g = scc_to_group[node.id];
-        for sym in &node.symbols {
-            if let Some(targets) = all_sym_deps.get(sym.as_str()) {
-                for t in targets {
-                    if dep_set.contains(t.as_str()) {
-                        group_ext[g].insert(t.as_str());
-                    }
-                }
-            }
-        }
-    }
-
-    for (g, ext_targets) in group_ext.iter().enumerate() {
+    for (g, ext_targets) in group_ext_deps.iter().enumerate() {
         let group_idx = group_base + g;
-        for &ext_target in ext_targets {
+        for ext_target in ext_targets {
             if let Some(dep_new_idx) = names.get_index_of(ext_target) {
                 graph.add_edge(
                     NodeIndex::new(dep_new_idx),
@@ -1067,7 +1103,7 @@ fn wire_dependent_to_groups(
 /// Returns a map from full symbol path to the set of external target
 /// names that symbol depends on. Only dependencies NOT starting with
 /// `target_prefix` are included (cross-target deps).
-fn collect_symbol_external_targets(
+pub fn collect_symbol_external_targets(
     module: &Module,
     target_prefix: &str,
     module_path: &str,
@@ -1729,5 +1765,104 @@ mod tests {
             None,
         );
         assert!(result.candidates.is_empty());
+    }
+
+    #[test]
+    fn shatter_uses_cost_model() {
+        // Setup: 1 target, 1 symbol, with significant metadata overhead.
+        let mut symbols = HashMap::new();
+        symbols.insert(
+            "MySym".to_string(),
+            Symbol {
+                file: "lib.rs".to_string(),
+                event_times_ms: HashMap::from([("typeck".to_string(), 10.0)]),
+                dependencies: HashSet::new(),
+                kind: SymbolKind::ModuleDef {
+                    kind: "Function".to_string(),
+                    visibility: Visibility::Public,
+                },
+            },
+        );
+        let target = Target {
+            timings: TargetTimings {
+                wall_time: Duration::from_millis(100),
+                event_times_ms: HashMap::from([
+                    ("metadata_decode_entry".to_string(), 40.0),
+                    ("incr_comp_persist".to_string(), 50.0),
+                ]),
+            },
+            dependencies: HashSet::new(),
+            root: Module {
+                symbols,
+                submodules: HashMap::new(),
+            },
+        };
+        let mut packages = HashMap::new();
+        packages.insert(
+            "my-pkg".to_string(),
+            Package {
+                targets: HashMap::from([("lib".to_string(), target)]),
+            },
+        );
+        let sg = SymbolGraph { packages };
+
+        let schedule = ScheduleData {
+            summary: Summary {
+                critical_path: Duration::from_millis(100),
+                total_cost: Duration::from_millis(100),
+                parallelism_ratio: 1.0,
+                target_count: 1,
+                symbol_count: 1,
+                lane_count: 1,
+            },
+            targets: vec![TargetData {
+                name: "my-pkg/lib".to_string(),
+                start: Duration::ZERO,
+                finish: Duration::from_millis(100),
+                cost: Duration::from_millis(100),
+                slack: Duration::ZERO,
+                lane: 0,
+                symbol_count: 1,
+                deps: vec![],
+                dependents: vec![],
+                on_critical_path: true,
+                forward_pred: None,
+                backward_succ: None,
+            }],
+            critical_path: vec![0],
+        };
+
+        // Model: Predict = 1.0*attr + 1.0*meta + 1.0*other
+        let model = CostModel {
+            coeff_attr: 1.0,
+            coeff_meta: 1.0,
+            coeff_other: 1.0,
+            r_squared: 0.9,
+            inlier_threshold: 1.0,
+        };
+
+        // Test with cost model.
+        let (new_schedule, _) =
+            shatter_target(&sg, "my-pkg/lib", &schedule, Some(&model)).unwrap();
+        let group_target = new_schedule
+            .targets
+            .iter()
+            .find(|t| t.name.contains("::group_"))
+            .unwrap();
+
+        // attr (10) + meta (40) + other (50) = 100ms
+        assert_eq!(group_target.cost, Duration::from_millis(100));
+
+        // Test fallback (no cost model).
+        let (schedule_fallback, _) =
+            shatter_target(&sg, "my-pkg/lib", &schedule, None).unwrap();
+        let group_fallback = schedule_fallback
+            .targets
+            .iter()
+            .find(|t| t.name.contains("::group_"))
+            .unwrap();
+
+        // attr (10) = 10ms
+        assert_eq!(group_fallback.cost, Duration::from_millis(10));
     }
 }
