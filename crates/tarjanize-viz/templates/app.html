@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>tarjanize — interactive split explorer</title>
-  <style>{{ style_css }}</style>
+  <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
   <!-- Main panel: sidebar + Gantt viewport. -->
@@ -33,6 +33,9 @@
       <button id="save-btn">Save Symbol Graph</button>
     </div>
 
+    <!-- Draggable resize handle between sidebar and viewport. -->
+    <div id="sidebar-resize"></div>
+
     <!-- PixiJS canvas mounts inside this div. -->
     <div id="viewport"></div>
   </div>
@@ -50,221 +53,18 @@
   }
   </script>
 
-  <!-- Fetch schedule data from the API, then run the Gantt renderer bundle.
-       Top-level await blocks module execution, so window.DATA is set
-       before the inlined bundle reads it. After the Gantt chart renders,
-       we wire up the target-click event to fetch and display split
-       recommendations in the sidebar. -->
+  <!-- Fetch schedule data, set window.DATA, then dynamically import the
+       renderer bundle. Top-level await ensures DATA is populated before
+       the renderer reads it at module load time. -->
   <script type="module">
     const resp = await fetch('/api/schedule');
     window.DATA = await resp.json();
-
-    {{ bundle_js|safe }}
-
-    // -----------------------------------------------------------------------
-    // State
-    // -----------------------------------------------------------------------
-
-    // Store the original schedule data so we can restore it when the user
-    // deselects a target or clicks away from a preview.
-    let originalData = structuredClone(window.DATA);
-
-    // Currently active candidate threshold (null when no preview active).
-    let activeThreshold = null;
-
-    // Currently selected target name (null when nothing selected).
-    let selectedTarget = null;
-
-    // -----------------------------------------------------------------------
-    // Helper: refresh sidebar stats from the current schedule data
-    // -----------------------------------------------------------------------
-
-    // Update the sidebar summary stats to reflect the latest schedule.
-    // Called after split/unsplit operations change the schedule.
-    function refreshSidebarStats() {
-      const fmt = window.formatMs || ((v) => v.toFixed(1) + ' ms');
-      const { summary } = window.DATA;
-      document.getElementById('stat-cp').textContent = fmt(summary.critical_path_ms);
-      document.getElementById('stat-total').textContent = fmt(summary.total_cost_ms);
-      document.getElementById('stat-parallel').textContent = summary.parallelism_ratio.toFixed(2) + 'x';
-      document.getElementById('stat-targets').textContent = summary.target_count;
-      document.getElementById('stat-symbols').textContent = summary.symbol_count;
-      document.getElementById('stat-lanes').textContent = summary.lane_count;
-    }
-
-    // -----------------------------------------------------------------------
-    // Helper: format milliseconds for display
-    // -----------------------------------------------------------------------
-
-    function fmt(ms) {
-      return (window.formatMs || ((v) => v.toFixed(1) + ' ms'))(ms);
-    }
-
-    // -----------------------------------------------------------------------
-    // Restore original schedule (hide recommendations, reset preview)
-    // -----------------------------------------------------------------------
-
-    function restoreOriginal() {
-      if (activeThreshold !== null) {
-        window.DATA = structuredClone(originalData);
-        window.updateSchedule(window.DATA);
-        refreshSidebarStats();
-        activeThreshold = null;
-      }
-      selectedTarget = null;
-      document.getElementById('recommendations').style.display = 'none';
-    }
-
-    // -----------------------------------------------------------------------
-    // Target-click event: fetch and display split recommendations
-    // -----------------------------------------------------------------------
-
-    window.addEventListener('target-click', async (event) => {
-      const { name } = event.detail;
-
-      // If clicking the same target again, deselect it.
-      if (selectedTarget === name) {
-        restoreOriginal();
-        return;
-      }
-
-      // If switching targets, restore original schedule first.
-      if (activeThreshold !== null) {
-        window.DATA = structuredClone(originalData);
-        window.updateSchedule(window.DATA);
-        refreshSidebarStats();
-        activeThreshold = null;
-      }
-
-      selectedTarget = name;
-
-      // Target names are "package/target". Split and encode for the URL.
-      const slashIdx = name.indexOf('/');
-      const pkg = name.substring(0, slashIdx);
-      const target = name.substring(slashIdx + 1);
-      const splitsUrl = `/api/splits/${encodeURIComponent(pkg)}/${encodeURIComponent(target)}`;
-
-      try {
-        const splitsResp = await fetch(splitsUrl);
-        if (!splitsResp.ok) return;
-
-        const rec = await splitsResp.json();
-
-        // Show the recommendations panel.
-        const recsDiv = document.getElementById('recommendations');
-        recsDiv.style.display = '';
-
-        // Render the header with target name and cost.
-        document.getElementById('rec-header').innerHTML =
-          `<span class="rec-target-name">${rec.target}</span>` +
-          `<br><span class="rec-cost">Cost: ${fmt(rec.current_cost_ms)}</span>`;
-
-        // Render candidate cards.
-        const listDiv = document.getElementById('rec-list');
-        if (rec.candidates.length === 0) {
-          listDiv.innerHTML = '<div style="color:#888;font-size:12px">No beneficial splits found.</div>';
-          return;
-        }
-
-        listDiv.innerHTML = rec.candidates.map(c => `
-          <div class="split-candidate" data-threshold="${c.threshold_ms}">
-            <div class="candidate-improvement">
-              <span class="global-save">saves ${fmt(c.global_improvement_ms)} critical path</span>
-              <span class="local-save">${fmt(c.local_improvement_ms)} local</span>
-            </div>
-            <div class="candidate-detail">
-              ${c.downset_scc_count} SCCs (${fmt(c.downset_cost_ms)}) can start at T=${fmt(c.threshold_ms)}
-            </div>
-            ${c.split_modules.length > 0
-              ? `<div class="candidate-warning">splits ${c.split_modules.join(', ')} across both crates</div>`
-              : ''}
-          </div>
-        `).join('');
-
-        // Attach click handlers to candidate cards.
-        listDiv.querySelectorAll('.split-candidate').forEach(card => {
-          card.addEventListener('click', async () => {
-            const threshold = parseFloat(card.dataset.threshold);
-
-            // Toggle: clicking the active candidate deactivates it.
-            if (activeThreshold === threshold) {
-              window.DATA = structuredClone(originalData);
-              window.updateSchedule(window.DATA);
-              refreshSidebarStats();
-              activeThreshold = null;
-              listDiv.querySelectorAll('.split-candidate').forEach(c => c.classList.remove('active'));
-              return;
-            }
-
-            // Preview this candidate.
-            const previewResp = await fetch('/api/preview-split', {
-              method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ target_id: rec.target, threshold_ms: threshold }),
-            });
-
-            if (previewResp.ok) {
-              const newSchedule = await previewResp.json();
-              window.DATA = newSchedule;
-              window.updateSchedule(newSchedule);
-              refreshSidebarStats();
-              activeThreshold = threshold;
-
-              // Highlight the active card.
-              listDiv.querySelectorAll('.split-candidate').forEach(c => c.classList.remove('active'));
-              card.classList.add('active');
-            }
-          });
-        });
-
-      } catch (err) {
-        // Network error -- silently ignore.
-      }
-    });
-
-    // -----------------------------------------------------------------------
-    // "Shatter" button: replace target with horizon-grouped targets
-    // -----------------------------------------------------------------------
-
-    document.getElementById('shatter-btn').addEventListener('click', async () => {
-      if (!selectedTarget) return;
-
-      const shatterResp = await fetch('/api/shatter', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target_id: selectedTarget }),
-      });
-
-      if (shatterResp.ok) {
-        const newSchedule = await shatterResp.json();
-        window.DATA = newSchedule;
-        window.updateSchedule(newSchedule);
-        refreshSidebarStats();
-
-        // Shatter is persistent: update the baseline so subsequent
-        // operations (including shattering other targets) build on it.
-        originalData = structuredClone(newSchedule);
-        activeThreshold = null;
-        selectedTarget = null;
-        document.getElementById('recommendations').style.display = 'none';
-      }
-    });
-
-    // -----------------------------------------------------------------------
-    // "Save Symbol Graph" button: download modified SymbolGraph as JSON
-    // -----------------------------------------------------------------------
-
-    document.getElementById('save-btn').addEventListener('click', async () => {
-      const resp = await fetch('/api/export');
-      const data = await resp.json();
-      const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = 'symbol_graph.json';
-      a.click();
-      URL.revokeObjectURL(url);
-    });
+    await import('/static/bundle.js');
   </script>
+
+  <!-- Sidebar event wiring (IIFE). Runs after the module script above
+       completes, by which time window.DATA and window.updateSchedule
+       are set by the renderer bundle. -->
+  <script src="/static/sidebar.js"></script>
 </body>
 </html>

@@ -16,7 +16,6 @@ workspace = true
 tarjanize-cost.workspace = true
 tarjanize-schedule.workspace = true
 tarjanize-schemas.workspace = true
-askama.workspace = true
 axum.workspace = true
 serde.workspace = true
 open.workspace = true

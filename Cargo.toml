@@ -30,9 +30,6 @@ anyhow = "1.0"
 # Time formatting
 jiff = "0.2"
 
-# Templating
-askama = "0.12"
-
 # Algorithms and data structures
 indexmap = "2.13"
 itertools = "0.14"

@@ -1,45 +1,39 @@
 //! Local web server for the interactive split explorer.
 //!
 //! Holds the computed `ScheduleData` in memory and serves it via JSON API.
-//! The index page renders the full `PixiJS` Gantt chart, fetching schedule
-//! data from `/api/schedule` at load time. Split recommendations and preview
+//! The index page is a plain HTML file that loads CSS, the renderer bundle,
+//! and the sidebar bundle as static assets. Schedule data is fetched from
+//! `/api/schedule` at load time. Split recommendations and preview
 //! endpoints let users explore split candidates without mutating server state.
 
 use std::sync::{Arc, RwLock};
 
-use askama::Template;
 use axum::Router;
 use axum::extract::State;
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
 use tarjanize_schedule::data::ScheduleData;
 use tarjanize_schedule::schedule::TargetGraph;
-use tarjanize_schedule::split::SplitOperation;
 use tarjanize_schemas::{CostModel, SymbolGraph};
 
 /// Bundled JS produced by esbuild during `build.rs`. Contains renderer.ts
-/// with logic.ts inlined, pixi.js kept as an external import. Shared with
-/// the static HTML mode (same bundle).
+/// with logic.ts inlined, pixi.js kept as an external import.
 const BUNDLE_JS: &str = include_str!(concat!(env!("OUT_DIR"), "/bundle.js"));
 
 /// Raw CSS, included at compile time. A single file with no imports, so no
-/// bundling needed. Shared with the static HTML mode (same stylesheet).
+/// bundling needed.
 const STYLE_CSS: &str = include_str!("../templates/style.css");
 
-/// Askama template for the interactive web app.
-///
-/// Unlike the static `VizTemplate` (which embeds schedule data inline),
-/// this template fetches data from `/api/schedule` at load time via
-/// top-level `await`. The bundle JS runs only after the fetch completes,
-/// so `window.DATA` is populated before the renderer reads it.
-#[derive(Template)]
-#[template(path = "app.html")]
-struct AppTemplate {
-    /// Inlined CSS (dark theme, sidebar layout, tooltip styling).
-    style_css: String,
-    /// Inlined esbuild bundle (renderer.ts + logic.ts, pixi.js external).
-    bundle_js: String,
-}
+/// Sidebar JS bundle produced by esbuild during `build.rs`. Contains
+/// sidebar.ts with tree.ts inlined, IIFE format to avoid variable
+/// collisions with the ESM renderer bundle.
+const SIDEBAR_JS: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/sidebar.js"));
+
+/// The index HTML page, served as-is. Contains no template syntax -- all
+/// assets are loaded via `<link>` and `<script>` tags pointing to the
+/// `/static/` routes.
+const INDEX_HTML: &str = include_str!("../templates/app.html");
 
 /// Shared application state, wrapped in `Arc` for cheap cloning across
 /// axum handlers.
@@ -79,20 +73,6 @@ impl std::fmt::Debug for AppState {
     }
 }
 
-/// Request body for the preview-split endpoint.
-///
-/// Specifies a target and a horizon threshold from the split
-/// recommendations. The handler finds the matching candidate, applies
-/// the split transiently (without persisting), and returns the modified
-/// schedule for Gantt chart preview.
-#[derive(Debug, serde::Deserialize)]
-struct PreviewSplitRequest {
-    /// Target identifier in `{package}/{target}` format.
-    target_id: String,
-    /// The horizon threshold (ms) identifying the candidate to preview.
-    threshold_ms: f64,
-}
-
 /// Request body for the shatter endpoint.
 ///
 /// Identifies the target to shatter into its full SCC condensation
@@ -108,37 +88,58 @@ struct ShatterRequest {
 ///
 /// Routes:
 /// - `GET /` -- interactive Gantt chart (fetches data from the API)
+/// - `GET /static/style.css` -- CSS stylesheet
+/// - `GET /static/bundle.js` -- Gantt renderer (ESM)
+/// - `GET /static/sidebar.js` -- Sidebar event wiring (IIFE)
 /// - `GET /api/schedule` -- full schedule data as JSON
-/// - `GET /api/splits/:package/:target` -- ranked split recommendations
-/// - `POST /api/preview-split` -- preview a split candidate (transient)
+/// - `GET /api/splits/:package/*target` -- ranked split recommendations
+/// - `GET /api/tree/:package/*target` -- module/symbol tree for a target
 /// - `POST /api/shatter` -- shatter a target into its SCCs (transient)
 /// - `GET /api/export` -- export the `SymbolGraph` as JSON
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index_handler))
+        .route("/static/style.css", get(css_handler))
+        .route("/static/bundle.js", get(bundle_js_handler))
+        .route("/static/sidebar.js", get(sidebar_js_handler))
         .route("/api/schedule", get(schedule_handler))
-        .route("/api/splits/{package}/{target}", get(splits_handler))
-        .route("/api/preview-split", post(preview_split_handler))
+        .route("/api/splits/{package}/{*target}", get(splits_handler))
+        .route("/api/tree/{package}/{*target}", get(tree_handler))
         .route("/api/shatter", post(shatter_handler))
         .route("/api/export", get(export_handler))
         .with_state(state)
 }
 
-/// Serves the interactive split explorer page.
-///
-/// Renders the `app.html` Askama template with inlined CSS and JS bundle.
-/// The template fetches schedule data from `/api/schedule` at load time,
-/// then initializes the `PixiJS` Gantt chart renderer.
-async fn index_handler() -> Html<String> {
-    let template = AppTemplate {
-        style_css: STYLE_CSS.to_owned(),
-        bundle_js: BUNDLE_JS.to_owned(),
-    };
-    // Template rendering is infallible for static string inputs. Panic on
-    // failure because a broken template is a programming error, not a
-    // runtime condition the server can recover from.
-    let rendered = template.render().expect("app.html template render failed");
-    Html(rendered)
+/// Serves the interactive split explorer page as plain HTML.
+async fn index_handler() -> Html<&'static str> {
+    Html(INDEX_HTML)
+}
+
+/// Serves the CSS stylesheet with the correct content type.
+async fn css_handler() -> ([(&'static str, &'static str); 1], &'static str) {
+    ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
+}
+
+/// Serves the Gantt renderer JS bundle (ESM) with the correct content type.
+async fn bundle_js_handler() -> (
+    [(&'static str, &'static str); 1],
+    &'static str,
+) {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        BUNDLE_JS,
+    )
+}
+
+/// Serves the sidebar JS bundle (IIFE) with the correct content type.
+async fn sidebar_js_handler() -> (
+    [(&'static str, &'static str); 1],
+    &'static str,
+) {
+    (
+        [("content-type", "application/javascript; charset=utf-8")],
+        SIDEBAR_JS,
+    )
 }
 
 /// Returns the current schedule data as JSON.
@@ -178,70 +179,31 @@ async fn splits_handler(
     )
 }
 
-/// Previews a split candidate without persisting it.
+/// Returns the full `Target` struct for the given package/target.
 ///
-/// Takes a target and threshold, computes the corresponding split
-/// candidate from the recommendations, determines the downset SCC IDs,
-/// applies the split transiently, and returns the modified schedule for
-/// Gantt chart preview. Does not mutate the server's split state.
+/// The frontend uses this to render the module/symbol tree in the
+/// sidebar when a target is clicked. Returns the `Target` directly
+/// from the `SymbolGraph`, including the full module hierarchy with
+/// symbols, costs, dependencies, and kind metadata.
 ///
-/// Returns 404 if the target doesn't exist or no candidate matches
-/// the given threshold.
-async fn preview_split_handler(
+/// Returns 404 if the package or target doesn't exist.
+async fn tree_handler(
     State(state): State<Arc<AppState>>,
-    Json(req): Json<PreviewSplitRequest>,
-) -> Result<Json<ScheduleData>, axum::http::StatusCode> {
-    let schedule = state.schedule.read().expect("schedule lock poisoned");
-
-    // Condense the target into its SCC DAG.
-    let intra = tarjanize_schedule::target_graph::condense_target(
-        &state.symbol_graph,
-        &req.target_id,
-    )
-    .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-
-    // Compute effective horizons to determine which SCCs fall in the downset.
-    let horizons = tarjanize_schedule::recommend::compute_effective_horizons(
-        &intra,
-        &state.symbol_graph,
-        &req.target_id,
-        &schedule,
-    );
-
-    // Collect SCC IDs where horizon <= threshold (the downset).
-    // Convert the f64 ms threshold from the request to Duration for
-    // comparison with the Duration-based horizons.
-    let threshold =
-        std::time::Duration::from_secs_f64(req.threshold_ms / 1000.0);
-    let downset_scc_ids: Vec<usize> = intra
-        .nodes
-        .iter()
-        .filter(|node| horizons[node.id] <= threshold)
-        .map(|node| node.id)
-        .collect();
-
-    if downset_scc_ids.is_empty() {
-        return Err(axum::http::StatusCode::NOT_FOUND);
-    }
-
-    // Build a synthetic split operation for the downset.
-    let preview_op = SplitOperation {
-        source_target: req.target_id.clone(),
-        new_crate_name: format!("{}::preview", req.target_id),
-        selected_sccs: downset_scc_ids,
-    };
-
-    // Apply the preview split transiently (no persistent state).
-    let (target_graph, _) = tarjanize_schedule::split::apply_splits(
-        &state.base_target_graph,
-        &state.symbol_graph,
-        &[preview_op],
-    );
-
-    let new_schedule =
-        tarjanize_schedule::schedule::compute_schedule(&target_graph);
-
-    Ok(Json(new_schedule))
+    axum::extract::Path((package, target)): axum::extract::Path<(
+        String,
+        String,
+    )>,
+) -> Result<Json<tarjanize_schemas::Target>, axum::http::StatusCode> {
+    let pkg = state
+        .symbol_graph
+        .packages
+        .get(&package)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    let tgt = pkg
+        .targets
+        .get(&target)
+        .ok_or(axum::http::StatusCode::NOT_FOUND)?;
+    Ok(Json(tgt.clone()))
 }
 
 /// Shatters a target by horizon, persisting the result.
@@ -455,80 +417,6 @@ mod tests {
         );
     }
 
-    /// POST /api/preview-split should return a modified schedule
-    /// without mutating the server's schedule state.
-    #[tokio::test]
-    async fn api_preview_split_returns_modified_schedule() {
-        let state = test_state();
-
-        // Preview a split at threshold 0.0. Since the test fixture has
-        // no external dependencies, all horizons are 0.0 and the
-        // downset includes all SCCs at this threshold.
-        let preview_body = serde_json::json!({
-            "target_id": "test-pkg/lib",
-            "threshold_ms": 0.0,
-        });
-
-        let app = build_router(Arc::clone(&state));
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/preview-split")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_vec(&preview_body).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), 200);
-
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let schedule: tarjanize_schedule::data::ScheduleData =
-            serde_json::from_slice(&body)
-                .expect("response should be valid ScheduleData JSON");
-
-        // The preview should produce a schedule (may have 2 targets
-        // from the split). The exact count depends on how the split
-        // partitions the SCCs.
-        assert!(
-            !schedule.targets.is_empty(),
-            "preview schedule should have targets"
-        );
-    }
-
-    /// POST /api/preview-split should return 404 for a nonexistent
-    /// target.
-    #[tokio::test]
-    async fn api_preview_split_404_for_missing_target() {
-        let state = test_state();
-
-        let preview_body = serde_json::json!({
-            "target_id": "nonexistent/lib",
-            "threshold_ms": 0.0,
-        });
-
-        let app = build_router(state);
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/api/preview-split")
-                    .header("content-type", "application/json")
-                    .body(axum::body::Body::from(
-                        serde_json::to_vec(&preview_body).unwrap(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), 404);
-    }
-
     /// GET /api/export should return a valid `SymbolGraph` JSON.
     #[tokio::test]
     async fn api_export_returns_valid_symbol_graph() {
@@ -628,5 +516,124 @@ mod tests {
             .unwrap();
 
         assert_eq!(resp.status(), 404);
+    }
+
+    /// GET /api/tree/{package}/{target} should return the Target struct
+    /// from the `SymbolGraph`, including the full module/symbol tree.
+    #[tokio::test]
+    async fn api_tree_returns_target() {
+        let state = test_state();
+        let app = build_router(Arc::clone(&state));
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tree/test-pkg/lib")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let target: tarjanize_schemas::Target = serde_json::from_slice(&body)
+            .expect("response should be valid Target JSON");
+
+        // The test fixture has 2 symbols (Foo and Bar) in the root module.
+        assert_eq!(target.root.symbols.len(), 2);
+        assert!(
+            target.root.symbols.contains_key("Foo"),
+            "root module should contain Foo"
+        );
+        assert!(
+            target.root.symbols.contains_key("Bar"),
+            "root module should contain Bar"
+        );
+    }
+
+    /// GET /api/tree/{package}/{target} should return 404 for a
+    /// nonexistent package or target.
+    #[tokio::test]
+    async fn api_tree_404_for_missing_target() {
+        let state = test_state();
+        let app = build_router(state);
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tree/nonexistent/lib")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 404);
+    }
+
+    /// GET /api/tree/{package}/{*target} should handle target names
+    /// containing slashes (e.g., `bin/main`). The catch-all `{*target}`
+    /// parameter captures the entire remaining path.
+    #[tokio::test]
+    async fn api_tree_handles_slash_in_target_name() {
+        // Build a state with a "bin/main" target to exercise the
+        // catch-all path parameter.
+        let sym = Symbol {
+            file: "main.rs".into(),
+            event_times_ms: HashMap::from([("typeck".into(), 3.0)]),
+            dependencies: HashSet::new(),
+            kind: SymbolKind::ModuleDef {
+                kind: "Function".into(),
+                visibility: Visibility::Public,
+            },
+        };
+        let root = Module {
+            symbols: HashMap::from([("main".into(), sym)]),
+            submodules: HashMap::new(),
+        };
+        let target = Target {
+            timings: TargetTimings::default(),
+            dependencies: HashSet::new(),
+            root,
+        };
+        let mut targets = HashMap::new();
+        targets.insert("bin/main".into(), target);
+        let mut packages = HashMap::new();
+        packages.insert("my-pkg".into(), Package { targets });
+        let sg = SymbolGraph { packages };
+
+        let tg = tarjanize_schedule::build_target_graph(&sg, None);
+        let schedule = tarjanize_schedule::schedule::compute_schedule(&tg);
+
+        let state = Arc::new(AppState {
+            symbol_graph: sg,
+            base_target_graph: tg,
+            cost_model: None,
+            schedule: RwLock::new(schedule),
+        });
+
+        let app = build_router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/tree/my-pkg/bin/main")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), 200);
+
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let tgt: tarjanize_schemas::Target = serde_json::from_slice(&body)
+            .expect("response should be valid Target JSON");
+
+        assert!(
+            tgt.root.symbols.contains_key("main"),
+            "should return the bin/main target's symbols"
+        );
     }
 }

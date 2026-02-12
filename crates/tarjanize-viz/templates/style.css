@@ -21,11 +21,14 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
- * Panel layout (app mode only -- the static viz.html has no panels)
+ * Panel layout
  * ------------------------------------------------------------------------ */
 
-/* Main panel: sidebar + Gantt viewport. Takes the full viewport width. */
+/* Main panel: sidebar + Gantt viewport. Takes the full viewport width.
+ * The --sidebar-w custom property drives all sidebar/viewport positioning;
+ * it defaults to 250px and is updated by the JS resize handler. */
 #right-panel {
+  --sidebar-w: 250px;
   position: fixed;
   top: 0;
   left: 0;
@@ -34,22 +37,23 @@ body {
 }
 
 /* The PixiJS canvas mounts into this div. It fills the space to the right
- * of the sidebar. */
+ * of the sidebar + resize handle. */
 #viewport {
   position: absolute;
   top: 0;
-  left: 250px;
+  left: calc(var(--sidebar-w) + 4px);
   right: 0;
   bottom: 0;
 }
 
 /* Fixed sidebar: always visible, scrollable if content overflows.
- * Positioned at the left edge. */
+ * Width driven by the --sidebar-w CSS variable so the drag handle
+ * can resize it. */
 #sidebar {
   position: absolute;
   top: 0;
   left: 0;
-  width: 250px;
+  width: var(--sidebar-w);
   height: 100%;
   background: #16213e;
   color: #e0e0e0;
@@ -57,6 +61,24 @@ body {
   overflow-y: auto;
   box-sizing: border-box;
   z-index: 10;
+}
+
+/* Draggable resize handle: a thin strip between the sidebar and the
+ * Gantt viewport. Cursor changes to col-resize on hover to signal
+ * that it's draggable. */
+#sidebar-resize {
+  position: absolute;
+  top: 0;
+  left: var(--sidebar-w);
+  width: 4px;
+  height: 100%;
+  cursor: col-resize;
+  background: #333;
+  z-index: 11;
+}
+
+#sidebar-resize:hover {
+  background: #00d4ff;
 }
 
 #sidebar h2 {
@@ -88,7 +110,7 @@ body {
 }
 
 /* ---------------------------------------------------------------------------
- * Split recommendations (shown when a target is clicked)
+ * Target detail panel (shown when a target is clicked)
  * ------------------------------------------------------------------------ */
 
 #recommendations {
@@ -112,45 +134,102 @@ body {
   font-size: 12px;
 }
 
-.split-candidate {
-  padding: 8px;
-  margin-bottom: 6px;
-  background: #1a1a2e;
-  border: 1px solid #333;
-  border-radius: 4px;
+/* ---------------------------------------------------------------------------
+ * Module/symbol tree
+ * ------------------------------------------------------------------------ */
+
+/* Module header row: toggle + name + cost + symbol count. Clickable to
+ * expand/collapse children. */
+.tree-module-header {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 0;
   cursor: pointer;
   font-size: 12px;
+  color: #ccc;
 }
 
-.split-candidate:hover {
-  border-color: #00d4ff;
+.tree-module-header:hover {
+  color: #fff;
 }
 
-.split-candidate.active {
-  border-color: #4caf50;
-  background: #1a2e1a;
-}
-
-.candidate-improvement {
-  color: #4caf50;
-  font-weight: bold;
-  margin-bottom: 4px;
-}
-
-.candidate-improvement .local-save {
+/* Collapse/expand triangle. Fixed width so names align regardless of
+ * whether the toggle is present. */
+.tree-toggle {
+  display: inline-block;
+  width: 12px;
+  font-size: 10px;
   color: #888;
-  font-weight: normal;
-  margin-left: 8px;
+  flex-shrink: 0;
+  user-select: none;
 }
 
-.candidate-detail {
-  color: #aaa;
+/* Spacer for leaf modules (no children, no toggle). Same width as
+ * .tree-toggle to keep alignment. */
+.tree-toggle-spacer {
+  display: inline-block;
+  width: 12px;
+  flex-shrink: 0;
 }
 
-.candidate-warning {
-  color: #ff9800;
-  margin-top: 4px;
+.tree-mod-name {
+  color: #e0a0ff;
+  font-weight: bold;
+  flex-shrink: 0;
+}
+
+/* Symbol row: kind + visibility + name + cost + dep count. */
+.tree-symbol {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 1px 0;
   font-size: 11px;
+  color: #bbb;
+}
+
+.tree-sym-kind {
+  color: #888;
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
+.tree-vis {
+  color: #4caf50;
+  font-size: 9px;
+  flex-shrink: 0;
+}
+
+.tree-sym-name {
+  color: #e0e0e0;
+  flex-shrink: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Cost and dep count badges, right-aligned. */
+.tree-cost {
+  color: #00d4ff;
+  font-size: 10px;
+  margin-left: auto;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.tree-count {
+  color: #888;
+  font-size: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+
+.tree-deps {
+  color: #888;
+  font-size: 10px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 /* Floating tooltip: positioned via JS, hidden by default. */

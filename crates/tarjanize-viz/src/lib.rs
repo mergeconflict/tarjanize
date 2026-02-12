@@ -1,13 +1,12 @@
-//! Interactive HTML build schedule visualization.
+//! Interactive build schedule visualization web server.
 //!
-//! Provides two modes:
-//! - Static HTML generation via [`run()`] — self-contained file for sharing
-//! - Interactive web server via [`run_server()`] — local app for exploring splits
+//! Starts a local HTTP server with an interactive split explorer for
+//! analyzing build schedules from a `SymbolGraph`.
 //!
 //! ## Pipeline
 //!
 //! ```text
-//! SymbolGraph + CostModel → TargetGraph → ScheduleData → HTML / JSON API
+//! SymbolGraph + CostModel -> TargetGraph -> ScheduleData -> JSON API
 //! ```
 //!
 //! The `SymbolGraph` provides the dependency structure and per-symbol costs.
@@ -17,41 +16,13 @@
 
 pub mod data;
 mod error;
-mod html;
 pub mod server;
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::sync::{Arc, RwLock};
 
 pub use error::VizError;
-use tarjanize_schemas::{CostModel, SymbolGraph};
-
-/// Generates a static HTML build schedule visualization.
-///
-/// Reads a `SymbolGraph` from `input`, computes the schedule using the
-/// `cost_model` for wall time predictions, and writes a self-contained
-/// HTML file to `output`.
-///
-/// When `cost_model` is `None`, falls back to per-symbol cost sums
-/// (the "effective" timing from the symbol graph).
-pub fn run(
-    mut input: impl Read,
-    cost_model: Option<&CostModel>,
-    output: impl Write,
-) -> Result<(), VizError> {
-    let mut json = String::new();
-    input.read_to_string(&mut json)?;
-
-    let symbol_graph: SymbolGraph =
-        serde_json::from_str(&json).map_err(VizError::deserialize)?;
-
-    let target_graph =
-        tarjanize_schedule::build_target_graph(&symbol_graph, cost_model);
-    let schedule_data =
-        tarjanize_schedule::schedule::compute_schedule(&target_graph);
-
-    html::generate(&schedule_data, output)
-}
+use tarjanize_schemas::SymbolGraph;
 
 /// Starts the interactive split explorer web server.
 ///
