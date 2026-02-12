@@ -5,7 +5,7 @@
 // immediately at module load time — no wrapping function.
 //
 // Exposes `window.updateSchedule(newData)` so the app can re-render
-// the Gantt chart with modified schedule data (e.g., split previews).
+// the Gantt chart with modified schedule data (e.g., after shatter).
 
 import { Application, Container, Graphics, Text } from "pixi.js";
 import {
@@ -87,8 +87,8 @@ let searchMatches = null;
 // Populate sidebar stats
 // ---------------------------------------------------------------------------
 
-// Expose formatMs on the window so the split UI can reuse it for
-// updating sidebar stats without duplicating the formatting logic.
+// Expose formatMs on the window so the sidebar UI can reuse it for
+// updating stats without duplicating the formatting logic.
 window.formatMs = formatMs;
 
 // Populate sidebar stats from the current DATA.
@@ -615,7 +615,7 @@ function onBarPointerOut() {
 }
 
 // Dispatch a custom event when a bar is clicked so the sidebar (in
-// app.html) can fetch and render split recommendations.
+// app.html) can fetch and render target details.
 function onBarClick(event) {
   const idx = event.currentTarget.targetIndex;
   const t = targets[idx];
@@ -789,9 +789,9 @@ buildChart();
 // updateSchedule: re-render the Gantt chart with new schedule data
 // ---------------------------------------------------------------------------
 
-// Exposed on the window so app.html can call it when previewing split
-// candidates. Accepts a new ScheduleData object, replaces window.DATA,
-// rebuilds all PixiJS content, and updates sidebar stats.
+// Exposed on the window so app.html can call it after shatter. Accepts
+// a new ScheduleData object, replaces window.DATA, rebuilds all PixiJS
+// content, and updates sidebar stats.
 window.updateSchedule = function(newData) {
   window.DATA = newData;
   buildChart();

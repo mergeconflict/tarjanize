@@ -26,13 +26,15 @@
 //!   keyed by normalized `DefPath` then event label).
 //! - Events without a usable `DefPath` go to `event_times_ms` (target-level,
 //!   keyed by event label).
+//! - Self-profile bookkeeping events (`self_profile_*`) are ignored.
 //!
 //! This ensures `sum(target.event_times_ms) + sum(all symbol event_times_ms)`
-//! equals total self-time, with no double-counting.
+//! equals total self-time for non-self-profile events, with no double-counting.
 //!
-//! Wall-clock `wall_time_ms` is the span of all profiled events
-//! (min start to max end). We use `cargo check` so only frontend events
-//! are profiled — no LLVM, codegen, or linking.
+//! Wall-clock `wall_time_ms` is measured as the span of all profiled events
+//! (min start to max end), then reduced by the total self-time of
+//! `self_profile_*` events to remove profiling overhead. We use `cargo check`
+//! so only frontend events are profiled — no LLVM, codegen, or linking.
 
 use std::collections::{HashMap, HashSet};
 use std::panic;
@@ -245,9 +247,17 @@ impl ProfileData {
     /// Each event's self-time lands in exactly one place:
     /// - Events with a usable `DefPath` go to `frontend_costs` (per-symbol).
     /// - Events without a usable `DefPath` go to `event_times_ms` (target-level).
+    /// - Self-profile bookkeeping events (`self_profile_*`) are ignored.
     ///
     /// Wall-clock `wall_time_ms` is the span of all profiled events
-    /// (min start to max end across all events).
+    /// (min start to max end across all events), minus total self-profile
+    /// self-time to remove profiling overhead.
+    ///
+    /// TODO: Refactor to return per-profile timings instead of mutating
+    /// `ProfileData`. `&mut self` implies we can aggregate across multiple
+    /// profiles, but `load_from_dir_with_symbols` panics on multiple files.
+    /// A functional API would align the type shape with the invariant and
+    /// eliminate `+=`-style accumulation on existing timings.
     ///
     /// Returns the number of events processed.
     fn aggregate_profile(
@@ -260,10 +270,12 @@ impl ProfileData {
         let mut count = 0;
         let mut raw_duration_sum = Duration::ZERO;
         let mut recorded_self_time_sum = Duration::ZERO;
+        let mut self_profile_self_time_sum = Duration::ZERO;
 
         // Track min start / max end timestamps for wall-clock.
         // All events contribute to a single wall-clock span. Unattributed
         // events (including backend) go to event_times_ms on the target.
+        // We subtract self-profile self-time from the span at the end.
         let mut min_start: Option<SystemTime> = None;
         let mut max_end: Option<SystemTime> = None;
 
@@ -306,6 +318,9 @@ impl ProfileData {
 
                 // Top event ended before current event started - finalize it.
                 let entry = thread.stack.pop().expect("stack entry missing");
+                if is_self_profile_label(entry.event.label.as_ref()) {
+                    self_profile_self_time_sum += entry.self_time;
+                }
                 let ancestor_local =
                     nearest_local_ancestor(&thread.stack, symbol_paths)
                         .cloned();
@@ -341,6 +356,9 @@ impl ProfileData {
         for (_, thread) in threads {
             let mut stack = thread.stack;
             while let Some(entry) = stack.pop() {
+                if is_self_profile_label(entry.event.label.as_ref()) {
+                    self_profile_self_time_sum += entry.self_time;
+                }
                 let ancestor_local =
                     nearest_local_ancestor(&stack, symbol_paths).cloned();
                 if let Some(recorded) = self.record_event(
@@ -362,12 +380,16 @@ impl ProfileData {
             .target_timings
             .entry(crate_name.to_string())
             .or_default();
-        timings.wall_time += duration_between(min_start, max_end);
+        // Subtract self-profile overhead from the raw wall-clock span.
+        let wall_time = duration_between(min_start, max_end)
+            .saturating_sub(self_profile_self_time_sum);
+        timings.wall_time += wall_time;
 
         // Log the inflation ratio for debugging.
         info!(
             raw_ms = raw_duration_sum.as_millis(),
             self_time_ms = recorded_self_time_sum.as_millis(),
+            self_profile_ms = self_profile_self_time_sum.as_millis(),
             wall_time_ms = timings.wall_time.as_secs_f64() * 1000.0,
             "self-time sums"
         );
@@ -382,6 +404,7 @@ impl ProfileData {
     ///   keyed by normalized `DefPath` then event label).
     /// - Events without a usable `DefPath` go to `event_times_ms` (target-level,
     ///   keyed by event label).
+    /// - Self-profile bookkeeping events (`self_profile_*`) are ignored.
     ///
     /// If `symbol_paths` is provided, a local `DefPath` is only considered
     /// a symbol when it exists in that set. Otherwise we fall back to the
@@ -399,6 +422,12 @@ impl ProfileData {
         symbol_paths: Option<&HashSet<String>>,
     ) -> Option<Duration> {
         let label = &*event.label;
+
+        // Skip self-profile bookkeeping; it reflects profiling overhead,
+        // not compilation work we want to model or split across crates.
+        if is_self_profile_label(label) {
+            return None;
+        }
 
         let local_matches_symbol = local_path.is_some_and(|path| {
             symbol_paths.is_none_or(|symbols| symbols.contains(path))
@@ -802,6 +831,14 @@ fn is_descendant_segment(segment: &str) -> bool {
     }
 
     false
+}
+
+/// Returns true if the event label represents self-profile bookkeeping.
+///
+/// These events are profiling overhead and should not be included in
+/// per-symbol or per-target cost accounting.
+fn is_self_profile_label(label: &str) -> bool {
+    label.starts_with("self_profile_")
 }
 
 fn local_path_for_event(
@@ -1284,6 +1321,48 @@ mod tests {
         );
     }
 
+    /// Self-profile bookkeeping time is subtracted from wall-clock span.
+    #[test]
+    fn test_wall_clock_subtracts_self_profile_time() {
+        use analyzeme::ProfilingDataBuilder;
+
+        let ms = 1_000_000;
+        let mut builder = ProfilingDataBuilder::new();
+        builder
+            .interval(
+                "GenericActivity",
+                "self_profile_alloc_query_strings",
+                0,
+                0,
+                5 * ms,
+                |_| {},
+            )
+            .interval("Query", "typeck", 0, 10 * ms, 20 * ms, |_| {})
+            .interval(
+                "GenericActivity",
+                "self_profile_alloc_query_strings",
+                0,
+                30 * ms,
+                50 * ms,
+                |_| {},
+            );
+
+        let profile = builder.into_profiling_data();
+        let mut data = ProfileData::default();
+        data.aggregate_profile(&profile, "test_crate", None);
+
+        let timings =
+            data.get_target_timings("test_crate").expect("should exist");
+
+        // Raw span is 50ms (0..50). Self-profile self-time is 25ms, so we
+        // expect 50 - 25 = 25ms after subtracting profiling overhead.
+        assert!(
+            (timings.wall_time.as_secs_f64() * 1000.0 - 25.0).abs() < 0.1,
+            "Expected wall_time_ms ~25.0, got {}",
+            timings.wall_time.as_secs_f64() * 1000.0
+        );
+    }
+
     /// Metadata events are now part of the wall-clock span
     /// and recorded in `event_times_ms` with their raw label.
     #[test]
@@ -1501,8 +1580,8 @@ mod tests {
         );
     }
 
-    /// Events without a `DefPath` (e.g., `incr_comp`, `self_profile`) are now
-    /// tracked in `event_times_ms` rather than being silently dropped.
+    /// Events without a `DefPath` (e.g., `incr_comp`) are now tracked in
+    /// `event_times_ms` rather than being silently dropped.
     #[test]
     fn test_unattributed_events_in_event_times_ms() {
         use analyzeme::ProfilingDataBuilder;
@@ -1542,6 +1621,36 @@ mod tests {
             (timings.wall_time.as_secs_f64() * 1000.0 - 20.0).abs() < 0.1,
             "Expected wall_time_ms ~20, got {}",
             timings.wall_time.as_secs_f64() * 1000.0
+        );
+    }
+
+    /// Self-profile bookkeeping events are excluded from `event_times_ms`.
+    #[test]
+    fn test_self_profile_events_ignored() {
+        use analyzeme::ProfilingDataBuilder;
+
+        let ms = 1_000_000;
+        let mut builder = ProfilingDataBuilder::new();
+        builder.interval(
+            "GenericActivity",
+            "self_profile_alloc_query_strings",
+            0,
+            0,
+            10 * ms,
+            |_| {},
+        );
+
+        let profile = builder.into_profiling_data();
+        let mut data = ProfileData::default();
+        data.aggregate_profile(&profile, "test_crate", None);
+
+        let timings =
+            data.get_target_timings("test_crate").expect("should exist");
+        assert!(
+            !timings
+                .event_times_ms
+                .contains_key("self_profile_alloc_query_strings"),
+            "self_profile_* events should be ignored",
         );
     }
 

@@ -1,24 +1,15 @@
-//! Split recommendation engine: horizon analysis and candidate evaluation.
+//! Horizon-based shatter helpers and cost distribution logic.
 //!
-//! Combines two phases:
-//!
-//! 1. **Effective horizon computation** — each SCC in a target's intra-target
-//!    DAG gets an "effective horizon": the earliest wall-clock time at which
-//!    it could begin compiling, given its external dependencies and the
-//!    horizons of its predecessors.
-//!
-//! 2. **Split candidate generation** — finds threshold cuts where a
-//!    significant jump in effective horizon indicates a good split boundary.
-//!    For each candidate, computes both the local improvement (within the
-//!    target) and the global improvement (full schedule recomputation).
+//! Computes effective horizons for SCCs inside a target and provides
+//! utilities to shatter a target into horizon groups while distributing
+//! target-level overhead costs across the new groups.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
 use tarjanize_schemas::{
-    CostModel, Module, SymbolGraph, Target, TargetTimings, serde_duration,
+    CostModel, Module, SymbolGraph, SymbolKind, Target, TargetTimings,
 };
 
 use crate::data::ScheduleData;
@@ -52,7 +43,7 @@ pub fn compute_effective_horizons(
     // target-level dependency set (e.g. benchmark/test targets in the
     // same package, or re-exported paths from non-dependencies). Including
     // those would inflate max_horizon beyond the target's real start time,
-    // making all splits appear detrimental.
+    // making shatter groups look later than they really are.
     let target_prefix = format!("[{target_id}]::");
     let (package_name, target_key) = target_id
         .split_once('/')
@@ -215,324 +206,194 @@ pub fn collect_external_max_finish<S: BuildHasher>(
     result
 }
 
-/// Ranked split candidates for a single target.
+/// Per-group scaling ratios for distributing target-level event costs.
 ///
-/// Contains the target's current cost and a list of candidate threshold
-/// cuts, sorted by global improvement (most beneficial first). An empty
-/// `candidates` list means the target has no beneficial split points.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SplitRecommendation {
-    /// Target identifier in `{package}/{target}` format.
-    pub target: String,
-    /// Current predicted compilation cost.
-    #[serde(rename = "current_cost_ms", with = "serde_duration")]
-    pub current_cost: Duration,
-    /// Candidate splits, sorted by `global_improvement` descending.
-    pub candidates: Vec<SplitCandidate>,
+/// These ratios let us apply different heuristics per event category while
+/// keeping all distribution logic in one place.
+struct GroupRatios {
+    /// Ratio based on attributed frontend cost (proxy for body complexity).
+    attr: Vec<f64>,
+    /// Ratio based on symbol count (proxy for crate-level passes).
+    sym: Vec<f64>,
+    /// Ratio based on impl count (proxy for trait-system workload).
+    impls: Vec<f64>,
+    /// Ratio based on dependency usage (proxy for metadata load).
+    deps: Vec<f64>,
 }
 
-/// A single candidate split at a specific horizon threshold.
+/// Computes normalized ratios from per-group counts.
 ///
-/// Represents cutting the SCC DAG into a "downset" (SCCs with effective
-/// horizon at or below the threshold) and an "upset" (remaining SCCs).
-/// The downset becomes a new dependency crate that can begin compiling
-/// earlier, while the upset keeps the original target name.
-#[derive(Debug, Deserialize, Serialize)]
-pub struct SplitCandidate {
-    /// The effective horizon threshold for this cut.
-    #[serde(rename = "threshold_ms", with = "serde_duration")]
-    pub threshold: Duration,
-    /// Reduction in the target's own compilation time from parallelism.
-    #[serde(rename = "local_improvement_ms", with = "serde_duration")]
-    pub local_improvement: Duration,
-    /// Reduction in the full build's critical path length.
-    #[serde(rename = "global_improvement_ms", with = "serde_duration")]
-    pub global_improvement: Duration,
-    /// Number of SCCs in the downset (new dependency crate).
-    pub downset_scc_count: usize,
-    /// Predicted cost of the downset crate.
-    #[serde(rename = "downset_cost_ms", with = "serde_duration")]
-    pub downset_cost: Duration,
-    /// Number of SCCs in the upset (residual crate).
-    pub upset_scc_count: usize,
-    /// Predicted cost of the upset crate.
-    #[serde(rename = "upset_cost_ms", with = "serde_duration")]
-    pub upset_cost: Duration,
-    /// Module paths in the downset.
-    pub downset_modules: Vec<String>,
-    /// Module paths in the upset.
-    pub upset_modules: Vec<String>,
-    /// All distinct module paths touched by this split.
-    pub split_modules: Vec<String>,
+/// Returns a uniform ratio if all counts are zero so we avoid division by
+/// zero and still distribute costs predictably.
+fn normalized_ratios_from_usize(counts: &[usize]) -> Vec<f64> {
+    if counts.is_empty() {
+        // No groups to scale; return an empty ratio vector.
+        return Vec::new();
+    }
+    let len_u32 = u32::try_from(counts.len()).expect("ratio length fits u32");
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        // Uniform fallback keeps total cost conserved when no signals exist.
+        return vec![1.0 / f64::from(len_u32); counts.len()];
+    }
+    let total_u32 = u32::try_from(total).expect("count fits u32");
+    let total_f = f64::from(total_u32);
+    // Normalize each group's count to a ratio so the distribution sums to 1.
+    counts
+        .iter()
+        .map(|&count| {
+            let count_u32 = u32::try_from(count).expect("count fits u32");
+            f64::from(count_u32) / total_f
+        })
+        .collect()
 }
 
-/// Generates ranked split candidates for a target.
+/// Computes normalized ratios from floating-point counts.
 ///
-/// Analyzes the target's intra-target SCC DAG to find threshold cuts
-/// where differing effective horizons indicate a beneficial split. For
-/// each candidate, computes both local improvement (within-target
-/// parallelism gain) and global improvement (full schedule critical
-/// path reduction).
+/// Falls back to the provided ratio if the total is zero.
+fn normalized_ratios_from_f64(counts: &[f64], fallback: &[f64]) -> Vec<f64> {
+    let total: f64 = counts.iter().sum();
+    if total <= 0.0 {
+        // No signal available; fall back to the provided ratio.
+        return fallback.to_vec();
+    }
+    // Normalize by total so ratios sum to 1.
+    counts.iter().map(|&count| count / total).collect()
+}
+
+/// Computes normalized ratios from per-group counts with a fallback.
 ///
-/// Returns a `SplitRecommendation` with candidates sorted by
-/// `global_improvement` descending. Candidates with negative local
-/// improvement are filtered out (they would make things worse).
-pub fn compute_split_recommendations(
-    symbol_graph: &SymbolGraph,
-    target_id: &str,
-    schedule: &ScheduleData,
-    cost_model: Option<&CostModel>,
-) -> SplitRecommendation {
-    let empty = SplitRecommendation {
-        target: target_id.to_string(),
-        current_cost: Duration::ZERO,
-        candidates: Vec::new(),
-    };
+/// Used for impl counts: if there are no impls at all, we fall back to
+/// symbol-count scaling to avoid a zeroed distribution.
+fn normalized_ratios_from_usize_with_fallback(
+    counts: &[usize],
+    fallback: &[f64],
+) -> Vec<f64> {
+    let total: usize = counts.iter().sum();
+    if total == 0 {
+        // No impls at all; reuse the fallback distribution.
+        return fallback.to_vec();
+    }
+    normalized_ratios_from_usize(counts)
+}
 
-    // Look up the target's current cost from the schedule.
-    let Some(target_data) =
-        schedule.targets.iter().find(|t| t.name == target_id)
-    else {
-        return empty;
-    };
-    let current_cost = target_data.cost;
-
-    // Condense the target into its SCC DAG.
-    let Some(intra) = condense_target(symbol_graph, target_id) else {
-        return SplitRecommendation {
-            target: target_id.to_string(),
-            current_cost,
-            candidates: Vec::new(),
+/// Counts impl symbols per group using the `sym_to_group` lookup.
+///
+/// This lets trait-system costs scale with impl density instead of generic
+/// symbol counts.
+fn count_impls_by_group(
+    module: &Module,
+    target_prefix: &str,
+    module_path: &str,
+    sym_to_group: &HashMap<&str, usize>,
+    counts: &mut [usize],
+) {
+    // Walk symbols in this module and increment the owning group's impl count.
+    for (name, symbol) in &module.symbols {
+        let full_path = if module_path.is_empty() {
+            format!("{target_prefix}{name}")
+        } else {
+            format!("{target_prefix}{module_path}::{name}")
         };
-    };
+        if matches!(symbol.kind, SymbolKind::Impl { .. })
+            && let Some(&group) = sym_to_group.get(full_path.as_str())
+        {
+            counts[group] += 1;
+        }
+    }
 
-    // Compute effective horizons for each SCC.
-    let horizons =
-        compute_effective_horizons(&intra, symbol_graph, target_id, schedule);
-
-    if horizons.is_empty() {
-        return SplitRecommendation {
-            target: target_id.to_string(),
-            current_cost,
-            candidates: Vec::new(),
+    // Recurse into submodules to cover the full target.
+    for (submod_name, submod) in &module.submodules {
+        let child_path = if module_path.is_empty() {
+            submod_name.clone()
+        } else {
+            format!("{module_path}::{submod_name}")
         };
-    }
-
-    // Find the maximum horizon — thresholds must be strictly less than
-    // this to produce a non-trivial split.
-    let max_horizon = horizons.iter().copied().max().unwrap_or(Duration::ZERO);
-
-    // Collect distinct threshold values strictly less than max_horizon.
-    // Each unique horizon value is a potential cut point.
-    let mut thresholds: Vec<Duration> = horizons
-        .iter()
-        .copied()
-        .filter(|&h| h < max_horizon)
-        .collect();
-    thresholds.sort_unstable();
-    thresholds.dedup();
-
-    // Look up target-level timing data for cost model predictions.
-    // Each half inherits the full target's meta/other overhead.
-    let (meta, other) = extract_meta_other(symbol_graph, target_id);
-
-    let ctx = ThresholdContext {
-        intra: &intra,
-        horizons: &horizons,
-        max_horizon,
-        target_data,
-        current_cost,
-        meta,
-        other,
-        cost_model,
-        schedule,
-        target_id,
-    };
-
-    let candidates: Vec<SplitCandidate> = thresholds
-        .iter()
-        .filter_map(|&threshold| evaluate_threshold(&ctx, threshold))
-        .collect();
-
-    let mut sorted = candidates;
-    sorted.sort_by_key(|c| std::cmp::Reverse(c.global_improvement));
-
-    SplitRecommendation {
-        target: target_id.to_string(),
-        current_cost,
-        candidates: sorted,
+        count_impls_by_group(
+            submod,
+            target_prefix,
+            &child_path,
+            sym_to_group,
+            counts,
+        );
     }
 }
 
-/// Context for evaluating threshold candidates within a single target.
+/// Distributes target-level event timings across shatter groups.
 ///
-/// Groups the per-target state needed by `evaluate_threshold` to keep
-/// the parameter count within clippy's limit.
-struct ThresholdContext<'a> {
-    intra: &'a IntraTargetGraph,
-    horizons: &'a [Duration],
-    max_horizon: Duration,
-    target_data: &'a crate::data::TargetData,
-    current_cost: Duration,
-    meta: f64,
-    other: f64,
-    cost_model: Option<&'a CostModel>,
-    schedule: &'a ScheduleData,
-    target_id: &'a str,
-}
-
-/// Evaluates a single threshold cut, returning a `SplitCandidate` if
-/// the split produces a positive local improvement, or `None` otherwise.
+/// The event list is biased toward omicron's top-15 "other" events. Anything
+/// not explicitly categorized falls back to symbol-count scaling.
 ///
-/// This is extracted from `compute_split_recommendations` to keep the
-/// main function under the line-count lint threshold.
-fn evaluate_threshold(
-    ctx: &ThresholdContext<'_>,
-    threshold: Duration,
-) -> Option<SplitCandidate> {
-    // Partition SCCs into downset (horizon <= threshold) and upset.
-    let downset_indices: Vec<usize> = (0..ctx.intra.nodes.len())
-        .filter(|&i| ctx.horizons[i] <= threshold)
-        .collect();
-    let upset_indices: Vec<usize> = (0..ctx.intra.nodes.len())
-        .filter(|&i| ctx.horizons[i] > threshold)
-        .collect();
+/// TODO: Re-evaluate the top events across more workspaces and expand
+/// the explicit list if needed.
+fn distribute_event_times(
+    event_times: &HashMap<String, f64>,
+    group_ratios: &GroupRatios,
+) -> (Vec<HashMap<String, f64>>, Vec<f64>, Vec<f64>) {
+    let group_count = group_ratios.sym.len();
+    let mut per_group: Vec<HashMap<String, f64>> =
+        vec![HashMap::new(); group_count];
+    let mut group_meta = vec![0.0; group_count];
+    let mut group_other = vec![0.0; group_count];
 
-    if downset_indices.is_empty() || upset_indices.is_empty() {
-        return None;
+    // Apply per-event scaling rules to build each group's event map.
+    for (label, &ms) in event_times {
+        let is_meta = label.starts_with("metadata_");
+        let ratios = if is_meta {
+            // Metadata decode and registration scales with dependency usage
+            // (per group deps).
+            &group_ratios.deps
+        } else {
+            match label.as_str() {
+                "compare_impl_item" | "specialization_graph_of" => {
+                    // Trait-system costs scale with impl density.
+                    &group_ratios.impls
+                }
+                "typeck"
+                | "mir_borrowck"
+                | "evaluate_obligation"
+                | "type_op_prove_predicate"
+                | "mir_built"
+                | "check_well_formed" => {
+                    // Function-body analysis scales with attributed frontend cost.
+                    &group_ratios.attr
+                }
+                "expand_proc_macro" => {
+                    // We don't know which symbols were generated by proc macros,
+                    // so approximate by symbol count.
+                    &group_ratios.sym
+                }
+                "expand_crate"
+                | "hir_crate"
+                | "late_resolve_crate"
+                | "check_mod_privacy"
+                | "incr_comp_encode_dep_graph" => {
+                    // Crate-level passes scale with overall item volume.
+                    &group_ratios.sym
+                }
+                _ => {
+                    // Fallback: distribute by symbol count to avoid duplication.
+                    &group_ratios.sym
+                }
+            }
+        };
+
+        // Distribute this event's cost across groups using the chosen ratio.
+        for g in 0..group_count {
+            let allocated_ms = ms * ratios[g];
+            if allocated_ms <= 0.0 {
+                continue;
+            }
+            per_group[g].insert(label.clone(), allocated_ms);
+            if is_meta {
+                group_meta[g] += allocated_ms;
+            } else {
+                group_other[g] += allocated_ms;
+            }
+        }
     }
 
-    // Compute raw attr costs (sum of SCC cost values) as f64 ms for the
-    // cost model, which operates in f64 millisecond space.
-    let downset_attr: f64 = downset_indices
-        .iter()
-        .map(|&i| ctx.intra.nodes[i].cost.as_secs_f64() * 1000.0)
-        .sum();
-    let upset_attr: f64 = upset_indices
-        .iter()
-        .map(|&i| ctx.intra.nodes[i].cost.as_secs_f64() * 1000.0)
-        .sum();
-
-    // Predict costs for each half. With a cost model, use the predict
-    // function (each half inherits the full target's meta/other).
-    // Without a cost model, use raw attr sums. The cost model operates
-    // in f64 milliseconds, so we convert to Duration at the boundary.
-    let (downset_cost, upset_cost) = if let Some(model) = ctx.cost_model {
-        (
-            Duration::from_secs_f64(
-                model.predict(downset_attr, ctx.meta, ctx.other) / 1000.0,
-            ),
-            Duration::from_secs_f64(
-                model.predict(upset_attr, ctx.meta, ctx.other) / 1000.0,
-            ),
-        )
-    } else {
-        (
-            Duration::from_secs_f64(downset_attr / 1000.0),
-            Duration::from_secs_f64(upset_attr / 1000.0),
-        )
-    };
-
-    // Compute local improvement: how much the target's finish time
-    // improves from splitting. The downset starts at `threshold`,
-    // the upset starts at `max(threshold + downset_cost, max_horizon)`.
-    let downset_finish = threshold + downset_cost;
-    let upset_start = (threshold + downset_cost).max(ctx.max_horizon);
-    let upset_finish = upset_start + upset_cost;
-    let split_finish = downset_finish.max(upset_finish);
-    let original_finish = ctx.target_data.start + ctx.current_cost;
-    let local_improvement = original_finish.saturating_sub(split_finish);
-
-    // Filter out splits with zero or negative local improvement.
-    if local_improvement.is_zero() {
-        return None;
-    }
-
-    // Compute global improvement by recomputing the schedule with
-    // the target replaced by two halves. The downset only needs deps
-    // that finish at or before the threshold — that's the whole point
-    // of the split (the downset can start compiling earlier).
-    let global_improvement = compute_global_improvement(
-        ctx.schedule,
-        ctx.target_id,
-        downset_cost,
-        upset_cost,
-        threshold,
-    );
-
-    let downset_modules = collect_modules(ctx.intra, &downset_indices);
-    let upset_modules = collect_modules(ctx.intra, &upset_indices);
-    let all_indices: Vec<usize> = (0..ctx.intra.nodes.len()).collect();
-    let split_modules = collect_modules(ctx.intra, &all_indices);
-
-    Some(SplitCandidate {
-        threshold,
-        local_improvement,
-        global_improvement,
-        downset_scc_count: downset_indices.len(),
-        downset_cost,
-        upset_scc_count: upset_indices.len(),
-        upset_cost,
-        downset_modules,
-        upset_modules,
-        split_modules,
-    })
-}
-
-/// Extracts meta and other timing components from target-level timings.
-///
-/// Meta = sum of `metadata_decode_*` events. Other = sum of non-metadata
-/// events. These are used by the cost model to predict compilation time
-/// for synthetic crate halves. Each half inherits the full target's
-/// meta/other overhead (conservative estimate).
-fn extract_meta_other(
-    symbol_graph: &SymbolGraph,
-    target_id: &str,
-) -> (f64, f64) {
-    let Some((pkg, tgt)) = target_id.split_once('/') else {
-        return (0.0, 0.0);
-    };
-    let Some(package) = symbol_graph.packages.get(pkg) else {
-        return (0.0, 0.0);
-    };
-    let Some(target) = package.targets.get(tgt) else {
-        return (0.0, 0.0);
-    };
-
-    let meta: f64 = target
-        .timings
-        .event_times_ms
-        .iter()
-        .filter(|(k, _)| k.starts_with("metadata_decode_"))
-        .map(|(_, v)| v)
-        .sum();
-    let other: f64 = target
-        .timings
-        .event_times_ms
-        .iter()
-        .filter(|(k, _)| !k.starts_with("metadata_decode_"))
-        .map(|(_, v)| v)
-        .sum();
-
-    (meta, other)
-}
-
-/// Collects distinct module paths for a set of SCC indices.
-///
-/// Returns sorted, deduplicated module paths from the specified SCC
-/// nodes. Used to populate the module breakdown fields in
-/// `SplitCandidate`.
-fn collect_modules(
-    intra: &IntraTargetGraph,
-    scc_indices: &[usize],
-) -> Vec<String> {
-    let mut modules: Vec<String> = scc_indices
-        .iter()
-        .map(|&i| intra.nodes[i].module_path.clone())
-        .collect();
-    modules.sort();
-    modules.dedup();
-    modules
+    (per_group, group_meta, group_other)
 }
 
 /// Shatters a target by horizon, grouping SCCs by effective horizon.
@@ -543,8 +404,10 @@ fn collect_modules(
 /// batched together, giving realistic parallelism gains without the
 /// overhead of one-target-per-SCC.
 ///
-/// Each group target uses raw attr cost (sum of member SCC costs, no
-/// per-target overhead). Dependencies are wired precisely:
+/// Each group target starts from raw attr cost (sum of member SCC costs).
+/// If a cost model is provided, target-level event costs are distributed
+/// across groups and fed into the model to estimate per-group overhead.
+/// Dependencies are wired precisely:
 /// - Each group inherits the union of external deps from its SCCs.
 /// - Inter-group edges are derived from the intra-target SCC DAG.
 /// - Dependents are rewired to the specific groups they reference.
@@ -589,8 +452,8 @@ pub fn shatter_target(
     }
 
     // Look up target-level timing data for cost model predictions.
-    // Each group inherits the full target's meta/other overhead.
-    let (meta, other) = extract_meta_other(symbol_graph, target_id);
+    // We distribute target-level event costs across groups instead of
+    // duplicating everything into each group.
 
     // Calculate dependency scaling ratios.
     // The "Scaled Metadata Cost" hypothesis assumes metadata decode cost is
@@ -639,26 +502,57 @@ pub fn shatter_target(
     // Aggregate per-group cost and symbol count from member SCCs.
     let mut group_costs = vec![Duration::ZERO; group_count];
     let mut group_attr = vec![0.0; group_count];
-    let mut group_sym_counts = vec![0_usize; group_count];
+    let mut group_scc_sym_counts = vec![0_usize; group_count];
     for node in &intra.nodes {
         let g = scc_to_group[node.id];
         group_attr[g] += node.cost.as_secs_f64() * 1000.0;
-        group_sym_counts[g] += node.symbols.len();
+        group_scc_sym_counts[g] += node.symbols.len();
     }
+
+    // Track impl counts per group for trait-system event scaling.
+    let mut group_impl_counts = vec![0_usize; group_count];
+    count_impls_by_group(
+        &target_obj.root,
+        &target_prefix,
+        "",
+        &sym_to_group,
+        &mut group_impl_counts,
+    );
+
+    // Use SCC symbol counts for scaling (excludes non-compilable re-exports).
+    let sym_ratio = normalized_ratios_from_usize(&group_scc_sym_counts);
+    let attr_ratio = normalized_ratios_from_f64(&group_attr, &sym_ratio);
+    let impl_ratio = normalized_ratios_from_usize_with_fallback(
+        &group_impl_counts,
+        &sym_ratio,
+    );
+    let scales = GroupRatios {
+        attr: attr_ratio,
+        sym: sym_ratio,
+        impls: impl_ratio,
+        deps: group_ratios.clone(),
+    };
+
+    // Distribute target-level event costs across groups.
+    let (group_event_times, group_meta, group_other) =
+        distribute_event_times(&target_obj.timings.event_times_ms, &scales);
 
     // Compute final group costs using the cost model if available.
     for g in 0..group_count {
         if let Some(model) = cost_model {
-            let ratio = group_ratios[g];
-            // Metadata cost scales with dependencies. Other overhead (linking, etc.)
-            // is per-crate, so it is retained (duplicated) for each new group.
+            // Use per-group meta/other instead of duplicating the full target.
             group_costs[g] = Duration::from_secs_f64(
-                model.predict(group_attr[g], meta * ratio, other) / 1000.0,
+                model.predict(group_attr[g], group_meta[g], group_other[g])
+                    / 1000.0,
             );
         } else {
             group_costs[g] = Duration::from_secs_f64(group_attr[g] / 1000.0);
         }
     }
+
+    // Start with SCC symbol counts; we add non-compilable extras later
+    // to keep the schedule's symbol_count consistent with the original.
+    let mut group_sym_counts = group_scc_sym_counts.clone();
 
     // The SCC DAG excludes Use/ExternCrate symbols (they're re-exports,
     // not compilable). Account for them so the shattered groups' total
@@ -696,7 +590,7 @@ pub fn shatter_target(
         &scc_to_group,
         group_count,
         &group_costs,
-        &group_ratios,
+        &group_event_times,
     );
 
     let tg = build_shattered_target_graph(
@@ -901,7 +795,9 @@ fn group_sccs_by_horizon(horizons: &[Duration]) -> (Vec<usize>, usize) {
 /// Clones the original graph, then replaces the shattered target with
 /// one target per horizon group. Each group target contains only the
 /// symbols from its member SCCs, moved from the original target's module
-/// tree using the `export` helpers. The original target is removed.
+/// tree using the `export` helpers. Target-level event timings are
+/// pre-distributed per group and applied directly. The original target
+/// is removed.
 ///
 /// This ensures `/api/tree/{pkg}/{target}::group_N` resolves correctly
 /// after shattering.
@@ -917,7 +813,7 @@ fn build_shattered_symbol_graph(
     scc_to_group: &[usize],
     group_count: usize,
     group_costs: &[Duration],
-    group_ratios: &[f64],
+    group_event_times: &[HashMap<String, f64>],
 ) -> SymbolGraph {
     use crate::export::{
         insert_symbol_into_module, parse_symbol_path, remove_symbol_from_module,
@@ -965,28 +861,14 @@ fn build_shattered_symbol_graph(
         }
     }
 
-    // Capture original timings for distribution before removing the target.
-    let original_timings = source_target.timings.clone();
     let original_deps = source_target.dependencies.clone();
     pkg.targets.remove(target_key);
 
     for (g, root) in group_roots.into_iter().enumerate() {
         let group_key = format!("{target_key}::group_{g}");
-        let ratio = group_ratios[g];
 
-        // Populate event_times_ms by iterating original events.
-        // - Metadata events are scaled by ratio.
-        // - Other events are retained (unscaled).
-        let mut event_times = HashMap::new();
-        for (key, &val) in &original_timings.event_times_ms {
-            if key.starts_with("metadata_decode_") {
-                if ratio > 0.0 {
-                    event_times.insert(key.clone(), val * ratio);
-                }
-            } else {
-                event_times.insert(key.clone(), val);
-            }
-        }
+        // Use the pre-distributed per-event timings for this group.
+        let event_times = group_event_times[g].clone();
 
         let group_target = Target {
             timings: TargetTimings {
@@ -1179,134 +1061,6 @@ fn collect_referenced_groups(
     groups.sort_unstable();
     groups.dedup();
     groups
-}
-
-/// Computes the global critical path improvement from splitting a target.
-///
-/// Builds a modified `TargetGraph` where the original target is replaced
-/// by two halves (downset + upset), recomputes the schedule, and returns
-/// the reduction in critical path length.
-///
-/// The downset half gets synthetic name `"{target_id}::downset"` and
-/// the upset keeps the original target name. Wiring:
-/// - Dependencies finishing at or before `threshold` -> downset only
-/// - All original dependencies -> upset
-/// - Downset -> upset edge (upset depends on downset)
-/// - Both halves -> original target's dependents
-///
-/// The downset only needs the subset of dependencies whose finish times
-/// are at or below the threshold — that's the scheduling advantage of the
-/// split. The upset still needs all original deps (plus the downset).
-fn compute_global_improvement(
-    schedule: &ScheduleData,
-    target_id: &str,
-    downset_cost: Duration,
-    upset_cost: Duration,
-    threshold: Duration,
-) -> Duration {
-    use indexmap::IndexSet;
-    use petgraph::graph::{DiGraph, NodeIndex};
-
-    let original_cp = schedule.summary.critical_path;
-
-    // Find the target index in the schedule.
-    let Some(target_idx) =
-        schedule.targets.iter().position(|t| t.name == target_id)
-    else {
-        return Duration::ZERO;
-    };
-
-    let target_data = &schedule.targets[target_idx];
-    let mut names = IndexSet::new();
-    let mut costs = Vec::new();
-    let mut symbol_counts = Vec::new();
-
-    // Add all existing targets, substituting costs for the split target.
-    for (i, t) in schedule.targets.iter().enumerate() {
-        if i == target_idx {
-            // The upset keeps the original target name but with the
-            // upset's cost.
-            names.insert(t.name.clone());
-            costs.push(upset_cost);
-            symbol_counts.push(t.symbol_count);
-        } else {
-            names.insert(t.name.clone());
-            costs.push(t.cost);
-            symbol_counts.push(t.symbol_count);
-        }
-    }
-
-    // Add the downset as a new target.
-    let downset_name = format!("{target_id}::downset");
-    names.insert(downset_name);
-    costs.push(downset_cost);
-    // Symbol count for synthetic half is approximate; doesn't affect
-    // scheduling.
-    symbol_counts.push(0);
-
-    let total = names.len();
-    let downset_idx = total - 1;
-
-    // Build the dependency graph.
-    let mut graph = DiGraph::<usize, ()>::with_capacity(total, 0);
-    for i in 0..total {
-        graph.add_node(i);
-    }
-
-    // Reconstruct original edges, excluding edges to/from the split target.
-    for (i, t) in schedule.targets.iter().enumerate() {
-        for &dep_idx in &t.deps {
-            if i == target_idx || dep_idx == target_idx {
-                continue; // Handle separately below.
-            }
-            graph.add_edge(NodeIndex::new(dep_idx), NodeIndex::new(i), ());
-        }
-    }
-
-    // Wire the split target's dependencies. The upset gets ALL original
-    // deps. The downset only gets deps that finish at or before the
-    // threshold — the whole point of the split is that the downset can
-    // start earlier because it doesn't need late-finishing deps.
-    for &dep_idx in &target_data.deps {
-        let dep_finish = schedule.targets[dep_idx].finish;
-
-        // All deps -> upset (original position).
-        graph.add_edge(NodeIndex::new(dep_idx), NodeIndex::new(target_idx), ());
-
-        // Only early-finishing deps -> downset.
-        if dep_finish <= threshold {
-            graph.add_edge(
-                NodeIndex::new(dep_idx),
-                NodeIndex::new(downset_idx),
-                (),
-            );
-        }
-    }
-
-    // Wire downset -> upset (upset depends on downset).
-    graph.add_edge(NodeIndex::new(downset_idx), NodeIndex::new(target_idx), ());
-
-    // Wire both halves -> original target's dependents.
-    for &dep_idx in &target_data.dependents {
-        // upset -> dependent (already handled via original position)
-        graph.add_edge(NodeIndex::new(target_idx), NodeIndex::new(dep_idx), ());
-        // downset -> dependent (downset is also a dep of dependents)
-        graph.add_edge(
-            NodeIndex::new(downset_idx),
-            NodeIndex::new(dep_idx),
-            (),
-        );
-    }
-
-    let modified_tg = TargetGraph {
-        names,
-        costs,
-        symbol_counts,
-        graph,
-    };
-
-    let new_schedule = compute_schedule(&modified_tg);
-    original_cp.saturating_sub(new_schedule.summary.critical_path)
 }
 
 #[cfg(test)]
@@ -1516,255 +1270,6 @@ mod tests {
             Some("a/test")
         );
         assert_eq!(extract_target_from_path("no_brackets"), None);
-    }
-
-    // =================================================================
-    // Split recommendation tests
-    // =================================================================
-
-    #[test]
-    fn recommend_produces_candidate_for_split_horizon() {
-        // "a" depends on external dep finishing at 50ms, "b" has no
-        // external deps. One candidate at threshold 0.0 separating
-        // "b" (downset) from "a" (upset).
-        let (sg, schedule) = make_graph_with_external_dep(
-            &[("a", 10.0, &["[dep-a/lib]::foo"]), ("b", 20.0, &[])],
-            50.0,
-        );
-        let result =
-            compute_split_recommendations(&sg, "test-pkg/lib", &schedule, None);
-        assert_eq!(result.target, "test-pkg/lib");
-        assert_eq!(result.candidates.len(), 1);
-        let c = &result.candidates[0];
-        assert!(
-            c.threshold.is_zero(),
-            "threshold should be Duration::ZERO, got {:?}",
-            c.threshold
-        );
-        assert_eq!(c.downset_scc_count, 1);
-        assert_eq!(c.upset_scc_count, 1);
-    }
-
-    #[test]
-    fn recommend_global_improvement_nonzero_for_critical_path() {
-        // "b" has no external deps (horizon 0), "a" depends on dep-a
-        // (horizon 50). The split downset ("b") can start at T=0
-        // instead of waiting for dep-a. Since test-pkg/lib is on the
-        // critical path, this should produce a global improvement.
-        let (sg, schedule) = make_graph_with_external_dep(
-            &[("a", 10.0, &["[dep-a/lib]::foo"]), ("b", 50.0, &[])],
-            50.0,
-        );
-        let result =
-            compute_split_recommendations(&sg, "test-pkg/lib", &schedule, None);
-        assert_eq!(result.candidates.len(), 1);
-        let c = &result.candidates[0];
-        assert!(
-            !c.global_improvement.is_zero(),
-            "critical path split should have positive global improvement, \
-             got {:?}",
-            c.global_improvement
-        );
-        assert!(
-            !c.local_improvement.is_zero(),
-            "split should have positive local improvement, got {:?}",
-            c.local_improvement
-        );
-    }
-
-    #[test]
-    fn recommend_empty_when_all_horizons_equal() {
-        // Two independent symbols, no external deps. All horizons are 0.
-        let (sg, schedule) = make_graph_with_external_dep(
-            &[("a", 10.0, &[]), ("b", 20.0, &[])],
-            50.0,
-        );
-        let result =
-            compute_split_recommendations(&sg, "test-pkg/lib", &schedule, None);
-        assert!(result.candidates.is_empty());
-    }
-
-    #[test]
-    fn recommend_local_improvement_is_positive() {
-        let (sg, schedule) = make_graph_with_external_dep(
-            &[("a", 40.0, &["[dep-a/lib]::foo"]), ("b", 30.0, &[])],
-            50.0,
-        );
-        let result =
-            compute_split_recommendations(&sg, "test-pkg/lib", &schedule, None);
-        assert_eq!(result.candidates.len(), 1);
-        assert!(!result.candidates[0].local_improvement.is_zero());
-    }
-
-    /// Like `make_graph_with_external_dep` but allows custom target
-    /// timings for cost model testing.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "test fixture construction is inherently verbose"
-    )]
-    fn make_graph_with_timings(
-        syms: &[(&str, f64, &[&str])],
-        dep_finish_ms: f64,
-        timings: TargetTimings,
-    ) -> (SymbolGraph, ScheduleData) {
-        let mut symbols = HashMap::new();
-        for &(name, cost, deps) in syms {
-            let dep_set: HashSet<String> =
-                deps.iter().map(ToString::to_string).collect();
-            let event_times = if cost > 0.0 {
-                HashMap::from([("typeck".to_string(), cost)])
-            } else {
-                HashMap::new()
-            };
-            symbols.insert(
-                name.to_string(),
-                Symbol {
-                    file: "lib.rs".to_string(),
-                    event_times_ms: event_times,
-                    dependencies: dep_set,
-                    kind: SymbolKind::ModuleDef {
-                        kind: "Function".to_string(),
-                        visibility: Visibility::Public,
-                    },
-                },
-            );
-        }
-
-        let root = Module {
-            symbols,
-            submodules: HashMap::new(),
-        };
-        let test_target = Target {
-            timings,
-            dependencies: HashSet::from(["dep-a/lib".to_string()]),
-            root,
-        };
-        let dep_target = Target {
-            timings: TargetTimings::default(),
-            dependencies: HashSet::new(),
-            root: Module {
-                symbols: HashMap::new(),
-                submodules: HashMap::new(),
-            },
-        };
-
-        let mut packages = HashMap::new();
-        packages.insert(
-            "test-pkg".to_string(),
-            Package {
-                targets: HashMap::from([("lib".to_string(), test_target)]),
-            },
-        );
-        packages.insert(
-            "dep-a".to_string(),
-            Package {
-                targets: HashMap::from([("lib".to_string(), dep_target)]),
-            },
-        );
-        let sg = SymbolGraph { packages };
-
-        let schedule = ScheduleData {
-            summary: Summary {
-                critical_path: Duration::from_secs_f64(
-                    (dep_finish_ms + 100.0) / 1000.0,
-                ),
-                total_cost: Duration::from_secs_f64(
-                    (dep_finish_ms + 100.0) / 1000.0,
-                ),
-                parallelism_ratio: 1.0,
-                target_count: 2,
-                symbol_count: syms.len(),
-                lane_count: 1,
-            },
-            targets: vec![
-                TargetData {
-                    name: "dep-a/lib".to_string(),
-                    start: Duration::ZERO,
-                    finish: Duration::from_secs_f64(dep_finish_ms / 1000.0),
-                    cost: Duration::from_secs_f64(dep_finish_ms / 1000.0),
-                    slack: Duration::ZERO,
-                    lane: 0,
-                    symbol_count: 0,
-                    deps: vec![],
-                    dependents: vec![1],
-                    on_critical_path: true,
-                    forward_pred: None,
-                    backward_succ: Some(1),
-                },
-                TargetData {
-                    name: "test-pkg/lib".to_string(),
-                    start: Duration::from_secs_f64(dep_finish_ms / 1000.0),
-                    finish: Duration::from_secs_f64(
-                        (dep_finish_ms + 100.0) / 1000.0,
-                    ),
-                    cost: Duration::from_secs_f64(100.0 / 1000.0),
-                    slack: Duration::ZERO,
-                    lane: 0,
-                    symbol_count: syms.len(),
-                    deps: vec![0],
-                    dependents: vec![],
-                    on_critical_path: true,
-                    forward_pred: Some(0),
-                    backward_succ: None,
-                },
-            ],
-            critical_path: vec![0, 1],
-        };
-        (sg, schedule)
-    }
-
-    #[test]
-    fn recommend_negative_improvement_filtered_out() {
-        // With a cost model that has very high per-target overhead,
-        // splitting tiny symbols into two crates doubles the overhead,
-        // making the split worse than the original.
-        let timings = TargetTimings {
-            wall_time: Duration::ZERO,
-            event_times_ms: HashMap::from([
-                ("metadata_decode_entry".to_string(), 5.0),
-                ("incr_comp_persist".to_string(), 5.0),
-            ]),
-        };
-        let (sg, schedule) = make_graph_with_timings(
-            &[("a", 1.0, &["[dep-a/lib]::foo"]), ("b", 1.0, &[])],
-            50.0,
-            timings,
-        );
-        // Cost model: each half costs attr*1 + meta*100 + other*100.
-        // Original: predict(2.0, 5.0, 5.0) = 2 + 500 + 500 = 1002
-        // Each half: predict(1.0, 5.0, 5.0) = 1 + 500 + 500 = 1001
-        // Splitting produces two ~1001ms halves, worse than one ~1002ms.
-        let model = CostModel {
-            coeff_attr: 1.0,
-            coeff_meta: 100.0,
-            coeff_other: 100.0,
-            r_squared: 0.9,
-            inlier_threshold: 1.0,
-        };
-        let result = compute_split_recommendations(
-            &sg,
-            "test-pkg/lib",
-            &schedule,
-            Some(&model),
-        );
-        assert!(
-            result.candidates.is_empty(),
-            "high-overhead split should be filtered, got {} candidates",
-            result.candidates.len()
-        );
-    }
-
-    #[test]
-    fn recommend_missing_target_returns_empty() {
-        let (sg, schedule) =
-            make_graph_with_external_dep(&[("a", 10.0, &[])], 50.0);
-        let result = compute_split_recommendations(
-            &sg,
-            "nonexistent/lib",
-            &schedule,
-            None,
-        );
-        assert!(result.candidates.is_empty());
     }
 
     #[test]

@@ -33,7 +33,7 @@ tarjanize viz          → localhost web server            Interactive split exp
 tarjanize condense     → optimized_symbol_graph.json    SCC + partition + reorganize
 ```
 
-`cargo tarjanize` extracts symbols and dependencies from a Rust workspace via a custom rustc driver. `tarjanize cost` fits a MAGSAC++ regression model to profile data and reports the critical path. `tarjanize viz` starts an interactive web server for exploring the build schedule and evaluating split recommendations. `tarjanize condense` computes SCCs, merges them via union-find (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`.
+`cargo tarjanize` extracts symbols and dependencies from a Rust workspace via a custom rustc driver. `tarjanize cost` fits a MAGSAC++ regression model to profile data and reports the critical path. `tarjanize viz` starts an interactive web server for exploring the build schedule and shattering targets by horizon. `tarjanize condense` computes SCCs, merges them via union-find (respecting orphan rule anchor constraints), and outputs an optimized `SymbolGraph`.
 
 ## Code Style
 
@@ -139,13 +139,13 @@ tarjanize/
 - **schedule.rs** - Forward/backward DP for critical path, swim lane packing
 - **target_graph.rs** - `TargetGraph` construction from `SymbolGraph` + `CostModel`
 - **split.rs** - Target splitting (shatter) analysis for what-if scenarios
-- **recommend.rs** - Horizon-based split recommendations for critical path reduction
+- **recommend.rs** - Horizon-based shatter helpers and target-level cost distribution
 - **heatmap.rs** - Cost heatmap data for visualization
 - **export.rs** - Export modified `SymbolGraph` after splits
 
 **tarjanize-viz** (library)
 - **lib.rs** - `run_server()` starts interactive split explorer web server
-- **server.rs** - Axum HTTP server with JSON API (schedule, splits, shatter, tree, export endpoints)
+- **server.rs** - Axum HTTP server with JSON API (schedule, shatter, tree, export endpoints)
 
 ## Key Patterns
 
@@ -187,4 +187,3 @@ Read these docs for deeper context on specific topics:
 - **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). tarjanize only tracks frontend costs
 - **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties drive compilation time
 - **[docs/structural-extraction-plan.md](docs/structural-extraction-plan.md)** — Event-based cost model design: per-symbol attribution, two-term regression, validation results
-

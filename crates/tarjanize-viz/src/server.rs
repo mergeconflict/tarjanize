@@ -3,8 +3,8 @@
 //! Holds the computed `ScheduleData` in memory and serves it via JSON API.
 //! The index page is a plain HTML file that loads CSS, the renderer bundle,
 //! and the sidebar bundle as static assets. Schedule data is fetched from
-//! `/api/schedule` at load time. Split recommendations and preview
-//! endpoints let users explore split candidates without mutating server state.
+//! `/api/schedule` at load time. The shatter endpoint lets users explore
+//! horizon-grouped splits without mutating server state permanently.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -127,7 +127,6 @@ struct SymbolCostBreakdown {
 /// - `GET /static/bundle.js` -- Gantt renderer (ESM)
 /// - `GET /static/sidebar.js` -- Sidebar event wiring (IIFE)
 /// - `GET /api/schedule` -- full schedule data as JSON
-/// - `GET /api/splits/:package/*target` -- ranked split recommendations
 /// - `GET /api/tree/:package/*target` -- module/symbol tree for a target
 /// - `POST /api/shatter` -- shatter a target into its SCCs (transient)
 /// - `GET /api/export` -- export the `SymbolGraph` as JSON
@@ -138,7 +137,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/static/bundle.js", get(bundle_js_handler))
         .route("/static/sidebar.js", get(sidebar_js_handler))
         .route("/api/schedule", get(schedule_handler))
-        .route("/api/splits/{package}/{*target}", get(splits_handler))
         .route("/api/tree/{package}/{*target}", get(tree_handler))
         .route("/api/shatter", post(shatter_handler))
         .route("/api/export", get(export_handler))
@@ -183,35 +181,6 @@ async fn schedule_handler(
 ) -> Json<ScheduleData> {
     let schedule = state.schedule.read().expect("schedule lock poisoned");
     Json(schedule.clone())
-}
-
-/// Returns ranked split recommendations for a target.
-///
-/// Computes effective horizons across the target's intra-target SCC DAG
-/// and evaluates threshold cuts to find beneficial split points. Returns
-/// a `SplitRecommendation` with candidates sorted by global improvement.
-/// Always returns 200 (empty candidates list for non-existent targets).
-async fn splits_handler(
-    State(state): State<Arc<AppState>>,
-    axum::extract::Path((package, target)): axum::extract::Path<(
-        String,
-        String,
-    )>,
-) -> Json<tarjanize_schedule::recommend::SplitRecommendation> {
-    let target_id = format!("{package}/{target}");
-    let sg = state
-        .symbol_graph
-        .read()
-        .expect("symbol_graph lock poisoned");
-    let schedule = state.schedule.read().expect("schedule lock poisoned");
-    Json(
-        tarjanize_schedule::recommend::compute_split_recommendations(
-            &sg,
-            &target_id,
-            &schedule,
-            state.cost_model.as_ref(),
-        ),
-    )
 }
 
 /// Returns the full `Target` struct and per-symbol cost breakdowns.
@@ -547,41 +516,6 @@ mod tests {
         assert!(
             !schedule.summary.critical_path.is_zero(),
             "critical path should be positive"
-        );
-    }
-
-    /// GET /api/splits/{package}/{target} should return split
-    /// recommendations with target, candidates, and `current_cost_ms`.
-    #[tokio::test]
-    async fn api_splits_returns_recommendations() {
-        let state = test_state();
-        let app = build_router(Arc::clone(&state));
-
-        // Use the known test target "test-pkg/lib".
-        let resp = app
-            .oneshot(
-                Request::builder()
-                    .uri("/api/splits/test-pkg/lib")
-                    .body(axum::body::Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(resp.status(), 200);
-
-        let body = resp.into_body().collect().await.unwrap().to_bytes();
-        let rec: serde_json::Value = serde_json::from_slice(&body)
-            .expect("response should be valid JSON");
-
-        assert!(rec.get("target").is_some(), "must have target field");
-        assert!(
-            rec.get("candidates").is_some(),
-            "must have candidates field"
-        );
-        assert!(
-            rec.get("current_cost_ms").is_some(),
-            "must have current_cost_ms field"
         );
     }
 

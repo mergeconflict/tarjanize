@@ -1,12 +1,12 @@
 /* style.css -- Layout and theme for the tarjanize build schedule visualization.
  *
  * Single-panel layout: sidebar (250px) + full-width PixiJS Gantt chart canvas.
- * Split recommendations appear in the sidebar when a target is clicked.
+ * Target details appear in the sidebar when a target is clicked.
  *
  * Layout:
  *   | Sidebar (250px) | Gantt Viewport                              |
  *   | Stats, Search   | PixiJS canvas                               |
- *   | Recommendations |                                             |
+ *   | Target Details  |                                             |
  *
  * The tooltip floats above everything (z-index 100) and follows the cursor.
  * It has pointer-events:none so it never intercepts mouse events meant for
@@ -97,7 +97,7 @@ body {
   font-weight: bold;
 }
 
-/* Search input: matches the dark theme and sits above the recommendations. */
+/* Search input: matches the dark theme and sits above target details. */
 #search-input {
   width: 100%;
   padding: 8px;
@@ -294,7 +294,7 @@ body {
 }
 
 /* "Save Symbol Graph" button in the sidebar. Downloads the modified
- * SymbolGraph JSON reflecting all current split operations. */
+ * SymbolGraph JSON reflecting the current shatter state. */
 #save-btn {
   width: 100%;
   margin-top: 12px;
@@ -312,9 +312,9 @@ body {
   background: #66bb6a;
 }
 
-/* "Shatter" button in the recommendations panel. Groups the
- * target's SCCs by effective horizon and replaces the original target
- * with one target per horizon group. Orange to distinguish from green save. */
+/* "Shatter" button in the details panel. Groups the target's SCCs by
+ * effective horizon and replaces the original target with one target
+ * per horizon group. Orange to distinguish from green save. */
 #shatter-btn {
   width: 100%;
   margin-top: 8px;
