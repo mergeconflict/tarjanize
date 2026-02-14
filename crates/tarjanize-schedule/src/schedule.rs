@@ -7,6 +7,9 @@
 //! 2. **Backward pass** — computes latest start times and slack
 //! 3. **Swim lane packing** — assigns parallel lanes via greedy bin-packing
 //! 4. **Critical path reconstruction** — follows predecessor chain
+//!
+//! Why: a single, deterministic scheduler keeps the CLI and UI aligned and
+//! makes critical-path analysis reproducible across tools.
 
 use std::time::Duration;
 
@@ -22,6 +25,9 @@ use crate::data::{ScheduleData, Summary, TargetData};
 /// Abstracts away the `SymbolGraph` so scheduling logic can be tested
 /// with simple hand-built graphs. The `lib.rs` entry point converts
 /// `SymbolGraph + CostModel` into this representation.
+///
+/// Why: schedule algorithms should not depend on extraction internals, so we
+/// isolate the minimal graph data they need.
 #[derive(Debug)]
 pub struct TargetGraph {
     /// Target identifiers in `{package}/{target}` format.
@@ -35,6 +41,9 @@ pub struct TargetGraph {
 }
 
 /// Result of the forward scheduling pass.
+///
+/// Why: forward pass produces intermediate values reused by the backward
+/// pass and critical-path reconstruction.
 struct ForwardResult {
     start: Vec<Duration>,
     finish: Vec<Duration>,
@@ -43,6 +52,9 @@ struct ForwardResult {
 }
 
 /// Result of the backward scheduling pass.
+///
+/// Why: backward pass needs its own container so slack and successor chains
+/// remain consistent with the forward pass outputs.
 struct BackwardResult {
     slack: Vec<Duration>,
     on_critical_path: Vec<bool>,
@@ -55,6 +67,9 @@ struct BackwardResult {
 /// reconstruction. Returns a [`ScheduleData`] ready for JSON embedding.
 ///
 /// Panics if the graph contains cycles (caller must ensure DAG).
+///
+/// Why: this is the single entry point for schedule computation used by
+/// both the CLI and viz.
 pub fn compute_schedule(tg: &TargetGraph) -> ScheduleData {
     let n = tg.names.len();
     if n == 0 {
@@ -94,7 +109,7 @@ pub fn compute_schedule(tg: &TargetGraph) -> ScheduleData {
         .enumerate()
         .max_by_key(|(_, d)| *d)
         .map(|(i, _)| i)
-        .unwrap();
+        .expect("graph has at least one target after early return");
 
     let mut critical_path = Vec::new();
     let mut current = Some(end_idx);
@@ -126,7 +141,11 @@ pub fn compute_schedule(tg: &TargetGraph) -> ScheduleData {
 
     let targets: Vec<TargetData> = (0..n)
         .map(|i| TargetData {
-            name: tg.names.get_index(i).unwrap().clone(),
+            name: tg
+                .names
+                .get_index(i)
+                .expect("index i is in 0..n which is within names bounds")
+                .clone(),
             start: fwd.start[i],
             finish: fwd.finish[i],
             cost: tg.costs[i],
@@ -164,6 +183,9 @@ pub fn compute_schedule(tg: &TargetGraph) -> ScheduleData {
 /// finish[t]       = start[t] + cost[t]
 /// forward_pred[t] = argmax(finish[dep])
 /// ```
+///
+/// Why: earliest-start times define the critical path and feed slack
+/// computation in the backward pass.
 fn forward_pass(tg: &TargetGraph, sorted: &[NodeIndex]) -> ForwardResult {
     let n = tg.names.len();
     let mut start = vec![Duration::ZERO; n];
@@ -207,6 +229,9 @@ fn forward_pass(tg: &TargetGraph, sorted: &[NodeIndex]) -> ForwardResult {
 /// backward_succ[t] = argmax of that
 /// slack[t]         = critical_path_ms - (start[t] + cost[t] + longest_from[t])
 /// ```
+///
+/// Why: slack and backward successors drive critical-path highlighting and
+/// schedule sensitivity in the UI.
 fn backward_pass(
     tg: &TargetGraph,
     sorted: &[NodeIndex],
@@ -268,6 +293,9 @@ fn backward_pass(
 /// dependency so that individual targets remain visually distinct.
 /// This never increases lane count — if all available lanes belong to
 /// direct dependencies, we pick the best one anyway.
+///
+/// Why: lane assignment is purely for visualization, so we optimize for
+/// readability without changing overall parallelism.
 fn pack_swim_lanes(
     n: usize,
     start: &[Duration],
@@ -346,12 +374,17 @@ mod tests {
     use super::*;
 
     /// Converts f64 milliseconds to Duration for test convenience.
+    ///
+    /// Why: keeps test inputs readable while matching production units.
     fn ms(val: f64) -> Duration {
         Duration::from_secs_f64(val / 1000.0)
     }
 
     /// Builds a `TargetGraph` from target triples and edge pairs.
     /// Costs are specified in milliseconds for readability.
+    ///
+    /// Why: provides compact fixtures for schedule tests without
+    /// depending on the full `SymbolGraph` pipeline.
     fn make_target_graph(
         targets: &[(&str, f64, usize)],
         edges: &[(usize, usize)],
@@ -384,6 +417,9 @@ mod tests {
     // Empty graph
     // =====================================================================
 
+    /// Empty graphs should produce empty schedules.
+    ///
+    /// Why: the scheduler must gracefully handle degenerate input.
     #[test]
     fn empty_graph_produces_empty_schedule() {
         let tg = make_target_graph(&[], &[]);
@@ -400,6 +436,9 @@ mod tests {
     // Single target
     // =====================================================================
 
+    /// Single targets should start at zero with no slack.
+    ///
+    /// Why: baseline behavior anchors later multi-target expectations.
     #[test]
     fn single_target_starts_at_zero_with_no_slack() {
         let tg = make_target_graph(&[("a/lib", 100.0, 5)], &[]);
@@ -427,6 +466,9 @@ mod tests {
     // Chain: A(50) → B(30) → C(20), all on critical path
     // =====================================================================
 
+    /// A linear chain should schedule sequentially with no slack.
+    ///
+    /// Why: verifies critical-path propagation in the simplest DAG.
     #[test]
     fn chain_all_critical_sequential_starts() {
         // A(50) → B(30) → C(20)
@@ -474,6 +516,9 @@ mod tests {
     // B has less slack than C; both depend on A.
     // =====================================================================
 
+    /// Parallel forks should allocate lanes and compute slack correctly.
+    ///
+    /// Why: ensures slack and lane assignment reflect parallel branches.
     #[test]
     fn fork_parallel_lanes_correct_slack() {
         // A(100) is the root. B(30) and C(10) depend on A.
@@ -516,6 +561,9 @@ mod tests {
     // Tests forward_pred/backward_succ through a join point.
     // =====================================================================
 
+    /// Diamond shapes should preserve predecessor/successor chains.
+    ///
+    /// Why: validates join handling for critical-path reconstruction.
     #[test]
     fn diamond_correct_pred_succ() {
         // A(10) → B(100), A(10) → C(50), B→D(20), C→D(20)
@@ -575,6 +623,9 @@ mod tests {
     // Swim lane packing: peak parallelism = lane count
     // =====================================================================
 
+    /// Lane count should match peak parallelism for independent targets.
+    ///
+    /// Why: verifies that lane packing reflects true parallel capacity.
     #[test]
     fn swim_lanes_equal_peak_parallelism() {
         // Three independent targets — peak parallelism = 3.
@@ -601,6 +652,9 @@ mod tests {
         assert_eq!(lane_set.len(), 3);
     }
 
+    /// Sequential chains should reuse a single lane.
+    ///
+    /// Why: ensures lane packing does not inflate lane count.
     #[test]
     fn swim_lanes_reuse_when_sequential() {
         // A(100) → B(100): sequential, only 1 lane needed.
@@ -617,6 +671,9 @@ mod tests {
         assert_eq!(result.targets[0].lane, result.targets[1].lane);
     }
 
+    /// Mixed parallelism should reuse lanes after joins.
+    ///
+    /// Why: validates that lanes reflect peak concurrency, not total targets.
     #[test]
     fn swim_lanes_mixed_parallelism() {
         // A(100) → C(50), B(100) → C(50)
@@ -637,6 +694,9 @@ mod tests {
     // Summary statistics
     // =====================================================================
 
+    /// Summary stats should reflect total cost and critical path.
+    ///
+    /// Why: the UI and reports rely on these aggregates for accuracy.
     #[test]
     fn summary_statistics_correct() {
         // A(100), B(50), independent. Total=150, critical=100, ratio=1.5.
@@ -655,6 +715,9 @@ mod tests {
     // Deps and dependents lists
     // =====================================================================
 
+    /// Dep/dependent lists should be populated from the graph.
+    ///
+    /// Why: downstream UI uses these lists for navigation and highlighting.
     #[test]
     fn deps_and_dependents_populated() {
         // A → B, A → C

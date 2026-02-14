@@ -1,6 +1,6 @@
 {
   "compilerOptions": {
-    "target": "ES2022",
+    "target": "ES2024",
     "module": "ES2022",
     "moduleResolution": "bundler",
     "strict": true,
@@ -9,5 +9,13 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true
   },
-  "include": ["crates/tarjanize-viz/templates/**/*.ts"]
+  "include": [
+    "types/**/*.d.ts",
+    "types/generated/**/*.ts",
+    "crates/tarjanize-viz/templates/**/*.ts",
+    "e2e/**/*.ts",
+    "playwright.config.ts",
+    "vitest.config.ts",
+    "eslint.config.js"
+  ]
 }

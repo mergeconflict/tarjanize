@@ -5,12 +5,15 @@
 //! level — actually moving symbols between module trees to produce a new
 //! `SymbolGraph` that can be serialized and used as input to subsequent
 //! pipeline stages (e.g., `tarjanize condense`).
+//!
+//! Why: consumers need a concrete `SymbolGraph` after splits, not just
+//! schedule deltas, to continue the pipeline.
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use tarjanize_schemas::{
-    Module, Package, Symbol, SymbolGraph, Target, TargetTimings,
+    Module, Package, Symbol, SymbolGraph, Target, TargetId, TargetTimings,
     sum_event_times,
 };
 
@@ -30,6 +33,9 @@ use crate::target_graph::condense_target;
 ///
 /// Returns a new `SymbolGraph` with the splits applied. The original
 /// is not modified.
+///
+/// Why: split previews must produce a real graph that downstream tools can
+/// serialize and consume.
 pub fn export_symbol_graph(
     original: &SymbolGraph,
     operations: &[SplitOperation],
@@ -39,7 +45,10 @@ pub fn export_symbol_graph(
     for op in operations {
         // Condense the source target to obtain its SCC DAG. Skip
         // this operation if condensation fails (bad target name).
-        let Some(intra) = condense_target(&graph, &op.source_target) else {
+        let Some(source_id) = TargetId::parse(&op.source_target) else {
+            continue;
+        };
+        let Some(intra) = condense_target(&graph, &source_id) else {
             continue;
         };
 
@@ -64,11 +73,8 @@ pub fn export_symbol_graph(
             .flat_map(|n| n.symbols.iter().cloned())
             .collect();
 
-        // Parse the source target ID into (package, target_key).
-        let Some((pkg_name, target_key)) = op.source_target.split_once('/')
-        else {
-            continue;
-        };
+        let pkg_name = source_id.package();
+        let target_key = source_id.target();
 
         // Build the target prefix for stripping symbol paths.
         let target_prefix = format!("[{}]::", op.source_target);
@@ -83,7 +89,7 @@ pub fn export_symbol_graph(
         // Create the new target's module tree by extracting symbols
         // from the source.
         let mut new_root = Module::default();
-        let mut moved_cost: f64 = 0.0;
+        let mut moved_cost = Duration::ZERO;
 
         // Look up the source target mutably to remove symbols.
         let source_target = graph
@@ -136,9 +142,8 @@ pub fn export_symbol_graph(
         );
 
         // Adjust the residual's wall_time downward by the moved cost.
-        let moved_dur = Duration::from_secs_f64(moved_cost / 1000.0);
         source_target.timings.wall_time =
-            source_target.timings.wall_time.saturating_sub(moved_dur);
+            source_target.timings.wall_time.saturating_sub(moved_cost);
 
         // Copy external dependencies from the source target.
         let source_deps = source_target.dependencies.clone();
@@ -152,7 +157,7 @@ pub fn export_symbol_graph(
         // Create the new package and target.
         let new_target = Target {
             timings: TargetTimings {
-                wall_time: Duration::from_secs_f64(moved_cost / 1000.0),
+                wall_time: moved_cost,
                 event_times_ms: HashMap::new(),
             },
             dependencies: source_deps,
@@ -176,6 +181,8 @@ pub fn export_symbol_graph(
 ///
 /// Returns `None` if the path doesn't start with the expected prefix or
 /// has no symbol name after stripping the prefix.
+///
+/// Why: symbol moves need module segments to remove/insert correctly.
 pub(crate) fn parse_symbol_path(
     path: &str,
     target_prefix: &str,
@@ -198,6 +205,8 @@ pub(crate) fn parse_symbol_path(
 /// Returns the removed `Symbol` if found, or `None` if the module path
 /// or symbol name doesn't exist. This is a destructive operation on the
 /// source tree — the symbol is gone after removal.
+///
+/// Why: we must physically move symbols between module trees to reflect splits.
 pub(crate) fn remove_symbol_from_module(
     root: &mut Module,
     mod_segments: &[String],
@@ -216,6 +225,8 @@ pub(crate) fn remove_symbol_from_module(
 /// This mirrors the module path structure from the source target so the
 /// new target's module tree matches the original layout of the moved
 /// symbols.
+///
+/// Why: preserves module layout so paths remain stable after a split.
 pub(crate) fn insert_symbol_into_module(
     root: &mut Module,
     mod_segments: &[String],
@@ -235,6 +246,8 @@ pub(crate) fn insert_symbol_into_module(
 /// in `moving_symbols`) has its target prefix replaced from
 /// `old_prefix` to `new_prefix`. This ensures that cross-crate
 /// references point to the correct target after the split.
+///
+/// Why: without rewriting, moved symbols would still point at the old target.
 fn rewrite_dependencies(
     module: &mut Module,
     moving_symbols: &HashSet<String>,
@@ -278,13 +291,18 @@ mod tests {
     /// The target has two submodules ("alpha" and "beta"), each with
     /// one symbol. `alpha::Foo` depends on `beta::Bar`, but not vice
     /// versa, producing two distinct SCCs so we can split one out.
+    ///
+    /// Why: provides a deterministic fixture for export tests.
     fn test_symbol_graph() -> SymbolGraph {
         let prefix = "[test-pkg/lib]::";
 
         // beta::Bar — no dependencies, costs 5ms.
         let bar = Symbol {
             file: "beta.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 5.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                Duration::from_millis(5),
+            )]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Struct".to_string(),
@@ -295,7 +313,10 @@ mod tests {
         // alpha::Foo — depends on beta::Bar, costs 10ms.
         let foo = Symbol {
             file: "alpha.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 10.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                Duration::from_millis(10),
+            )]),
             dependencies: HashSet::from([format!("{prefix}beta::Bar")]),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -326,7 +347,7 @@ mod tests {
                 wall_time: Duration::from_secs_f64(0.020),
                 event_times_ms: HashMap::from([(
                     "metadata_decode_foo".to_string(),
-                    3.0,
+                    Duration::from_millis(3),
                 )]),
             },
             dependencies: HashSet::from(["other-dep/lib".to_string()]),
@@ -340,6 +361,9 @@ mod tests {
         SymbolGraph { packages }
     }
 
+    /// Export with no splits should return the original graph.
+    ///
+    /// Why: empty operations must be a no-op for consumers.
     #[test]
     fn export_with_no_splits_returns_original() {
         let sg = test_symbol_graph();
@@ -353,12 +377,19 @@ mod tests {
         assert!(target.root.submodules.contains_key("beta"));
     }
 
+    /// Export with a split should add a new package/target.
+    ///
+    /// Why: split outputs must materialize as new crates in the graph.
     #[test]
     fn export_with_split_adds_new_package() {
         let sg = test_symbol_graph();
 
         // Condense to find the SCC containing beta::Bar (the leaf).
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -391,11 +422,18 @@ mod tests {
         );
     }
 
+    /// Split should remove moved symbols from the source target.
+    ///
+    /// Why: avoids duplicated symbols across residual and new crates.
     #[test]
     fn export_split_removes_symbols_from_source() {
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -437,11 +475,18 @@ mod tests {
         assert!(alpha_has_foo, "Foo must remain in source target");
     }
 
+    /// Residual should depend on the new crate after a split.
+    ///
+    /// Why: dependencies must preserve build order after symbols move.
     #[test]
     fn export_split_adds_dependency_from_source_to_new() {
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -464,11 +509,18 @@ mod tests {
         );
     }
 
+    /// New targets should inherit external deps from the source.
+    ///
+    /// Why: moved symbols still rely on external crates.
     #[test]
     fn export_split_copies_external_deps_to_new_target() {
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -492,11 +544,18 @@ mod tests {
         );
     }
 
+    /// Wall time should be reduced by the moved cost.
+    ///
+    /// Why: timing must reflect the residual vs new target split.
     #[test]
     fn export_split_adjusts_wall_time() {
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -529,11 +588,18 @@ mod tests {
         );
     }
 
+    /// Dependencies should be rewritten to the new target prefix.
+    ///
+    /// Why: moved symbols must refer to their new crate after export.
     #[test]
     fn export_split_rewrites_dependencies() {
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -565,13 +631,20 @@ mod tests {
         );
     }
 
+    /// Downset expansion should move transitive dependencies.
+    ///
+    /// Why: ensures exported splits obey convexity constraints.
     #[test]
     fn export_downset_expansion_moves_transitive_deps() {
         // Selecting alpha::Foo (which depends on beta::Bar) should
         // also move beta::Bar via downset expansion.
         let sg = test_symbol_graph();
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let foo_scc = intra
             .nodes
             .iter()
@@ -618,6 +691,9 @@ mod tests {
         assert!(!src_has_bar, "Bar should be removed from source");
     }
 
+    /// Invalid targets should be skipped without crashing.
+    ///
+    /// Why: export must be resilient to stale or invalid operations.
     #[test]
     fn export_invalid_target_is_skipped() {
         let sg = test_symbol_graph();
@@ -636,6 +712,9 @@ mod tests {
         assert!(!result.packages.contains_key("new-pkg"));
     }
 
+    /// Parsing should split module segments and symbol name.
+    ///
+    /// Why: export relies on path parsing to move symbols correctly.
     #[test]
     fn parse_symbol_path_basic() {
         let prefix = "[test-pkg/lib]::";
@@ -645,6 +724,9 @@ mod tests {
         assert_eq!(name, "Foo");
     }
 
+    /// Parsing should handle root-level symbols.
+    ///
+    /// Why: many symbols live at the crate root.
     #[test]
     fn parse_symbol_path_root_level() {
         let prefix = "[test-pkg/lib]::";
@@ -654,6 +736,9 @@ mod tests {
         assert_eq!(name, "RootSym");
     }
 
+    /// Parsing should handle nested module paths.
+    ///
+    /// Why: module hierarchies are common in real crates.
     #[test]
     fn parse_symbol_path_nested() {
         let prefix = "[test-pkg/lib]::";
@@ -663,6 +748,9 @@ mod tests {
         assert_eq!(name, "Deep");
     }
 
+    /// Parsing should reject paths without the expected prefix.
+    ///
+    /// Why: prevents accidentally moving symbols from other targets.
     #[test]
     fn parse_symbol_path_wrong_prefix() {
         let prefix = "[other-pkg/lib]::";
@@ -680,12 +768,19 @@ mod tests {
     /// Verify the exported `SymbolGraph` can be fed through
     /// `build_target_graph()` + `compute_schedule()` to produce a
     /// valid schedule. This is the "round-trip" property.
+    /// Exported graphs should round-trip through schedule generation.
+    ///
+    /// Why: downstream stages expect a valid schedule after export.
     #[test]
     fn export_round_trip_produces_valid_schedule() {
         let sg = test_symbol_graph();
 
         // Apply a split: move beta::Bar to a new crate.
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -737,6 +832,9 @@ mod tests {
     ///
     /// Verify that total symbol count is preserved: no symbols are
     /// lost or duplicated during export.
+    /// Export should preserve total symbol count across targets.
+    ///
+    /// Why: splits must not lose or duplicate symbols.
     #[test]
     fn export_preserves_total_symbol_count() {
         let sg = test_symbol_graph();
@@ -745,7 +843,11 @@ mod tests {
         let original_count = count_symbols_recursive(&sg);
 
         // Apply a split.
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra
             .nodes
             .iter()
@@ -769,21 +871,14 @@ mod tests {
         );
     }
 
-    /// Helper: recursively count all symbols across all targets.
+    /// Counts total symbols across all targets in a graph.
+    ///
+    /// Why: used to assert symbol conservation in export tests.
     fn count_symbols_recursive(sg: &SymbolGraph) -> usize {
-        fn count_in_module(module: &Module) -> usize {
-            module.symbols.len()
-                + module
-                    .submodules
-                    .values()
-                    .map(count_in_module)
-                    .sum::<usize>()
-        }
-
         sg.packages
             .values()
             .flat_map(|pkg| pkg.targets.values())
-            .map(|target| count_in_module(&target.root))
+            .map(|target| target.root.count_symbols())
             .sum()
     }
 
@@ -792,6 +887,9 @@ mod tests {
     ///
     /// Build a graph with two packages, split from each, verify both
     /// splits appear in the output.
+    /// Multiple splits on different targets should all apply.
+    ///
+    /// Why: export must handle batch operations consistently.
     #[test]
     fn export_multiple_splits_different_targets() {
         // Build a graph with two packages.
@@ -800,7 +898,10 @@ mod tests {
         // Add a second package "pkg-b" with one target.
         let sym_x = Symbol {
             file: "x.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 7.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                Duration::from_millis(7),
+            )]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -809,7 +910,10 @@ mod tests {
         };
         let sym_y = Symbol {
             file: "y.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 3.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                Duration::from_millis(3),
+            )]),
             dependencies: HashSet::from(["[pkg-b/lib]::X".to_string()]),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -841,15 +945,20 @@ mod tests {
         );
 
         // Condense both targets and pick SCC IDs.
-        let intra_a =
-            target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra_a = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
         let bar_scc = intra_a
             .nodes
             .iter()
             .find(|n| n.symbols.iter().any(|s| s.contains("Bar")))
             .expect("Bar SCC");
 
-        let intra_b = target_graph::condense_target(&sg, "pkg-b/lib").unwrap();
+        let intra_b =
+            target_graph::condense_target(&sg, &TargetId::new("pkg-b", "lib"))
+                .unwrap();
         let x_scc = intra_b
             .nodes
             .iter()

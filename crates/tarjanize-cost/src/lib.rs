@@ -21,11 +21,12 @@
 //! `tarjanize-viz`.
 
 use std::io::{Read, Write};
+use std::time::Duration;
 
 use tarjanize_magsac::{
     LinearModel, fit_magsac, r_squared_no_intercept_inliers,
 };
-use tarjanize_schemas::{CostModel, Module, SymbolGraph, sum_event_times};
+use tarjanize_schemas::{CostModel, SymbolGraph, duration_to_ms_f64};
 
 /// Per-target regression predictors and actual wall time.
 ///
@@ -276,6 +277,7 @@ impl FitResult {
             let outlier_count = rows.iter().filter(|r| r.4).count();
 
             // Table header: actual, predicted, delta, outlier marker.
+            // Column widths: 35 (name) + 3×9 (values) + 3 (marker) + spacing = 70.
             writeln!(
                 w,
                 "{:<35} {:>9} {:>9} {:>9}  Out",
@@ -299,7 +301,7 @@ impl FitResult {
             // Store outlier count for the summary section below.
             outlier_count_for_summary = Some(outlier_count);
         } else {
-            // No model — show actuals only.
+            // No model — show actuals only. 35 (name) + 9 (value) + spacing = 46.
             writeln!(w, "{:<35} {:>9}", "Target", "Actual")?;
             writeln!(w, "{}", "-".repeat(46))?;
 
@@ -363,29 +365,29 @@ fn extract_predictors(symbol_graph: &SymbolGraph) -> Vec<TargetPredictors> {
         for (target_key, target_data) in &package.targets {
             let name = format!("{package_name}/{target_key}");
 
-            let attr = collect_frontend_cost(&target_data.root);
-            let meta: f64 = target_data
+            let attr = target_data.root.collect_frontend_cost();
+            let meta = target_data
                 .timings
                 .event_times_ms
                 .iter()
                 .filter(|(k, _)| k.starts_with("metadata_decode_"))
-                .map(|(_, v)| v)
-                .sum();
-            let other: f64 = target_data
+                .map(|(_, v)| *v)
+                .fold(Duration::ZERO, |acc, next| acc + next);
+            let other = target_data
                 .timings
                 .event_times_ms
                 .iter()
                 .filter(|(k, _)| !k.starts_with("metadata_decode_"))
-                .map(|(_, v)| v)
-                .sum();
-            let wall = target_data.timings.wall_time.as_secs_f64() * 1000.0;
-            let symbol_count = count_symbols_in_module(&target_data.root);
+                .map(|(_, v)| *v)
+                .fold(Duration::ZERO, |acc, next| acc + next);
+            let wall = duration_to_ms_f64(target_data.timings.wall_time);
+            let symbol_count = target_data.root.count_symbols();
 
             targets.push(TargetPredictors {
                 name,
-                attr,
-                meta,
-                other,
+                attr: duration_to_ms_f64(attr),
+                meta: duration_to_ms_f64(meta),
+                other: duration_to_ms_f64(other),
                 wall,
                 symbol_count,
             });
@@ -393,32 +395,6 @@ fn extract_predictors(symbol_graph: &SymbolGraph) -> Vec<TargetPredictors> {
     }
 
     targets
-}
-
-/// Recursively sums all symbol `event_times_ms` in a module tree.
-/// Frontend work is serial, so we sum all `event_times_ms` values per
-/// symbol.
-fn collect_frontend_cost(module: &Module) -> f64 {
-    let mut total = 0.0;
-
-    for symbol in module.symbols.values() {
-        total += sum_event_times(&symbol.event_times_ms);
-    }
-
-    for submodule in module.submodules.values() {
-        total += collect_frontend_cost(submodule);
-    }
-
-    total
-}
-
-/// Counts symbols in a module tree recursively.
-fn count_symbols_in_module(module: &Module) -> usize {
-    let mut count = module.symbols.len();
-    for submodule in module.submodules.values() {
-        count += count_symbols_in_module(submodule);
-    }
-    count
 }
 
 /// Formats a millisecond duration as a human-readable string.
@@ -441,7 +417,9 @@ fn format_duration_ms(ms: f64) -> String {
 
     // Round to seconds when >= 1s; keep milliseconds for sub-second values.
     if dur.abs() >= jiff::SignedDuration::from_secs(1) {
-        dur = dur.round(jiff::Unit::Second).unwrap();
+        dur = dur
+            .round(jiff::Unit::Second)
+            .expect("rounding to seconds always succeeds for finite durations");
     }
     SpanPrinter::new()
         .direction(Direction::Sign)
@@ -461,13 +439,19 @@ fn truncate_name(name: &str, max_len: usize) -> String {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::time::Duration;
 
     use tarjanize_schemas::{
-        Package, Symbol, SymbolKind, TargetTimings, Visibility,
+        Module, Package, Symbol, SymbolKind, TargetTimings, Visibility,
     };
 
     use super::*;
+
+    /// Converts f64 milliseconds to Duration for test fixtures.
+    ///
+    /// Why: keeps test inputs readable while matching production units.
+    fn ms(val: f64) -> Duration {
+        Duration::from_secs_f64(val / 1000.0)
+    }
 
     /// Creates a symbol with the given frontend cost.
     /// The cost is stored in `event_times_ms` under the `"typeck"` key.
@@ -476,7 +460,7 @@ mod tests {
             file: "test.rs".to_string(),
             event_times_ms: HashMap::from([(
                 "typeck".to_string(),
-                frontend_cost,
+                ms(frontend_cost),
             )]),
             dependencies: std::collections::HashSet::new(),
             kind: SymbolKind::ModuleDef {
@@ -495,7 +479,7 @@ mod tests {
         let mut targets = HashMap::new();
         targets.insert(
             "lib".to_string(),
-            tarjanize_schemas::Crate {
+            tarjanize_schemas::Target {
                 timings,
                 root: Module {
                     symbols,
@@ -518,15 +502,15 @@ mod tests {
 
             let mut event_times_ms = HashMap::new();
             event_times_ms
-                .insert("metadata_decode_entry_foo".to_string(), meta_cost);
-            event_times_ms.insert("typeck".to_string(), other_cost);
+                .insert("metadata_decode_entry_foo".to_string(), ms(meta_cost));
+            event_times_ms.insert("typeck".to_string(), ms(other_cost));
 
             packages.insert(
                 pkg.to_string(),
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time: Duration::from_secs_f64(wall / 1000.0),
+                        wall_time: ms(wall),
                         event_times_ms,
                     },
                 ),
@@ -671,16 +655,16 @@ mod tests {
             let mut event_times_ms = HashMap::new();
             event_times_ms.insert(
                 "metadata_decode_entry_generics_of".to_string(),
-                meta_cost,
+                ms(meta_cost),
             );
-            event_times_ms.insert("typeck".to_string(), other_cost);
+            event_times_ms.insert("typeck".to_string(), ms(other_cost));
 
             packages.insert(
                 pkg.to_string(),
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time: Duration::from_secs_f64(wall / 1000.0),
+                        wall_time: ms(wall),
                         event_times_ms,
                     },
                 ),
@@ -693,14 +677,14 @@ mod tests {
 
         let mut test_event_times = HashMap::new();
         test_event_times
-            .insert("metadata_decode_entry_generics_of".to_string(), 15.0);
-        test_event_times.insert("typeck".to_string(), 5.0);
+            .insert("metadata_decode_entry_generics_of".to_string(), ms(15.0));
+        test_event_times.insert("typeck".to_string(), ms(5.0));
 
         packages.get_mut("a").unwrap().targets.insert(
             "test".to_string(),
-            tarjanize_schemas::Crate {
+            tarjanize_schemas::Target {
                 timings: TargetTimings {
-                    wall_time: Duration::from_secs_f64(250.0 / 1000.0),
+                    wall_time: ms(250.0),
                     event_times_ms: test_event_times,
                 },
                 root: Module {
@@ -948,16 +932,16 @@ mod tests {
             let mut event_times_ms = HashMap::new();
             event_times_ms.insert(
                 "metadata_decode_entry_generics_of".to_string(),
-                meta_cost,
+                ms(meta_cost),
             );
-            event_times_ms.insert("typeck".to_string(), other_cost);
+            event_times_ms.insert("typeck".to_string(), ms(other_cost));
 
             packages.insert(
                 pkg.to_string(),
                 make_lib_package(
                     symbols,
                     TargetTimings {
-                        wall_time: Duration::from_secs_f64(wall / 1000.0),
+                        wall_time: ms(wall),
                         event_times_ms,
                     },
                 ),
@@ -970,14 +954,14 @@ mod tests {
 
         let mut test_event_times = HashMap::new();
         test_event_times
-            .insert("metadata_decode_entry_generics_of".to_string(), 15.0);
-        test_event_times.insert("typeck".to_string(), 5.0);
+            .insert("metadata_decode_entry_generics_of".to_string(), ms(15.0));
+        test_event_times.insert("typeck".to_string(), ms(5.0));
 
         packages.get_mut("a").unwrap().targets.insert(
             "test".to_string(),
-            tarjanize_schemas::Crate {
+            tarjanize_schemas::Target {
                 timings: TargetTimings {
-                    wall_time: Duration::from_secs_f64(250.0 / 1000.0),
+                    wall_time: ms(250.0),
                     event_times_ms: test_event_times,
                 },
                 root: Module {

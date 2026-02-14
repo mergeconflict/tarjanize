@@ -7,6 +7,9 @@ target
 node_modules
 package-lock.json
 
+# ts-rs generated TypeScript declarations (cargo test regenerates these)
+types/generated/
+
 # Playwright
 e2e/.server-state.json
 test-results/

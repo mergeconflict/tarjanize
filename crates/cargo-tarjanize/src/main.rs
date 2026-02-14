@@ -15,8 +15,6 @@
 
 #![feature(rustc_private)]
 #![feature(box_patterns)]
-#![feature(duration_millis_float)]
-
 // These extern crate declarations pull in the rustc internal crates.
 // They must be declared here because rustc_private crates use a special
 // linking mechanism that requires explicit extern crate statements.
@@ -27,10 +25,13 @@ extern crate rustc_middle;
 extern crate rustc_session;
 extern crate rustc_span;
 
+mod anchors;
 mod driver;
 mod extract;
 mod orchestrator;
+mod path_transform;
 mod profile;
+mod profile_processing;
 
 use std::env;
 use std::process::ExitCode;
@@ -42,9 +43,13 @@ use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::format::FmtSpan;
 
 /// Environment variable for passing verbosity level from orchestrator to driver.
+///
+/// Why: driver mode cannot parse CLI args, so verbosity must flow via env.
 pub const ENV_VERBOSITY: &str = "TARJANIZE_VERBOSITY";
 
 /// Crates to include in the logging allowlist.
+///
+/// Why: keep log volume focused on tarjanize code, not rustc internals.
 const CRATES: &[&str] = &["cargo_tarjanize"];
 
 /// Extract symbol graphs from Rust workspaces using rustc.
@@ -52,28 +57,41 @@ const CRATES: &[&str] = &["cargo_tarjanize"];
 /// When invoked as `cargo tarjanize`, analyzes all workspace member crates
 /// and produces a JSON file containing all symbols and their dependency
 /// relationships. Compilation costs are measured using rustc's `-Zself-profile`.
+///
+/// Why: exposes a single entry point that coordinates extraction and cost data.
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
 #[command(bin_name = "cargo tarjanize")]
 pub struct Cli {
-    /// Output file path for the symbol graph JSON
+    /// Output file path for the symbol graph JSON.
+    ///
+    /// Why: the orchestrator writes a single aggregated graph to this path.
     #[arg(short, long, value_name = "FILE")]
     pub output: std::path::PathBuf,
 
-    /// Verbosity level (-v for debug, -vv for trace, -q for warn, -qq for error)
+    /// Verbosity level (-v for debug, -vv for trace, -q for warn, -qq for error).
+    ///
+    /// Why: controls tracing output for both orchestrator and driver runs.
     #[command(flatten)]
     pub verbose: Verbosity<InfoLevel>,
 
-    /// Path to Cargo.toml manifest
+    /// Path to Cargo.toml manifest.
+    ///
+    /// Why: allows running from outside the workspace directory.
     #[arg(long, value_name = "PATH")]
     pub manifest_path: Option<String>,
 
     /// Package(s) to analyze (can be specified multiple times).
     /// If not specified, analyzes all workspace members.
+    ///
+    /// Why: enables focused extraction without scanning the entire workspace.
     #[arg(short, long, value_name = "SPEC")]
     pub package: Vec<String>,
 }
 
+/// Entrypoint that dispatches to orchestrator or driver mode.
+///
+/// Why: cargo invokes the same binary both as a CLI and as `RUSTC_WRAPPER`.
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().collect();
 
@@ -81,6 +99,7 @@ fn main() -> ExitCode {
     // When cargo invokes us as RUSTC_WRAPPER, it passes the path to rustc as argv[1].
     // The path might be absolute (e.g., /usr/bin/rustc) or just "rustc".
     // When the user runs "cargo tarjanize", cargo invokes us with "tarjanize" as argv[1].
+    // Why: argv[1] is the only stable indicator of rustc-wrapper invocation.
     let is_driver_mode = args.get(1).is_some_and(|arg| {
         // Check if this looks like a rustc invocation.
         // Could be "rustc", "/path/to/rustc", or "rustc.exe" on Windows.
@@ -123,6 +142,8 @@ fn main() -> ExitCode {
 }
 
 /// Initialize tracing with a specific level filter.
+///
+/// Why: the orchestrator needs consistent logging scoped to this crate.
 fn init_tracing(level: tracing::level_filters::LevelFilter) {
     let allowlist = CRATES.iter().map(|c| format!("{c}={level}")).join(",");
     let filter = EnvFilter::new(format!("warn,{allowlist}"));
@@ -135,6 +156,8 @@ fn init_tracing(level: tracing::level_filters::LevelFilter) {
 
 /// Initialize tracing from the `TARJANIZE_VERBOSITY` environment variable.
 /// Used in driver mode where we can't parse CLI args.
+///
+/// Why: the driver runs inside cargo/rustc and cannot see the CLI flags.
 fn init_tracing_from_env() {
     let level = env::var(ENV_VERBOSITY)
         .ok()

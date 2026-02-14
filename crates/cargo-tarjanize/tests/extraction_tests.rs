@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
 
-use tarjanize_schemas::{Crate, Module, SymbolGraph};
+use tarjanize_schemas::{Module, SymbolGraph, Target};
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -26,10 +26,10 @@ use tarjanize_schemas::{Crate, Module, SymbolGraph};
 
 /// Iterate over all crates (compilation units) in the symbol graph.
 ///
-/// With the Package/Target/Crate structure, crates are nested under
+/// With the Package/Target structure, targets are nested under
 /// `packages[pkg].targets[target]`. This helper flattens that for tests
 /// that need to iterate over all crates.
-fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
+fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Target> {
     graph.packages.values().flat_map(|pkg| pkg.targets.values())
 }
 
@@ -41,7 +41,7 @@ fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
 fn get_crate_by_name<'a>(
     graph: &'a SymbolGraph,
     crate_name: &str,
-) -> Option<&'a Crate> {
+) -> Option<&'a Target> {
     // Try package name with hyphens (e.g., "my-crate")
     if let Some(pkg) = graph.packages.get(crate_name) {
         return pkg.targets.get("lib");
@@ -1353,6 +1353,8 @@ fn get_impl_name(graph: &SymbolGraph) -> Option<String> {
 }
 
 /// Get a symbol's visibility.
+///
+/// Why: tests need to verify macro-generated items preserve visibility.
 fn get_symbol_visibility(
     graph: &SymbolGraph,
     name: &str,
@@ -1629,7 +1631,7 @@ fn test_impl_name_generic_bound() {
     let graph = extract_fixture("impl_generic_bound");
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl ImplTrait for ImplType<T>".to_string())
+        Some("impl<T> ImplTrait for ImplType<T>".to_string())
     );
 }
 
@@ -1645,7 +1647,7 @@ fn test_impl_name_where_clause() {
     // Where clause is not included in the impl name
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl ImplTrait for ImplType<T>".to_string())
+        Some("impl<T> ImplTrait for ImplType<T>".to_string())
     );
 }
 
@@ -1661,7 +1663,10 @@ fn test_impl_name_assoc_type() {
 #[test]
 fn test_impl_name_generic_inherent() {
     let graph = extract_fixture("anchor_inherent_impl_generic");
-    assert_eq!(get_impl_name(&graph), Some("impl Container<T>".to_string()));
+    assert_eq!(
+        get_impl_name(&graph),
+        Some("impl<T> Container<T>".to_string())
+    );
 }
 
 #[test]
@@ -1669,7 +1674,7 @@ fn test_impl_name_generic_trait() {
     let graph = extract_fixture("anchor_generic_trait_impl");
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl MyTrait<T> for MyType".to_string())
+        Some("impl<T> MyTrait<T> for MyType".to_string())
     );
 }
 
@@ -1678,21 +1683,24 @@ fn test_impl_name_blanket() {
     let graph = extract_fixture("anchor_blanket_impl");
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl MyTrait for T".to_string())
+        Some("impl<T> MyTrait for T".to_string())
     );
 }
 
 #[test]
 fn test_impl_name_lifetime() {
     let graph = extract_fixture("anchor_lifetime_params");
-    assert_eq!(get_impl_name(&graph), Some("impl MyType<'a>".to_string()));
+    assert_eq!(
+        get_impl_name(&graph),
+        Some("impl<'a> MyType<'a>".to_string())
+    );
 }
 
 #[test]
 fn test_impl_name_inherent_where_clause() {
     let graph = extract_fixture("anchor_where_clause");
     // Where clause is not included in the impl name
-    assert_eq!(get_impl_name(&graph), Some("impl MyType<T>".to_string()));
+    assert_eq!(get_impl_name(&graph), Some("impl<T> MyType<T>".to_string()));
 }
 
 #[test]
@@ -1732,7 +1740,7 @@ fn test_impl_name_for_mut_reference() {
 fn test_impl_name_generic_bounds_inherent() {
     let graph = extract_fixture("anchor_generic_bounds");
     // Generic bounds are not included in the impl name
-    assert_eq!(get_impl_name(&graph), Some("impl MyType<T>".to_string()));
+    assert_eq!(get_impl_name(&graph), Some("impl<T> MyType<T>".to_string()));
 }
 
 #[test]
@@ -1740,7 +1748,7 @@ fn test_impl_name_multiple_type_params() {
     let graph = extract_fixture("anchor_multiple_type_params");
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl Container<A, B>".to_string())
+        Some("impl<A, B> Container<A, B>".to_string())
     );
 }
 
@@ -1797,7 +1805,7 @@ fn test_impl_name_trait_generic_param() {
     let graph = extract_fixture("anchor_trait_type_param_local_self");
     assert_eq!(
         get_impl_name(&graph),
-        Some("impl MyTrait<T> for MyType".to_string())
+        Some("impl<T> MyTrait<T> for MyType".to_string())
     );
 }
 

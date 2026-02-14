@@ -13,9 +13,10 @@ description = "Schema definitions for tarjanize output formats"
 workspace = true
 
 [dependencies]
-schemars.workspace = true
+ts-rs.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_with.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

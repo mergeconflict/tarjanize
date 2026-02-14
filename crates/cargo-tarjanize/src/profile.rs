@@ -42,13 +42,15 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use analyzeme::{Event, EventPayload, ProfilingData, Timestamp};
-use tarjanize_schemas::TargetTimings;
-use tracing::{debug, info, info_span, warn};
+use tarjanize_schemas::{TargetTimings, duration_to_ms_f64};
+use tracing::{debug, debug_span, warn};
 
 /// Aggregated timing data from self-profile output.
 ///
 /// Contains frontend costs (by `DefPath` and event label) and target-level
 /// timings (wall-clock span and unattributed event times).
+///
+/// Why: downstream stages need both per-symbol and target-level timing data.
 #[derive(Debug, Default)]
 pub struct ProfileData {
     /// Frontend costs indexed by normalized `DefPath`, then by event label.
@@ -60,24 +62,32 @@ pub struct ProfileData {
 }
 
 /// Summary of unmatched frontend paths after roll-up.
+///
+/// Why: unmatched paths highlight attribution gaps for debugging and tuning.
 #[derive(Debug, Default)]
 pub struct RollupSummary {
-    /// Total unattributed time by event label (ms).
-    pub totals_by_label: HashMap<String, f64>,
-    /// Unmatched non-module frontend paths with total self-time (ms).
-    pub unmatched_paths: Vec<(String, f64)>,
-    /// Module-level frontend paths with total self-time (ms).
-    pub module_paths: Vec<(String, f64)>,
-    /// Total unattributed time across all unmatched paths (ms).
-    pub total_unmatched_ms: f64,
+    /// Total unattributed time by event label.
+    pub totals_by_label: HashMap<String, Duration>,
+    /// Unmatched non-module frontend paths with total self-time.
+    pub unmatched_paths: Vec<(String, Duration)>,
+    /// Module-level frontend paths with total self-time.
+    pub module_paths: Vec<(String, Duration)>,
+    /// Total unattributed time across all unmatched paths.
+    pub total_unmatched_ms: Duration,
 }
 
+/// Stack entry tracking an in-flight profiling event.
+///
+/// Why: self-time calculation needs per-event accounting while traversing.
 struct StackEntry<'a> {
     event: Event<'a>,
     self_time: Duration,
     local_path: Option<String>,
 }
 
+/// Per-thread state for nesting-aware self-time computation.
+///
+/// Why: self-profile events are recorded per thread and must be aggregated.
 struct PerThreadState<'a> {
     /// Stack of open events paired with their accumulated self-time.
     /// Self-time starts at full duration and decreases for children.
@@ -87,29 +97,31 @@ struct PerThreadState<'a> {
 impl ProfileData {
     /// Load profile data from a directory containing `.mm_profdata` files.
     ///
-    /// Parses all profile files in the directory and categorizes timing data.
-    /// Returns an empty `ProfileData` if the directory doesn't exist
-    /// or contains no profile files.
-    /// Load profile data from a directory containing `.mm_profdata` files,
-    /// using a symbol allowlist to filter module paths during attribution.
+    /// Parses the directory and aggregates timing data into per-symbol and
+    /// per-target buckets. Returns an empty `ProfileData` if the directory
+    /// doesn't exist or contains no profile files.
     ///
     /// When `symbol_paths` is provided, events whose local `DefPath` does not
     /// match an extracted symbol are attributed to the nearest symbol in the
     /// event stack instead of being recorded under the module path.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "profile loading interleaves parsing, attribution, and summaries"
-    )]
+    ///
+    /// When multiple profile files are present (from concurrent rustc
+    /// invocations with different feature sets), uses the latest file
+    /// (highest PID in filename) and logs a warning.
+    ///
+    /// Why: callers need a single profile artifact per target for stable
+    /// cost attribution and to avoid double-counting across files.
     pub fn load_from_dir_with_symbols(
         dir: &Path,
         symbol_paths: Option<&HashSet<String>>,
     ) -> Self {
-        let _span = info_span!("load_from_dir", dir = %dir.display()).entered();
+        let _span =
+            debug_span!("load_from_dir", dir = %dir.display()).entered();
 
         let mut data = ProfileData::default();
 
-        let entries = match std::fs::read_dir(dir) {
-            Ok(entries) => entries,
+        let profile_files = match list_profile_files(dir) {
+            Ok(files) => files,
             Err(e) => {
                 warn!(
                     "failed to read profile directory {}: {}",
@@ -120,18 +132,7 @@ impl ProfileData {
             }
         };
 
-        // Collect all profile files first for logging.
-        let profile_files: Vec<PathBuf> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                path.extension()
-                    .is_some_and(|ext| ext == "mm_profdata")
-                    .then_some(path)
-            })
-            .collect();
-
-        info!(
+        debug!(
             dir = %dir.display(),
             file_count = profile_files.len(),
             files = ?profile_files,
@@ -139,94 +140,43 @@ impl ProfileData {
         );
 
         if profile_files.is_empty() {
-            info!(dir = %dir.display(), "no profile files found");
+            debug!(dir = %dir.display(), "no profile files found");
             return data;
         }
 
-        if profile_files.len() > 1 {
-            let mut crate_names = Vec::new();
-            for file in &profile_files {
-                let stem = file.file_stem();
-                let name = stem.map_or_else(
-                    || "<unknown>".to_string(),
-                    |s| extract_crate_name(&s.to_string_lossy()),
-                );
-                crate_names.push(name);
-            }
-
-            panic!(
-                "multiple profile files in target directory {}; files={:?}; crate_names={:?}",
-                dir.display(),
-                profile_files,
-                crate_names
+        // `cargo check --all-targets` can produce multiple metadata-only
+        // compilations of the same crate with different feature sets
+        // (different `-C metadata` hashes). The driver's atomic sentinel
+        // prevents most duplicates, but as defense in depth we handle
+        // any remaining multi-file cases by picking the latest profile
+        // (highest PID in filename = most recent invocation).
+        //
+        // TODO: model feature-variant compilations as distinct targets
+        // so the cost model reflects actual per-variant work.
+        let profile_file = if profile_files.len() > 1 {
+            warn!(
+                dir = %dir.display(),
+                file_count = profile_files.len(),
+                files = ?profile_files,
+                "multiple profile files found; using latest"
             );
-        }
-
-        let path = &profile_files[0];
-        let Some(stem) = path.file_stem() else {
-            warn!("failed to extract profile stem: {}", path.display());
-            return data;
+            profile_files
+                .iter()
+                .max_by_key(|p| {
+                    p.file_name().map(std::ffi::OsStr::to_os_string)
+                })
+                .expect("non-empty profile_files vec")
+        } else {
+            &profile_files[0]
         };
-        let stem_str = stem.to_string_lossy();
-        let stem_path = path.with_file_name(stem);
 
-        // Use catch_unwind because decodeme can panic on corrupted
-        // profile data (e.g., truncated string tables).
-        let stem_path_clone = stem_path.clone();
-        let _span = info_span!("load_profile_file", file = %stem_str).entered();
-        let result =
-            panic::catch_unwind(|| ProfilingData::new(&stem_path_clone));
+        let (file_count, event_count) =
+            load_profile_file(&mut data, profile_file, symbol_paths);
 
-        let file_count = profile_files.len();
-        let mut event_count = 0;
-        match result {
-            Ok(Ok(profile)) => {
-                // Extract crate name from profile filename.
-                // Format: "crate_name-XXXXXXX" where X is hex digits.
-                let crate_name = extract_crate_name(&stem_str);
-
-                let _span = info_span!(
-                    "aggregate_profile",
-                    file = %stem_str,
-                    crate_name = %crate_name,
-                    num_events = profile.num_events()
-                )
-                .entered();
-                let aggregate_result =
-                    panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                        data.aggregate_profile(
-                            &profile,
-                            &crate_name,
-                            symbol_paths,
-                        )
-                    }));
-                match aggregate_result {
-                    Ok(count) => {
-                        event_count += count;
-                    }
-                    Err(_) => {
-                        warn!(
-                            "profile data corrupted during aggregation: {}",
-                            stem_path.display()
-                        );
-                    }
-                }
-            }
-            Ok(Err(e)) => {
-                debug!("failed to load profile {}: {}", stem_path.display(), e);
-            }
-            Err(_) => {
-                warn!(
-                    "profile data corrupted (parser panic): {}",
-                    stem_path.display()
-                );
-            }
-        }
-
-        info!(
+        debug!(
             file_count,
             event_count,
-            frontend_paths = data.frontend_costs.len(),
+            frontend_paths = data.frontend_count(),
             target_count = data.target_timings.len(),
             "loaded self-profile data"
         );
@@ -260,6 +210,8 @@ impl ProfileData {
     /// eliminate `+=`-style accumulation on existing timings.
     ///
     /// Returns the number of events processed.
+    ///
+    /// Why: self-time aggregation avoids double-counting nested queries.
     fn aggregate_profile(
         &mut self,
         profile: &ProfilingData,
@@ -312,29 +264,23 @@ impl ProfileData {
             // the current event.
             while let Some(entry) = thread.stack.last() {
                 if entry.event.contains(&event) {
-                    // Top event is parent of current event - keep it.
                     break;
                 }
 
-                // Top event ended before current event started - finalize it.
-                let entry = thread.stack.pop().expect("stack entry missing");
-                if is_self_profile_label(entry.event.label.as_ref()) {
-                    self_profile_self_time_sum += entry.self_time;
-                }
-                let ancestor_local =
-                    nearest_local_ancestor(&thread.stack, symbol_paths)
-                        .cloned();
-                if let Some(recorded) = self.record_event(
-                    &entry.event,
-                    entry.self_time,
+                // Top event ended before current event started — finalize it.
+                let entry = thread
+                    .stack
+                    .pop()
+                    .expect("stack entry missing after last() check");
+                let (sp, rec, c) = self.finalize_entry(
+                    &entry,
+                    &thread.stack,
                     crate_name,
-                    entry.local_path.as_deref(),
-                    ancestor_local.as_deref(),
                     symbol_paths,
-                ) {
-                    recorded_self_time_sum += recorded;
-                }
-                count += 1;
+                );
+                self_profile_self_time_sum += sp;
+                recorded_self_time_sum += rec;
+                count += c;
             }
 
             // Subtract current event's duration from parent's self-time.
@@ -356,22 +302,15 @@ impl ProfileData {
         for (_, thread) in threads {
             let mut stack = thread.stack;
             while let Some(entry) = stack.pop() {
-                if is_self_profile_label(entry.event.label.as_ref()) {
-                    self_profile_self_time_sum += entry.self_time;
-                }
-                let ancestor_local =
-                    nearest_local_ancestor(&stack, symbol_paths).cloned();
-                if let Some(recorded) = self.record_event(
-                    &entry.event,
-                    entry.self_time,
+                let (sp, rec, c) = self.finalize_entry(
+                    &entry,
+                    &stack,
                     crate_name,
-                    entry.local_path.as_deref(),
-                    ancestor_local.as_deref(),
                     symbol_paths,
-                ) {
-                    recorded_self_time_sum += recorded;
-                }
-                count += 1;
+                );
+                self_profile_self_time_sum += sp;
+                recorded_self_time_sum += rec;
+                count += c;
             }
         }
 
@@ -386,7 +325,7 @@ impl ProfileData {
         timings.wall_time += wall_time;
 
         // Log the inflation ratio for debugging.
-        info!(
+        debug!(
             raw_ms = raw_duration_sum.as_millis(),
             self_time_ms = recorded_self_time_sum.as_millis(),
             self_profile_ms = self_profile_self_time_sum.as_millis(),
@@ -395,6 +334,46 @@ impl ProfileData {
         );
 
         count
+    }
+
+    /// Finalize a single stack entry by recording its self-time.
+    ///
+    /// Checks whether the entry is a self-profile bookkeeping event (which
+    /// only contributes to overhead tracking), then records the remaining
+    /// entries via `record_event`.
+    ///
+    /// Returns `(self_profile_self_time, recorded_self_time, count)` where:
+    /// - `self_profile_self_time` is non-zero only for bookkeeping events
+    /// - `recorded_self_time` is non-zero only for attributed events
+    /// - `count` is always 1 (for accumulation)
+    ///
+    /// Why: deduplicates the finalization pattern used both during the main
+    /// event walk (for non-containing ancestors) and the post-walk drain.
+    fn finalize_entry(
+        &mut self,
+        entry: &StackEntry<'_>,
+        remaining_stack: &[StackEntry<'_>],
+        crate_name: &str,
+        symbol_paths: Option<&HashSet<String>>,
+    ) -> (Duration, Duration, usize) {
+        let sp_time = if is_self_profile_label(entry.event.label.as_ref()) {
+            entry.self_time
+        } else {
+            Duration::ZERO
+        };
+        let ancestor_local =
+            nearest_local_ancestor(remaining_stack, symbol_paths).cloned();
+        let recorded = self
+            .record_event(
+                &entry.event,
+                entry.self_time,
+                crate_name,
+                entry.local_path.as_deref(),
+                ancestor_local.as_deref(),
+                symbol_paths,
+            )
+            .unwrap_or(Duration::ZERO);
+        (sp_time, recorded, 1)
     }
 
     /// Record an event's self-time into exactly one cost map.
@@ -412,6 +391,8 @@ impl ProfileData {
     ///
     /// Returns the recorded self-time if the event was attributed to a symbol,
     /// otherwise None.
+    ///
+    /// Why: ensures each self-time sample contributes to a single bucket.
     fn record_event(
         &mut self,
         event: &Event<'_>,
@@ -458,28 +439,30 @@ impl ProfileData {
             .entry(crate_name.to_string())
             .or_default();
         *timings.event_times_ms.entry(label.to_string()).or_default() +=
-            self_time.as_millis_f64();
+            self_time;
 
         None
     }
 
     /// Get per-event compilation times for a symbol path.
     ///
-    /// Returns a map of event label to time in milliseconds, or None if no
-    /// timing data exists. Normalizes the path by replacing hyphens with
-    /// underscores in the crate name prefix, since Rust crate names use
-    /// underscores but cargo package names use hyphens.
+    /// Returns a map of event label to time, or None if no timing data exists.
+    /// Normalizes the path by replacing hyphens with underscores in the crate
+    /// name prefix, since Rust crate names use underscores but cargo package
+    /// names use hyphens.
+    ///
+    /// Why: consumers use per-event timings while preserving `Duration`.
     pub fn get_event_times_ms(
         &self,
         path: &str,
-    ) -> Option<HashMap<String, f64>> {
+    ) -> Option<HashMap<String, Duration>> {
         // Profile paths use underscores (Rust convention), but our paths use
         // cargo package names with hyphens. Normalize the crate name prefix.
         let normalized = path.replace('-', "_");
         self.frontend_costs.get(&normalized).map(|inner| {
             inner
                 .iter()
-                .map(|(label, dur)| (label.clone(), dur.as_millis_f64()))
+                .map(|(label, dur)| (label.clone(), *dur))
                 .collect()
         })
     }
@@ -489,6 +472,8 @@ impl ProfileData {
     /// Returns None if no timings were recorded for this crate.
     /// Normalizes the crate name by replacing hyphens with underscores,
     /// since Rust crate names use underscores but cargo package names use hyphens.
+    ///
+    /// Why: scheduling and visualization need per-target timing data.
     pub fn get_target_timings(
         &self,
         crate_name: &str,
@@ -506,6 +491,8 @@ impl ProfileData {
     /// attribute the event costs there. This ensures nested items (e.g. consts
     /// inside functions) roll up to their enclosing symbol instead of being
     /// treated as unmatched.
+    ///
+    /// Why: roll-up preserves total cost while reducing unattributed noise.
     ///
     // TODO: Reduce leaked per-symbol queries. Per-DefId queries like `typeck`,
     // `mir_borrowck`, `mir_built`, `predicates_of`, `generics_of`, `param_env`,
@@ -528,11 +515,11 @@ impl ProfileData {
         module_paths: &HashSet<String>,
         crate_prefix: &str,
     ) -> RollupSummary {
-        let mut totals = HashMap::new();
-        let mut per_path_totals: Vec<(String, f64)> = Vec::new();
-        let mut module_path_totals: Vec<(String, f64)> = Vec::new();
-        let mut total_unmatched_ms = 0.0;
-        let mut module_unmatched_ms = 0.0;
+        let mut totals: HashMap<String, Duration> = HashMap::new();
+        let mut per_path_totals: Vec<(String, Duration)> = Vec::new();
+        let mut module_path_totals: Vec<(String, Duration)> = Vec::new();
+        let mut total_unmatched_ms = Duration::ZERO;
+        let mut module_unmatched_ms = Duration::ZERO;
 
         let mut to_remove: Vec<String> = Vec::new();
         let mut to_roll_up: Vec<(String, HashMap<String, Duration>)> =
@@ -551,11 +538,10 @@ impl ProfileData {
             {
                 to_roll_up.push((ancestor, events.clone()));
             } else {
-                let mut path_total = 0.0;
+                let mut path_total = Duration::ZERO;
                 for (label, duration) in events {
-                    let ms = duration.as_millis_f64();
-                    path_total += ms;
-                    *totals.entry(label.clone()).or_default() += ms;
+                    path_total += *duration;
+                    *totals.entry(label.clone()).or_default() += *duration;
                 }
                 total_unmatched_ms += path_total;
                 if module_paths.contains(path) {
@@ -581,21 +567,17 @@ impl ProfileData {
         }
 
         if !per_path_totals.is_empty() {
-            per_path_totals.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            per_path_totals.sort_by_key(|e| std::cmp::Reverse(e.1));
         }
         if !module_path_totals.is_empty() {
-            module_path_totals.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            module_path_totals.sort_by_key(|e| std::cmp::Reverse(e.1));
         }
 
         debug!(
             unmatched_paths = per_path_totals.len(),
             module_paths = module_path_totals.len(),
-            total_unmatched_ms,
-            module_unmatched_ms,
+            total_unmatched_ms = duration_to_ms_f64(total_unmatched_ms),
+            module_unmatched_ms = duration_to_ms_f64(module_unmatched_ms),
             "unmatched frontend paths after roll-up"
         );
 
@@ -608,16 +590,102 @@ impl ProfileData {
     }
 
     /// Get the number of unique frontend paths with timing data.
-    #[expect(dead_code, reason = "useful for debugging and logging")]
+    ///
+    /// Why: useful for logging and validating attribution coverage.
     pub fn frontend_count(&self) -> usize {
         self.frontend_costs.len()
     }
+}
+
+/// List all `.mm_profdata` files in a directory.
+///
+/// Why: `load_from_dir_with_symbols` only operates on profile artifacts.
+fn list_profile_files(dir: &Path) -> Result<Vec<PathBuf>, std::io::Error> {
+    let entries = std::fs::read_dir(dir)?;
+    Ok(entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            path.extension()
+                .is_some_and(|ext| ext == "mm_profdata")
+                .then_some(path)
+        })
+        .collect())
+}
+
+/// Load a single profile file and aggregate its events.
+///
+/// Returns `(file_count, event_count)` for logging.
+///
+/// Why: isolates parsing/aggregation from directory handling.
+fn load_profile_file(
+    data: &mut ProfileData,
+    path: &Path,
+    symbol_paths: Option<&HashSet<String>>,
+) -> (usize, usize) {
+    let Some(stem) = path.file_stem() else {
+        warn!("failed to extract profile stem: {}", path.display());
+        return (1, 0);
+    };
+    let stem_str = stem.to_string_lossy();
+    let stem_path = path.with_file_name(stem);
+
+    // Use catch_unwind because decodeme can panic on corrupted
+    // profile data (e.g., truncated string tables).
+    let stem_path_clone = stem_path.clone();
+    let _span = debug_span!("load_profile_file", file = %stem_str).entered();
+    let result = panic::catch_unwind(|| ProfilingData::new(&stem_path_clone));
+
+    let mut event_count = 0;
+    match result {
+        Ok(Ok(profile)) => {
+            // Extract crate name from profile filename.
+            // Format: "crate_name-XXXXXXX" where X is hex digits.
+            let crate_name = extract_crate_name(&stem_str);
+
+            let _span = debug_span!(
+                "aggregate_profile",
+                file = %stem_str,
+                crate_name = %crate_name,
+                num_events = profile.num_events()
+            )
+            .entered();
+            let aggregate_result =
+                panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                    data.aggregate_profile(&profile, &crate_name, symbol_paths)
+                }));
+            match aggregate_result {
+                Ok(count) => {
+                    event_count += count;
+                }
+                Err(_) => {
+                    warn!(
+                        "profile data corrupted during aggregation: {}",
+                        stem_path.display()
+                    );
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            debug!("failed to load profile {}: {}", stem_path.display(), e);
+        }
+        Err(_) => {
+            warn!(
+                "profile data corrupted (parser panic): {}",
+                stem_path.display()
+            );
+        }
+    }
+
+    (1, event_count)
 }
 
 /// Extract crate name from profile filename.
 ///
 /// Profile files are named `crate_name-XXXXXXX` where X is hex digits.
 /// Returns the crate name portion.
+///
+/// Why: profile filenames are the only stable place to recover crate names.
 fn extract_crate_name(stem: &str) -> String {
     // Find the last hyphen followed by hex digits.
     if let Some(last_hyphen) = stem.rfind('-') {
@@ -635,6 +703,8 @@ fn extract_crate_name(stem: &str) -> String {
 ///
 /// Returns 0.0 if either value is `None` (no events of that category were seen)
 /// or if `end` is before `start`.
+///
+/// Why: wall-clock spans must tolerate missing or invalid timestamps.
 fn duration_between(
     min_start: Option<SystemTime>,
     max_end: Option<SystemTime>,
@@ -668,6 +738,8 @@ fn duration_between(
 /// - `_[N]` or `_` → anonymous consts
 /// - Single-char uppercase idents or `'_[N]` → generic/lifetime params
 /// - Anything after `{{impl}}[N]` → impl methods aggregate to impl block
+///
+/// Why: normalized paths allow attribution to extracted symbols.
 fn normalize_frontend_path(path: &str) -> String {
     // Skip paths that don't look like DefPaths (no :: separator).
     if !path.contains("::") {
@@ -744,15 +816,12 @@ fn normalize_frontend_path(path: &str) -> String {
                 // `foo::{{impl}}::method` → `foo::{{impl}}`
                 return current[..impl_end].to_string();
             }
-            if rest_after_impl.starts_with('[') && rest_after_impl.contains(']')
-            {
+            if rest_after_impl.starts_with('[') {
                 // `foo::{{impl}}[N]::method` → `foo::{{impl}}[N]`
-                let bracket_end = impl_end
-                    + rest_after_impl
-                        .find(']')
-                        .expect("bracket_end must exist")
-                    + 1;
-                return current[..bracket_end].to_string();
+                if let Some(bracket_offset) = rest_after_impl.find(']') {
+                    let bracket_end = impl_end + bracket_offset + 1;
+                    return current[..bracket_end].to_string();
+                }
             }
         }
 
@@ -801,6 +870,8 @@ fn normalize_frontend_path(path: &str) -> String {
 ///
 /// These segments represent entities that can't be split independently
 /// from their parent and generate per-item events that should roll up.
+///
+/// Why: descendant segments must be stripped for correct attribution.
 fn is_descendant_segment(segment: &str) -> bool {
     // Braced compiler-internal segments: {{closure}}, {{closure}}[N],
     // {{opaque}}, {{opaque}}[N], {{constructor}}, {{coroutine}}.
@@ -837,10 +908,15 @@ fn is_descendant_segment(segment: &str) -> bool {
 ///
 /// These events are profiling overhead and should not be included in
 /// per-symbol or per-target cost accounting.
+///
+/// Why: profiling overhead would otherwise inflate compilation costs.
 fn is_self_profile_label(label: &str) -> bool {
     label.starts_with("self_profile_")
 }
 
+/// Extract a normalized local `DefPath` from a profile event.
+///
+/// Why: only local paths should be attributed to symbol costs.
 fn local_path_for_event(
     event: &Event<'_>,
     crate_prefix: &str,
@@ -854,6 +930,9 @@ fn local_path_for_event(
     Some(normalized)
 }
 
+/// Find the nearest ancestor path that is a known symbol.
+///
+/// Why: unmatched `DefPaths` should roll up to the closest extracted symbol.
 fn find_symbol_ancestor(
     path: &str,
     symbol_paths: &HashSet<String>,
@@ -877,6 +956,9 @@ fn find_symbol_ancestor(
     None
 }
 
+/// Find the nearest local symbol ancestor in the event stack.
+///
+/// Why: ancestor attribution helps avoid losing costs to non-symbol paths.
 fn nearest_local_ancestor<'a>(
     stack: &'a [StackEntry<'_>],
     symbol_paths: Option<&HashSet<String>>,
@@ -896,10 +978,23 @@ fn nearest_local_ancestor<'a>(
     }
 }
 
+/// Profile normalization and attribution tests.
+///
+/// Why: guard the cost model invariants against attribution regressions.
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Converts a `Duration` to f64 milliseconds for numeric assertions.
+    ///
+    /// Why: some tests assert on ms values for clarity.
+    fn ms_f64(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    /// Keeps crate-local `DefPaths` intact during normalization.
+    ///
+    /// Why: attribution depends on stable local symbol paths.
     #[test]
     fn test_normalize_frontend_path_keeps_crate_paths() {
         assert_eq!(
@@ -908,6 +1003,9 @@ mod tests {
         );
     }
 
+    /// Preserves std/core/alloc `DefPaths` during normalization.
+    ///
+    /// Why: external paths remain visible for target-level attribution.
     #[test]
     fn test_normalize_frontend_path_keeps_std_paths() {
         // std/core/alloc paths are now kept (they produce non-empty
@@ -921,12 +1019,18 @@ mod tests {
         );
     }
 
+    /// Filters non-`DefPath` strings during normalization.
+    ///
+    /// Why: avoid treating non-symbol data as attributable paths.
     #[test]
     fn test_normalize_frontend_path_skips_non_paths() {
         assert_eq!(normalize_frontend_path("()"), "");
         assert_eq!(normalize_frontend_path("<no path>"), "");
     }
 
+    /// Rolls unmatched frontend paths up to the nearest symbol ancestor.
+    ///
+    /// Why: nested items should contribute to their owning symbol, not drop.
     #[test]
     fn test_roll_up_unmatched_to_parent_symbol() {
         let mut data = ProfileData::default();
@@ -958,13 +1062,13 @@ mod tests {
             .frontend_costs
             .get("my_crate::main")
             .expect("main events");
-        let ms = events
-            .get("const_eval")
-            .expect("rolled up event")
-            .as_millis_f64();
-        assert!((ms - 10.0).abs() < 1e-6, "ms={ms}");
+        let duration = *events.get("const_eval").expect("rolled up event");
+        assert_eq!(duration, Duration::from_millis(10));
     }
 
+    /// Records unmatched costs when no symbol ancestor exists.
+    ///
+    /// Why: unattributed time must still be counted at the target level.
     #[test]
     fn test_roll_up_unmatched_without_ancestor() {
         let mut data = ProfileData::default();
@@ -989,10 +1093,13 @@ mod tests {
             .totals_by_label
             .get("const_eval")
             .copied()
-            .unwrap_or(0.0);
-        assert!((ms - 7.0).abs() < 1e-6, "ms={ms}");
+            .unwrap_or(Duration::ZERO);
+        assert!((ms_f64(ms) - 7.0).abs() < 1e-6, "ms={}", ms_f64(ms));
     }
 
+    /// Counts module paths as unmatched totals when no symbol exists.
+    ///
+    /// Why: module-level events still need to be accounted for in totals.
     #[test]
     fn test_roll_up_module_path_counts_as_unmatched_total() {
         let mut data = ProfileData::default();
@@ -1014,13 +1121,16 @@ mod tests {
             .totals_by_label
             .get("typeck")
             .copied()
-            .unwrap_or(0.0);
-        assert!((ms - 9.0).abs() < 1e-6, "ms={ms}");
+            .unwrap_or(Duration::ZERO);
+        assert!((ms_f64(ms) - 9.0).abs() < 1e-6, "ms={}", ms_f64(ms));
         assert!(summary.unmatched_paths.is_empty());
         assert_eq!(summary.module_paths.len(), 1);
         assert!(data.frontend_costs.is_empty());
     }
 
+    /// Aggregates impl member paths to their impl blocks.
+    ///
+    /// Why: impl members cannot be split independently of their impl.
     #[test]
     fn test_normalize_frontend_path_aggregates_to_impl() {
         // Method inside impl -> aggregate to impl.
@@ -1052,6 +1162,9 @@ mod tests {
         );
     }
 
+    /// Retains bare impl paths during normalization.
+    ///
+    /// Why: impl blocks are valid symbols even without methods.
     #[test]
     fn test_normalize_frontend_path_keeps_bare_impl() {
         // Bare impl without methods - keep as-is.
@@ -1061,6 +1174,9 @@ mod tests {
         );
     }
 
+    /// Preserves `use`-item paths during normalization.
+    ///
+    /// Why: use items are extracted as symbols and should remain attributable.
     #[test]
     fn test_normalize_frontend_path_keeps_use() {
         // Use items are real symbols — don't peel them as descendants.
@@ -1074,6 +1190,9 @@ mod tests {
         );
     }
 
+    /// Preserves extern crate paths during normalization.
+    ///
+    /// Why: extern crate items are now treated as symbols in extraction.
     #[test]
     fn test_normalize_frontend_path_keeps_extern_crate() {
         // ExternCrate items like `extern crate std` are now extracted as
@@ -1087,6 +1206,9 @@ mod tests {
         );
     }
 
+    /// Aggregates closure paths to their enclosing items.
+    ///
+    /// Why: closures are not split independently from their parent symbols.
     #[test]
     fn test_normalize_frontend_path_aggregates_closures() {
         // Closure in function -> aggregate to function.
@@ -1117,6 +1239,9 @@ mod tests {
         );
     }
 
+    /// Normalizes anonymous impl containers to their parent module.
+    ///
+    /// Why: anonymous containers should not create distinct symbol buckets.
     #[test]
     fn test_normalize_anonymous_impl_to_parent() {
         assert_eq!(
@@ -1137,6 +1262,9 @@ mod tests {
 
     // --- New descendant type tests (generic params, anon consts, opaque, etc.) ---
 
+    /// Rolls generic type parameters up to their parent path.
+    ///
+    /// Why: generic params are descendants, not standalone symbols.
     #[test]
     fn test_normalize_generic_type_param() {
         // Generic type params like `foo::T` should roll up to `foo`.
@@ -1150,6 +1278,9 @@ mod tests {
         );
     }
 
+    /// Rolls lifetime parameters up to their parent path.
+    ///
+    /// Why: lifetimes should not create standalone attribution buckets.
     #[test]
     fn test_normalize_lifetime_param() {
         // Lifetime params: `foo::'_` and `foo::'_[1]`.
@@ -1163,6 +1294,9 @@ mod tests {
         );
     }
 
+    /// Rolls anonymous const segments up to their parent path.
+    ///
+    /// Why: anonymous consts are nested implementation details.
     #[test]
     fn test_normalize_anonymous_const() {
         // Anonymous consts: `foo::_` and `foo::_[7]`.
@@ -1176,6 +1310,9 @@ mod tests {
         );
     }
 
+    /// Rolls opaque type segments up to their parent path.
+    ///
+    /// Why: opaque async types are not split independently.
     #[test]
     fn test_normalize_opaque_type() {
         // Opaque types from async fns.
@@ -1189,6 +1326,9 @@ mod tests {
         );
     }
 
+    /// Rolls constructor segments up to their parent path.
+    ///
+    /// Why: constructors are emitted as descendants, not standalone symbols.
     #[test]
     fn test_normalize_constructor() {
         assert_eq!(
@@ -1197,6 +1337,9 @@ mod tests {
         );
     }
 
+    /// Rolls coroutine segments up to their parent path.
+    ///
+    /// Why: coroutine bodies should not become separate attribution buckets.
     #[test]
     fn test_normalize_coroutine() {
         assert_eq!(
@@ -1205,6 +1348,9 @@ mod tests {
         );
     }
 
+    /// Collapses nested opaque/closure segments to their parent path.
+    ///
+    /// Why: nested compiler artifacts should roll up to the owning symbol.
     #[test]
     fn test_normalize_nested_opaque_closure() {
         // Nesting: `foo::{{opaque}}::{{closure}}` → `foo`.
@@ -1214,6 +1360,9 @@ mod tests {
         );
     }
 
+    /// Rolls impl method descendant segments up to the impl block.
+    ///
+    /// Why: impl blocks are the attribution unit for methods.
     #[test]
     fn test_normalize_impl_method_with_generic_param() {
         // Impl + descendant: `Type::{{impl}}::method::T` → `Type::{{impl}}`.
@@ -1223,6 +1372,9 @@ mod tests {
         );
     }
 
+    /// Rolls impl method closure segments up to the numbered impl block.
+    ///
+    /// Why: numbered impls are distinct containers for attribution.
     #[test]
     fn test_normalize_impl_numbered_method_with_closure() {
         // `Type::{{impl}}[1]::method::{{closure}}` → `Type::{{impl}}[1]`.
@@ -1234,6 +1386,9 @@ mod tests {
         );
     }
 
+    /// Parses crate names from profile filename stems.
+    ///
+    /// Why: crate names are recovered only from profile file names.
     #[test]
     fn test_extract_crate_name() {
         assert_eq!(
@@ -1247,6 +1402,8 @@ mod tests {
 
     /// Build fake profiling data with `ProfilingDataBuilder` and feed it
     /// through `aggregate_profile` to test wall-clock computation.
+    ///
+    /// Why: validates the baseline wall-clock span across mixed events.
     #[test]
     fn test_wall_clock_all_events() {
         use analyzeme::ProfilingDataBuilder;
@@ -1299,6 +1456,8 @@ mod tests {
     }
 
     /// Single event produces correct wall-clock span.
+    ///
+    /// Why: establishes the minimal-span baseline for wall-clock math.
     #[test]
     fn test_wall_clock_single_event() {
         use analyzeme::ProfilingDataBuilder;
@@ -1322,6 +1481,8 @@ mod tests {
     }
 
     /// Self-profile bookkeeping time is subtracted from wall-clock span.
+    ///
+    /// Why: profiling overhead must not inflate compilation costs.
     #[test]
     fn test_wall_clock_subtracts_self_profile_time() {
         use analyzeme::ProfilingDataBuilder;
@@ -1365,6 +1526,8 @@ mod tests {
 
     /// Metadata events are now part of the wall-clock span
     /// and recorded in `event_times_ms` with their raw label.
+    ///
+    /// Why: metadata queries contribute to frontend cost accounting.
     #[test]
     fn test_metadata_in_frontend_span_and_event_times_ms() {
         use analyzeme::ProfilingDataBuilder;
@@ -1402,10 +1565,11 @@ mod tests {
             .event_times_ms
             .get("generate_crate_metadata")
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or(Duration::ZERO);
         assert!(
-            (metadata_cost - 15.0).abs() < 0.1,
-            "Expected event_times_ms['generate_crate_metadata'] ~15.0, got {metadata_cost}",
+            (ms_f64(metadata_cost) - 15.0).abs() < 0.1,
+            "Expected event_times_ms['generate_crate_metadata'] ~15.0, got {}",
+            ms_f64(metadata_cost),
         );
     }
 
@@ -1414,6 +1578,8 @@ mod tests {
     /// Wall-clock = max(end) - min(start) across all events in a category,
     /// so nested events (whose intervals are contained within a parent) don't
     /// extend the span. If someone changed to duration-sum, this would break.
+    ///
+    /// Why: regression here would overstate compilation costs.
     #[test]
     fn test_wall_clock_nested_events_no_inflation() {
         use analyzeme::ProfilingDataBuilder;
@@ -1446,6 +1612,8 @@ mod tests {
     ///
     /// Wall-clock tracking is global (not per-thread) because we want the total
     /// elapsed time for a compilation, regardless of thread.
+    ///
+    /// Why: multi-threaded builds must report a single target span.
     #[test]
     fn test_wall_clock_multi_thread_merged() {
         use analyzeme::ProfilingDataBuilder;
@@ -1489,6 +1657,8 @@ mod tests {
     }
 
     /// Metadata events extend the wall-clock span and appear in `event_times_ms`.
+    ///
+    /// Why: metadata should be counted alongside frontend/backend costs.
     #[test]
     fn test_metadata_extends_wall_clock_span() {
         use analyzeme::ProfilingDataBuilder;
@@ -1538,14 +1708,17 @@ mod tests {
             .event_times_ms
             .get("generate_crate_metadata")
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or(Duration::ZERO);
         assert!(
-            (metadata_cost - 20.0).abs() < 0.1,
-            "Metadata event_cost should be ~20, got {metadata_cost}",
+            (ms_f64(metadata_cost) - 20.0).abs() < 0.1,
+            "Metadata event_cost should be ~20, got {}",
+            ms_f64(metadata_cost),
         );
     }
 
     /// Backend events are tracked in `event_times_ms` (complete ledger).
+    ///
+    /// Why: backend self-time is needed for total-cost accounting.
     #[test]
     fn test_backend_events_in_event_times_ms() {
         use analyzeme::ProfilingDataBuilder;
@@ -1573,15 +1746,18 @@ mod tests {
             .event_times_ms
             .get("LLVM_module_codegen")
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or(Duration::ZERO);
         assert!(
-            (llvm_cost - 40.0).abs() < 0.1,
-            "Expected event_times_ms['LLVM_module_codegen'] ~40, got {llvm_cost}",
+            (ms_f64(llvm_cost) - 40.0).abs() < 0.1,
+            "Expected event_times_ms['LLVM_module_codegen'] ~40, got {}",
+            ms_f64(llvm_cost),
         );
     }
 
     /// Events without a `DefPath` (e.g., `incr_comp`) are now tracked in
     /// `event_times_ms` rather than being silently dropped.
+    ///
+    /// Why: unattributed costs must still contribute to totals.
     #[test]
     fn test_unattributed_events_in_event_times_ms() {
         use analyzeme::ProfilingDataBuilder;
@@ -1610,21 +1786,24 @@ mod tests {
             .event_times_ms
             .get("incr_comp_persist_result")
             .copied()
-            .unwrap_or(0.0);
+            .unwrap_or(Duration::ZERO);
         assert!(
-            (cost - 20.0).abs() < 0.1,
-            "Expected event_times_ms['incr_comp_persist_result'] ~20, got {cost}",
+            (ms_f64(cost) - 20.0).abs() < 0.1,
+            "Expected event_times_ms['incr_comp_persist_result'] ~20, got {}",
+            ms_f64(cost),
         );
 
         // And it should extend the frontend wall-clock span.
         assert!(
-            (timings.wall_time.as_secs_f64() * 1000.0 - 20.0).abs() < 0.1,
+            (ms_f64(timings.wall_time) - 20.0).abs() < 0.1,
             "Expected wall_time_ms ~20, got {}",
-            timings.wall_time.as_secs_f64() * 1000.0
+            ms_f64(timings.wall_time)
         );
     }
 
     /// Self-profile bookkeeping events are excluded from `event_times_ms`.
+    ///
+    /// Why: self-profile overhead is not part of compilation costs.
     #[test]
     fn test_self_profile_events_ignored() {
         use analyzeme::ProfilingDataBuilder;
@@ -1660,6 +1839,8 @@ mod tests {
     /// `get_event_times_ms`), NOT to target-level `event_times_ms`. This
     /// ensures no double-counting: each event's self-time lands in exactly
     /// one place.
+    ///
+    /// Why: prevents cost inflation from double-counting attributed events.
     #[test]
     fn test_attributed_events_in_event_times_ms() {
         use std::borrow::Cow;
@@ -1696,10 +1877,11 @@ mod tests {
         // Should appear in per-symbol event_times_ms for attribution.
         let event_map = data.get_event_times_ms("my_crate::foo::bar").unwrap();
         let typeck_symbol_cost =
-            event_map.get("typeck").copied().unwrap_or(0.0);
+            event_map.get("typeck").copied().unwrap_or(Duration::ZERO);
         assert!(
-            (typeck_symbol_cost - 10.0).abs() < 0.1,
-            "Expected symbol event_times_ms['typeck'] ~10, got {typeck_symbol_cost}",
+            (ms_f64(typeck_symbol_cost) - 10.0).abs() < 0.1,
+            "Expected symbol event_times_ms['typeck'] ~10, got {}",
+            ms_f64(typeck_symbol_cost),
         );
 
         // Attributed events should NOT appear in target-level
@@ -1709,13 +1891,17 @@ mod tests {
         let timings = data.get_target_timings("my_crate");
         let target_typeck = timings
             .and_then(|t| t.event_times_ms.get("typeck").copied())
-            .unwrap_or(0.0);
+            .unwrap_or(Duration::ZERO);
         assert!(
-            target_typeck.abs() < 0.1,
-            "Attributed events should not appear in target-level event_times_ms, got {target_typeck}",
+            target_typeck.is_zero(),
+            "Attributed events should not appear in target-level event_times_ms, got {}",
+            ms_f64(target_typeck),
         );
     }
 
+    /// Prefers symbol ancestors over module paths when attributing events.
+    ///
+    /// Why: symbol-level attribution is more precise than module-level buckets.
     #[test]
     fn test_record_event_prefers_symbol_ancestor_over_module_path() {
         use std::borrow::Cow;
@@ -1758,6 +1944,8 @@ mod tests {
     }
 
     /// Multiple events with the same label accumulate in `event_times_ms`.
+    ///
+    /// Why: repeated queries should sum their self-time costs.
     #[test]
     fn test_event_times_ms_accumulate_same_label() {
         use analyzeme::ProfilingDataBuilder;
@@ -1775,13 +1963,17 @@ mod tests {
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
-        let typeck_cost =
-            timings.event_times_ms.get("typeck").copied().unwrap_or(0.0);
+        let typeck_cost = timings
+            .event_times_ms
+            .get("typeck")
+            .copied()
+            .unwrap_or(Duration::ZERO);
 
         // 10ms + 15ms = 25ms (self-time of both events).
         assert!(
-            (typeck_cost - 25.0).abs() < 0.1,
-            "Expected accumulated typeck ~25, got {typeck_cost}",
+            (ms_f64(typeck_cost) - 25.0).abs() < 0.1,
+            "Expected accumulated typeck ~25, got {}",
+            ms_f64(typeck_cost),
         );
     }
 
@@ -1791,6 +1983,8 @@ mod tests {
     /// Attributed events land in per-symbol maps, unattributed events land
     /// in target-level `event_times_ms`. Together they account for all
     /// profiled self-time with no double-counting.
+    ///
+    /// Why: the cost model depends on full accounting across buckets.
     #[test]
     fn test_event_times_ms_complete_accounting() {
         use std::borrow::Cow;
@@ -1861,35 +2055,50 @@ mod tests {
         );
 
         // Sum target-level event_times_ms (unattributed only).
-        let target_sum: f64 = data
-            .get_target_timings("my_crate")
-            .map_or(0.0, |t| t.event_times_ms.values().copied().sum());
+        let target_sum =
+            data.get_target_timings("my_crate")
+                .map_or(Duration::ZERO, |t| {
+                    t.event_times_ms
+                        .values()
+                        .copied()
+                        .fold(Duration::ZERO, |acc, next| acc + next)
+                });
 
         // Sum all per-symbol event_times_ms (attributed only).
-        let symbol_sum: f64 = data
-            .get_event_times_ms("my_crate::foo::bar")
-            .map_or(0.0, |m| m.values().copied().sum());
+        let symbol_sum = data.get_event_times_ms("my_crate::foo::bar").map_or(
+            Duration::ZERO,
+            |m| {
+                m.values()
+                    .copied()
+                    .fold(Duration::ZERO, |acc, next| acc + next)
+            },
+        );
 
         // Total: attributed(10) + unattributed(15 + 30) = 55ms.
         let total = target_sum + symbol_sum;
         assert!(
-            (total - 55.0).abs() < 0.1,
-            "sum(target.event_times_ms) + sum(symbol event_times_ms) should be ~55, got {total}",
+            (ms_f64(total) - 55.0).abs() < 0.1,
+            "sum(target.event_times_ms) + sum(symbol event_times_ms) should be ~55, got {}",
+            ms_f64(total),
         );
 
         // Verify the split: symbol got 10ms, target got 45ms.
         assert!(
-            (symbol_sum - 10.0).abs() < 0.1,
-            "Symbol sum should be ~10, got {symbol_sum}",
+            (ms_f64(symbol_sum) - 10.0).abs() < 0.1,
+            "Symbol sum should be ~10, got {}",
+            ms_f64(symbol_sum),
         );
         assert!(
-            (target_sum - 45.0).abs() < 0.1,
-            "Target sum should be ~45, got {target_sum}",
+            (ms_f64(target_sum) - 45.0).abs() < 0.1,
+            "Target sum should be ~45, got {}",
+            ms_f64(target_sum),
         );
     }
 
     /// Nested events: only self-time (not raw duration) goes into
     /// `event_times_ms`, preventing double-counting.
+    ///
+    /// Why: duration sums would overstate costs for nested queries.
     #[test]
     fn test_event_times_ms_use_self_time_not_duration() {
         use analyzeme::ProfilingDataBuilder;
@@ -1909,18 +2118,24 @@ mod tests {
 
         let timings =
             data.get_target_timings("test_crate").expect("should exist");
-        let typeck_cost =
-            timings.event_times_ms.get("typeck").copied().unwrap_or(0.0);
+        let typeck_cost = timings
+            .event_times_ms
+            .get("typeck")
+            .copied()
+            .unwrap_or(Duration::ZERO);
 
         // Self-time: parent(10) + child(10) = 20ms.
         // NOT raw duration: parent(20) + child(10) = 30ms.
         assert!(
-            (typeck_cost - 20.0).abs() < 0.1,
-            "Expected self-time ~20 (not raw duration ~30), got {typeck_cost}",
+            (ms_f64(typeck_cost) - 20.0).abs() < 0.1,
+            "Expected self-time ~20 (not raw duration ~30), got {}",
+            ms_f64(typeck_cost),
         );
     }
 
     /// Empty `event_times_ms` when no events are profiled.
+    ///
+    /// Why: callers should treat missing timing data as absent.
     #[test]
     fn test_event_times_ms_empty_without_events() {
         let data = ProfileData::default();

@@ -1,0 +1,4 @@
+[env]
+# ts-rs generates TypeScript type declarations from Rust structs.
+# Output lands here and is NOT checked into version control.
+TS_RS_EXPORT_DIR = { value = "types/generated", relative = true }

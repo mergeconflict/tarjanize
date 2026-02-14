@@ -74,7 +74,8 @@ body {
   height: 100%;
   cursor: col-resize;
   background: #333;
-  z-index: 11;
+  /* Keep below the sidebar so sidebar tooltips can float above it. */
+  z-index: 9;
 }
 
 #sidebar-resize:hover {

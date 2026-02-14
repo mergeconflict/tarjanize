@@ -5,8 +5,15 @@ use tarjanize_schedule::data::{ScheduleData, Summary, TargetData};
 use tarjanize_schedule::recommend::shatter_target;
 use tarjanize_schemas::{
     CostModel, Module, Package, Symbol, SymbolGraph, SymbolKind, Target,
-    TargetTimings, Visibility,
+    TargetId, TargetTimings, Visibility,
 };
+
+/// Converts f64 milliseconds to `Duration` for test fixtures.
+///
+/// Why: keeps test inputs readable while matching production units.
+fn ms(val: f64) -> Duration {
+    Duration::from_secs_f64(val / 1000.0)
+}
 
 /// Verifies that shattering scales metadata costs by dependency usage.
 #[test]
@@ -38,7 +45,7 @@ fn shatter_scales_metadata_cost() {
         "SymA".to_string(),
         Symbol {
             file: "lib.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 10.0)]),
+            event_times_ms: HashMap::from([("typeck".to_string(), ms(10.0))]),
             dependencies: HashSet::from(["[dep1/lib]::foo".to_string()]),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -52,7 +59,7 @@ fn shatter_scales_metadata_cost() {
         "SymB".to_string(),
         Symbol {
             file: "lib.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), 10.0)]),
+            event_times_ms: HashMap::from([("typeck".to_string(), ms(10.0))]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -71,7 +78,7 @@ fn shatter_scales_metadata_cost() {
         timings: TargetTimings {
             wall_time: Duration::from_millis(200), // Arbitrary wall time
             event_times_ms: HashMap::from([
-                ("metadata_decode_entry".to_string(), 100.0), // High meta cost
+                ("metadata_decode_entry".to_string(), ms(100.0)), // High meta cost
             ]),
         },
         dependencies: HashSet::from([
@@ -112,8 +119,8 @@ fn shatter_scales_metadata_cost() {
         TargetData {
             name: "dep1/lib".to_string(),
             start: Duration::ZERO,
-            finish: Duration::from_secs_f64(dep1_finish / 1000.0),
-            cost: Duration::from_secs_f64(dep1_finish / 1000.0),
+            finish: ms(dep1_finish),
+            cost: ms(dep1_finish),
             slack: Duration::ZERO,
             lane: 0,
             symbol_count: 0,
@@ -126,8 +133,8 @@ fn shatter_scales_metadata_cost() {
         TargetData {
             name: "dep2/lib".to_string(),
             start: Duration::ZERO,
-            finish: Duration::from_secs_f64(dep2_finish / 1000.0),
-            cost: Duration::from_secs_f64(dep2_finish / 1000.0),
+            finish: ms(dep2_finish),
+            cost: ms(dep2_finish),
             slack: Duration::ZERO,
             lane: 1,
             symbol_count: 0,
@@ -170,9 +177,13 @@ fn shatter_scales_metadata_cost() {
     };
 
     // 7. Run shatter_target
-    let (new_schedule, _) =
-        shatter_target(&sg, "test-pkg/lib", &schedule, Some(&model))
-            .expect("shatter_target failed");
+    let (new_schedule, _) = shatter_target(
+        &sg,
+        &TargetId::new("test-pkg", "lib"),
+        &schedule,
+        Some(&model),
+    )
+    .expect("shatter_target failed");
 
     // 8. Verify Costs
     // Groups should be:

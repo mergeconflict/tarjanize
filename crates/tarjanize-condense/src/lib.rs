@@ -31,6 +31,7 @@
 //! ```
 
 mod error;
+mod rewrite;
 mod scc;
 
 use std::io::{Read, Write};
@@ -70,6 +71,8 @@ use crate::scc::condense_and_partition;
 /// let mut out = stdout().lock();
 /// run(input, &mut out, None).unwrap();
 /// ```
+///
+/// Why: provides a single, stream-oriented entry point for the CLI pipeline.
 pub fn run(
     mut input: impl Read,
     mut output: impl Write,
@@ -78,6 +81,7 @@ pub fn run(
     let _span = debug_span!("run").entered();
 
     // Step 1: Read and parse input JSON.
+    // Why: the condense pipeline operates on a fully materialized SymbolGraph.
     let mut json = String::new();
     input.read_to_string(&mut json)?;
     let symbol_graph: SymbolGraph =
@@ -86,9 +90,11 @@ pub fn run(
         })?;
 
     // Step 2: Condense and partition the graph.
+    // Why: SCCs and anchor constraints must be resolved before rewriting paths.
     let optimized = condense_and_partition(&symbol_graph, cost_model);
 
     // Step 3: Write output JSON.
+    // Why: downstream stages expect a stable, pretty-printed schema format.
     serde_json::to_writer_pretty(&mut output, &optimized)
         .map_err(|e| CondenseError::new(CondenseErrorKind::Serialization(e)))?;
     writeln!(output)?;
@@ -105,6 +111,8 @@ mod tests {
     use super::*;
 
     /// Helper to create a simple symbol for testing.
+    ///
+    /// Why: keeps fixture construction concise across multiple tests.
     fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
@@ -118,10 +126,12 @@ mod tests {
     }
 
     /// Helper to create a crate with default overhead for testing.
+    ///
+    /// Why: avoids repeating boilerplate module setup in each test.
     fn make_crate(
         symbols: HashMap<String, Symbol>,
-    ) -> tarjanize_schemas::Crate {
-        tarjanize_schemas::Crate {
+    ) -> tarjanize_schemas::Target {
+        tarjanize_schemas::Target {
             root: Module {
                 symbols,
                 submodules: HashMap::new(),
@@ -130,16 +140,20 @@ mod tests {
         }
     }
 
-    /// Helper to wrap a Crate into a Package with a "lib" target.
-    fn make_package(crate_data: tarjanize_schemas::Crate) -> Package {
+    /// Helper to wrap a Target into a Package with a "lib" target.
+    ///
+    /// Why: tests rely on the standard "pkg/lib" target naming.
+    fn make_package(crate_data: tarjanize_schemas::Target) -> Package {
         let mut targets = HashMap::new();
         targets.insert("lib".to_string(), crate_data);
         Package { targets }
     }
 
     /// Helper to create a `SymbolGraph` from a map of crate names to Crates.
+    ///
+    /// Why: consolidates test graph assembly for readability.
     fn make_graph(
-        crates: HashMap<String, tarjanize_schemas::Crate>,
+        crates: HashMap<String, tarjanize_schemas::Target>,
     ) -> SymbolGraph {
         let packages = crates
             .into_iter()
@@ -148,6 +162,9 @@ mod tests {
         SymbolGraph { packages }
     }
 
+    /// Roundtrip smoke test: `run` produces valid `SymbolGraph` JSON.
+    ///
+    /// Why: verifies the CLI path can parse, condense, and serialize.
     #[test]
     fn test_run_roundtrip() {
         let mut symbols = HashMap::new();
@@ -170,6 +187,9 @@ mod tests {
         assert_eq!(optimized.packages.len(), 1);
     }
 
+    /// Invalid JSON should yield a deserialization error classification.
+    ///
+    /// Why: callers rely on error classification for user-facing messaging.
     #[test]
     fn test_run_invalid_json() {
         let mut output = Vec::new();

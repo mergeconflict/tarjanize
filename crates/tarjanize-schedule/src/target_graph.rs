@@ -3,14 +3,19 @@
 //! Computes the SCC DAG within a single target, collapsing symbols into
 //! strongly connected components. This is the graph the user sees when
 //! drilling down into a target for splitting.
+//!
+//! Why: SCC condensation is the unit of safe splitting inside a target, so
+//! we compute a dedicated graph for visualization and shatter analysis.
 
 use std::collections::{BTreeSet, HashMap};
 use std::time::Duration;
 
 use petgraph::graph::{DiGraph, NodeIndex};
 use serde::{Deserialize, Serialize};
+use serde_with::{DurationMilliSecondsWithFrac, serde_as};
 use tarjanize_schemas::{
-    Module, SymbolGraph, SymbolKind, serde_duration, sum_event_times,
+    Module, ModulePath, QualifiedSymbolPath, SymbolGraph, SymbolKind, TargetId,
+    sum_event_times,
 };
 
 /// An SCC node in the intra-target condensation graph.
@@ -19,6 +24,9 @@ use tarjanize_schemas::{
 /// symbols that mutually depend on each other and cannot be split apart.
 /// Singleton SCCs (no internal cycles) are the common case; multi-symbol
 /// SCCs indicate tight coupling.
+///
+/// Why: SCCs are the minimum indivisible units when splitting a crate.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SccNode {
     /// Unique index of this SCC within the target.
@@ -28,7 +36,8 @@ pub struct SccNode {
     /// Module path for the primary symbol (for visual clustering).
     pub module_path: String,
     /// Total attributed cost (sum of symbol `event_times_ms`).
-    #[serde(rename = "cost_ms", with = "serde_duration")]
+    #[serde(rename = "cost_ms")]
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
     pub cost: Duration,
 }
 
@@ -37,6 +46,8 @@ pub struct SccNode {
 /// Contains all SCC nodes, the edges between them, and module metadata
 /// for clustering. The frontend uses this to render the drill-down view
 /// when a user clicks on a target in the Gantt chart.
+///
+/// Why: the UI needs a compact, precomputed DAG for interactive exploration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntraTargetGraph {
     /// SCC nodes, indexed by `SccNode.id`.
@@ -61,12 +72,16 @@ pub struct IntraTargetGraph {
 /// 7. Returns `IntraTargetGraph`
 ///
 /// Returns `None` if the target doesn't exist in the symbol graph.
+///
+/// Why: splitting decisions rely on SCC structure, so we materialize it
+/// as a reusable, serializable graph.
 pub fn condense_target(
     symbol_graph: &SymbolGraph,
-    target_id: &str,
+    target_id: &TargetId,
 ) -> Option<IntraTargetGraph> {
-    // Step 1: Parse target_id as "{package}/{target}" and look up the target.
-    let (package_name, target_key) = target_id.split_once('/')?;
+    // Step 1: Look up the target using TargetId accessors.
+    let package_name = target_id.package();
+    let target_key = target_id.target();
     let target = symbol_graph
         .packages
         .get(package_name)?
@@ -79,12 +94,12 @@ pub fn condense_target(
     let target_prefix = format!("[{target_id}]::");
     let mut symbol_paths: Vec<String> = Vec::new();
     let mut module_paths: Vec<String> = Vec::new();
-    let mut costs: Vec<f64> = Vec::new();
+    let mut costs: Vec<Duration> = Vec::new();
 
     collect_symbols(
         &target.root,
-        &target_prefix,
-        "",
+        target_id,
+        &ModulePath::root(),
         &mut symbol_paths,
         &mut module_paths,
         &mut costs,
@@ -141,7 +156,7 @@ pub fn condense_target(
     for (scc_id, scc_node_idx) in condensed.node_indices().enumerate() {
         let members = &condensed[scc_node_idx];
         let mut syms: Vec<String> = Vec::new();
-        let mut total_cost = 0.0;
+        let mut total_cost = Duration::ZERO;
         let mut primary_module = String::new();
 
         for &orig_idx in members {
@@ -163,7 +178,7 @@ pub fn condense_target(
             id: scc_id,
             symbols: syms,
             module_path: primary_module,
-            cost: Duration::from_secs_f64(total_cost / 1000.0),
+            cost: total_cost,
         });
     }
 
@@ -171,6 +186,8 @@ pub fn condense_target(
     // already has the correct edges between SCCs, but with petgraph's
     // internal node indices. Map them to our SCC IDs.
     let mut edge_set: BTreeSet<(usize, usize)> = BTreeSet::new();
+    // Edge indices come from the condensed graph itself; missing endpoints or
+    // node mappings indicate internal inconsistency, so we fail fast.
     for edge in condensed.edge_indices() {
         let (src, dst) = condensed
             .edge_endpoints(edge)
@@ -207,6 +224,9 @@ pub fn condense_target(
 /// partition and all its anchors in another, violating the orphan rule.
 ///
 /// This mirrors step 2b in `tarjanize-condense/src/scc.rs`.
+///
+/// Why: enforcing orphan-rule constraints at the SCC level prevents
+/// invalid splits without re-running the full condense phase.
 fn add_anchor_back_edges(
     impl_anchors: &[(String, Vec<String>)],
     path_to_idx: &HashMap<&str, usize>,
@@ -230,9 +250,8 @@ fn add_anchor_back_edges(
         }
 
         // Pick the anchor with minimum in-degree (fewest incoming edges).
-        let best_anchor_idx = valid_anchor_indices
-            .into_iter()
-            .min_by_key(|&idx| {
+        let Some(best_anchor_idx) =
+            valid_anchor_indices.into_iter().min_by_key(|&idx| {
                 graph
                     .neighbors_directed(
                         nodes[idx],
@@ -240,7 +259,10 @@ fn add_anchor_back_edges(
                     )
                     .count()
             })
-            .expect("valid_anchor_indices is non-empty");
+        else {
+            // Defensive: the non-empty check above should guarantee a value.
+            continue;
+        };
 
         // Back-edge: impl -> anchor. In this graph, edges go from
         // dependency -> dependent, so the existing forward edge for
@@ -260,6 +282,9 @@ fn add_anchor_back_edges(
 ///
 /// This mirrors the pattern of `collect_symbols()` and
 /// `collect_dependencies()`, walking the same module tree recursively.
+///
+/// Why: anchor data is required to keep impls co-located with local types
+/// when we compute SCCs for splitting.
 fn collect_impl_anchors(
     module: &Module,
     target_prefix: &str,
@@ -307,13 +332,16 @@ fn collect_impl_anchors(
 /// Builds the full symbol path (`[pkg/target]::module::symbol`), the
 /// module path (just the module portion), and the total cost for each
 /// symbol.
+///
+/// Why: SCC condensation must only include real symbols that contribute
+/// to compile-time cost and dependency structure.
 fn collect_symbols(
     module: &Module,
-    target_prefix: &str,
-    module_path: &str,
+    target_id: &TargetId,
+    module_path: &ModulePath,
     symbol_paths: &mut Vec<String>,
     module_paths_out: &mut Vec<String>,
-    costs: &mut Vec<f64>,
+    costs: &mut Vec<Duration>,
 ) {
     for (name, symbol) in &module.symbols {
         // Filter out Use and ExternCrate items — they're re-exports/imports,
@@ -324,26 +352,17 @@ fn collect_symbols(
             continue;
         }
 
-        let full_path = if module_path.is_empty() {
-            format!("{target_prefix}{name}")
-        } else {
-            format!("{target_prefix}{module_path}::{name}")
-        };
-        symbol_paths.push(full_path);
-        module_paths_out.push(module_path.to_string());
+        let full_path = QualifiedSymbolPath::new(target_id, module_path, name);
+        symbol_paths.push(full_path.to_string());
+        module_paths_out.push(module_path.as_str().to_owned());
         costs.push(sum_event_times(&symbol.event_times_ms));
     }
 
     for (submod_name, submod) in &module.submodules {
-        let child_path = if module_path.is_empty() {
-            submod_name.clone()
-        } else {
-            format!("{module_path}::{submod_name}")
-        };
         collect_symbols(
             submod,
-            target_prefix,
-            &child_path,
+            target_id,
+            &module_path.child(submod_name),
             symbol_paths,
             module_paths_out,
             costs,
@@ -356,6 +375,9 @@ fn collect_symbols(
 /// Returns a list of `(symbol_path, intra_target_deps)` pairs. Only
 /// dependencies that start with the target prefix are included (cross-target
 /// deps are irrelevant for intra-target SCC computation).
+///
+/// Why: SCC computation is intra-target only, so cross-target edges would
+/// distort the condensation graph.
 fn collect_dependencies(
     module: &Module,
     target_prefix: &str,
@@ -408,12 +430,28 @@ mod tests {
 
     use super::*;
 
+    /// Converts millisecond costs to `Duration` for test fixtures.
+    ///
+    /// Why: test helpers use f64 ms inputs while the schema stores `Duration`.
+    fn duration_from_ms(ms: f64) -> Duration {
+        Duration::from_secs_f64(ms / 1000.0)
+    }
+
+    /// Missing targets should return None instead of panicking.
+    ///
+    /// Why: callers need a safe failure mode for invalid target IDs.
     #[test]
     fn condense_target_returns_none_for_missing_target() {
         let sg = SymbolGraph::default();
-        assert!(condense_target(&sg, "nonexistent/lib").is_none());
+        assert!(
+            condense_target(&sg, &TargetId::new("nonexistent", "lib"))
+                .is_none()
+        );
     }
 
+    /// `Use` items should be filtered out of SCCs.
+    ///
+    /// Why: re-exports do not contribute to compilation cost or splitting.
     #[test]
     fn condense_target_filters_use_items() {
         let mut symbols = HashMap::new();
@@ -421,7 +459,10 @@ mod tests {
             "real_fn".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 10.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(10),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -458,7 +499,8 @@ mod tests {
         packages.insert("test-pkg".to_string(), Package { targets });
         let sg = SymbolGraph { packages };
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         // Only the real_fn should appear, not the Use item.
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].symbols.len(), 1);
@@ -467,6 +509,8 @@ mod tests {
 
     /// Helper: builds a `SymbolGraph` with a single target `test-pkg/lib`
     /// from a list of `(name, kind_str, cost, deps)` tuples.
+    ///
+    /// Why: keeps test setup concise for SCC cases.
     fn make_target(syms: &[(&str, &str, f64, &[&str])]) -> SymbolGraph {
         make_target_in_module(syms, &[])
     }
@@ -474,6 +518,8 @@ mod tests {
     /// Helper: builds a `SymbolGraph` with a single target `test-pkg/lib`
     /// from symbols in the root module and symbols in named submodules.
     /// Submodule symbols are given as `(module_name, name, kind, cost, deps)`.
+    ///
+    /// Why: allows module-path behavior to be tested without extra fixtures.
     fn make_target_in_module(
         root_syms: &[(&str, &str, f64, &[&str])],
         sub_syms: &[(&str, &str, &str, f64, &[&str])],
@@ -485,7 +531,7 @@ mod tests {
             let dep_set: HashSet<String> =
                 deps.iter().map(|d| format!("{prefix}{d}")).collect();
             let event_times = if cost > 0.0 {
-                HashMap::from([("typeck".to_string(), cost)])
+                HashMap::from([("typeck".to_string(), duration_from_ms(cost))])
             } else {
                 HashMap::new()
             };
@@ -508,7 +554,7 @@ mod tests {
             let dep_set: HashSet<String> =
                 deps.iter().map(|d| format!("{prefix}{d}")).collect();
             let event_times = if cost > 0.0 {
-                HashMap::from([("typeck".to_string(), cost)])
+                HashMap::from([("typeck".to_string(), duration_from_ms(cost))])
             } else {
                 HashMap::new()
             };
@@ -550,6 +596,9 @@ mod tests {
         SymbolGraph { packages }
     }
 
+    /// Cycles should collapse into a single SCC.
+    ///
+    /// Why: SCCs represent indivisible groups for splitting.
     #[test]
     fn condense_target_merges_cyclic_symbols() {
         // sym_a depends on sym_b, sym_b depends on sym_a — mutual cycle.
@@ -558,7 +607,8 @@ mod tests {
             ("sym_b", "Function", 3.0, &["sym_a"]),
         ]);
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         // Both symbols should be merged into a single SCC.
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].symbols.len(), 2);
@@ -567,6 +617,9 @@ mod tests {
         assert_eq!(result.nodes[0].cost, Duration::from_millis(8));
     }
 
+    /// Chains should produce separate SCCs with a dependency edge.
+    ///
+    /// Why: validates edge direction and SCC separation for acyclic deps.
     #[test]
     fn condense_target_chain_produces_two_sccs_with_edge() {
         // A depends on B, no cycle. Should produce two separate SCCs
@@ -576,7 +629,8 @@ mod tests {
             ("fn_b", "Function", 20.0, &[]),
         ]);
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         assert_eq!(result.nodes.len(), 2);
         assert_eq!(result.edges.len(), 1);
 
@@ -586,6 +640,9 @@ mod tests {
         }
     }
 
+    /// Module paths should be preserved in SCC metadata.
+    ///
+    /// Why: the UI clusters SCCs by module path.
     #[test]
     fn condense_target_module_path_annotation() {
         // Symbols in different submodules should have their module paths
@@ -598,7 +655,8 @@ mod tests {
             ],
         );
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         // Three independent symbols → three SCCs.
         assert_eq!(result.nodes.len(), 3);
 
@@ -619,6 +677,9 @@ mod tests {
         assert!(result.modules.contains(&"codegen".to_string()));
     }
 
+    /// `ExternCrate` items should be filtered like `Use` items.
+    ///
+    /// Why: imports/re-exports do not contribute to SCC cost or splits.
     #[test]
     fn condense_target_filters_extern_crate_items() {
         // ExternCrate items should be filtered out just like Use items.
@@ -627,12 +688,16 @@ mod tests {
             ("ext_crate", "ExternCrate", 0.0, &[]),
         ]);
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         assert_eq!(result.nodes.len(), 1);
         assert_eq!(result.nodes[0].symbols.len(), 1);
         assert!(result.nodes[0].symbols[0].contains("real_fn"));
     }
 
+    /// Cross-target dependencies should be ignored in intra-target SCCs.
+    ///
+    /// Why: only same-target dependencies affect split feasibility.
     #[test]
     fn condense_target_cross_target_deps_ignored() {
         // A dependency on a symbol in another target should not create
@@ -644,7 +709,10 @@ mod tests {
             "local_fn".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 5.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(5),
+                )]),
                 dependencies: HashSet::from([format!(
                     "{other_prefix}external_fn"
                 )]),
@@ -670,11 +738,15 @@ mod tests {
         packages.insert("test-pkg".to_string(), Package { targets });
         let sg = SymbolGraph { packages };
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
         assert_eq!(result.nodes.len(), 1);
         assert!(result.edges.is_empty());
     }
 
+    /// Impl anchors should cause SCC merging with their anchor.
+    ///
+    /// Why: preserves orphan-rule constraints during splitting.
     #[test]
     fn condense_target_merges_impl_with_anchor() {
         // A struct "Foo" and an impl block "{{impl}}[0]" with anchor pointing
@@ -687,7 +759,10 @@ mod tests {
             "Foo".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 5.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(5),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Struct".to_string(),
@@ -699,7 +774,10 @@ mod tests {
             "{{impl}}[0]".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 3.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(3),
+                )]),
                 // The impl depends on Foo (normal forward edge).
                 dependencies: HashSet::from([format!("{prefix}Foo")]),
                 kind: SymbolKind::Impl {
@@ -724,7 +802,8 @@ mod tests {
         packages.insert("test-pkg".to_string(), Package { targets });
         let sg = SymbolGraph { packages };
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
 
         // Both Foo and {{impl}}[0] must be in the same SCC because the
         // anchor back-edge (Foo → {{impl}}[0]) creates a cycle with the
@@ -740,6 +819,9 @@ mod tests {
         assert_eq!(result.nodes[0].cost, Duration::from_millis(8));
     }
 
+    /// External anchors should not force intra-target merging.
+    ///
+    /// Why: only local anchors are relevant to intra-target SCCs.
     #[test]
     fn condense_target_external_anchor_no_back_edge() {
         // An impl with two anchors: one external (different target) and one
@@ -752,7 +834,10 @@ mod tests {
             "LocalType".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 4.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(4),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Struct".to_string(),
@@ -764,7 +849,10 @@ mod tests {
             "{{impl}}[0]".to_string(),
             Symbol {
                 file: "lib.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 2.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_millis(2),
+                )]),
                 // The impl depends on LocalType.
                 dependencies: HashSet::from([format!("{prefix}LocalType")]),
                 kind: SymbolKind::Impl {
@@ -794,7 +882,8 @@ mod tests {
         packages.insert("test-pkg".to_string(), Package { targets });
         let sg = SymbolGraph { packages };
 
-        let result = condense_target(&sg, "test-pkg/lib").unwrap();
+        let result =
+            condense_target(&sg, &TargetId::new("test-pkg", "lib")).unwrap();
 
         // The intra-target anchor (LocalType) causes merging despite the
         // external anchor being unreachable. Both symbols end up in one SCC.

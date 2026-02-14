@@ -9,9 +9,11 @@
 //! - **Stable**: Changes require updating the golden schema files
 //! - **Complete**: All information needed for analysis is captured
 //! - **Shared**: Used across all phases of the tarjanize pipeline
+//!
+//! Why: keeping schemas in one crate guarantees consistent serialization
+//! contracts across extraction, cost, schedule, condense, and viz.
 
 mod cost_model;
-pub mod serde_duration;
 mod symbol_graph;
 #[cfg(test)]
 mod testutil;

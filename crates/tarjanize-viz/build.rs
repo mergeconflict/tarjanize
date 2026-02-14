@@ -78,8 +78,12 @@ fn main() {
     assert!(status.success(), "esbuild bundling of sidebar.ts failed");
 
     // Rerun when any TS source file changes.
-    println!("cargo:rerun-if-changed=templates/logic.ts");
     println!("cargo:rerun-if-changed=templates/renderer.ts");
-    println!("cargo:rerun-if-changed=templates/tree.ts");
+    println!("cargo:rerun-if-changed=templates/logic.ts");
+    println!("cargo:rerun-if-changed=templates/color.ts");
+    println!("cargo:rerun-if-changed=templates/tooltip.ts");
+    println!("cargo:rerun-if-changed=templates/edges.ts");
+    println!("cargo:rerun-if-changed=templates/constants.ts");
     println!("cargo:rerun-if-changed=templates/sidebar.ts");
+    println!("cargo:rerun-if-changed=templates/tree.ts");
 }

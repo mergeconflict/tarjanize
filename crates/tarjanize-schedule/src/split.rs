@@ -4,13 +4,16 @@
 //! new crate. Enforces the downset constraint (new crates must be
 //! downward-closed sets in the SCC DAG) and computes the resulting
 //! schedule impact.
+//!
+//! Why: split operations must remain valid with respect to dependencies, so
+//! we enforce downset closure before mutating the target graph.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use petgraph::graph::NodeIndex;
 use serde::{Deserialize, Serialize};
-use tarjanize_schemas::SymbolGraph;
+use tarjanize_schemas::{SymbolGraph, TargetId};
 
 use crate::schedule::TargetGraph;
 use crate::target_graph;
@@ -21,6 +24,8 @@ use crate::target_graph;
 /// separate crate. The backend expands the selection to a full downset
 /// (transitive dependency closure) to enforce the convexity constraint:
 /// every dependency of a moved node must also be moved.
+///
+/// Why: the UI captures user intent, but backend must ensure a legal split.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SplitOperation {
     /// The target being split (e.g., "nexus-db-queries/lib").
@@ -37,6 +42,8 @@ pub struct SplitOperation {
 /// Distinguishes between user-selected nodes and those auto-included
 /// by the downset closure, so the UI can highlight which nodes were
 /// pulled in automatically.
+///
+/// Why: distinguishing auto-included SCCs helps explain why splits grow.
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct SplitResult {
     /// All SCC node IDs in the new crate (selected + downset expansion).
@@ -57,6 +64,9 @@ pub struct SplitResult {
 /// This enforces the convexity constraint for crate splitting: if a
 /// symbol is moved to a new crate, every symbol it depends on must
 /// also be moved (or already live in an external crate).
+///
+/// Why: without this closure, the split would create broken intra-target
+/// dependencies and invalid crates.
 pub fn compute_downset(
     deps: &[Vec<usize>],
     selected: &[usize],
@@ -89,6 +99,9 @@ pub fn compute_downset(
 ///
 /// Returns the modified `TargetGraph` and a `SplitResult` for each
 /// operation. The order of `SplitResult`s matches the input operations.
+///
+/// Why: callers need a single pass that updates the schedule graph and
+/// returns UI-facing metadata about the split.
 pub fn apply_splits(
     base: &TargetGraph,
     symbol_graph: &SymbolGraph,
@@ -116,8 +129,15 @@ pub fn apply_splits(
 
         // Condense the source target into its intra-target SCC DAG.
         // If condensation fails (target not in symbol graph), skip.
+        let Some(source_id) = TargetId::parse(&op.source_target) else {
+            results.push(SplitResult {
+                sccs_in_new_crate: Vec::new(),
+                auto_included: Vec::new(),
+            });
+            continue;
+        };
         let Some(intra) =
-            target_graph::condense_target(symbol_graph, &op.source_target)
+            target_graph::condense_target(symbol_graph, &source_id)
         else {
             results.push(SplitResult {
                 sccs_in_new_crate: Vec::new(),
@@ -247,6 +267,8 @@ mod tests {
     use super::*;
 
     /// A leaf node has no dependencies, so its downset is just itself.
+    ///
+    /// Why: validates the base case for downset computation.
     #[test]
     fn downset_of_leaf_is_just_itself() {
         // Chain: C has no deps, B depends on C, A depends on B.
@@ -262,6 +284,8 @@ mod tests {
 
     /// Selecting a node at the top of a chain should pull in every
     /// node below it transitively.
+    ///
+    /// Why: ensures downset includes transitive dependencies.
     #[test]
     fn downset_includes_transitive_deps() {
         // Chain: C -> B -> A. Selecting A should pull in B and C.
@@ -276,6 +300,8 @@ mod tests {
 
     /// Two parallel nodes sharing a common dependency should both
     /// contribute to pulling that dependency into the downset.
+    ///
+    /// Why: verifies union behavior when multiple selections overlap.
     #[test]
     fn downset_of_parallel_nodes_with_shared_dep() {
         // Diamond: A -> C, B -> C. Selecting A and B should include C.
@@ -289,6 +315,8 @@ mod tests {
     }
 
     /// An empty selection should produce an empty downset.
+    ///
+    /// Why: ensures no-op selections don't introduce artifacts.
     #[test]
     fn downset_empty_selection_is_empty() {
         let deps = vec![vec![], vec![0]];
@@ -297,6 +325,8 @@ mod tests {
     }
 
     /// In a graph with no edges, the downset of a node is just that node.
+    ///
+    /// Why: validates behavior on disconnected graphs.
     #[test]
     fn downset_disconnected_graph() {
         // Three independent nodes. Selecting node 1 should return {1}.
@@ -307,6 +337,8 @@ mod tests {
 
     /// A diamond DAG with deeper structure: selecting the top node
     /// should transitively pull in all reachable dependencies.
+    ///
+    /// Why: covers mixed fan-in/fan-out in dependency closure.
     #[test]
     fn downset_diamond_with_deep_chain() {
         // Diamond: D -> B, D -> C, B -> A, C -> A
@@ -332,6 +364,8 @@ mod tests {
     /// live in a single target `test-pkg/lib`. Dependencies reference
     /// other symbols in the same target using just the symbol name (the
     /// helper adds the `[test-pkg/lib]::` prefix automatically).
+    ///
+    /// Why: provides compact fixtures for `apply_splits` tests.
     fn make_simple_graph(
         syms: &[(&str, f64, &[&str])],
     ) -> (SymbolGraph, TargetGraph) {
@@ -341,7 +375,10 @@ mod tests {
             let dep_set: HashSet<String> =
                 deps.iter().map(|d| format!("{prefix}{d}")).collect();
             let event_times = if cost > 0.0 {
-                HashMap::from([("typeck".to_string(), cost)])
+                HashMap::from([(
+                    "typeck".to_string(),
+                    Duration::from_secs_f64(cost / 1000.0),
+                )])
             } else {
                 HashMap::new()
             };
@@ -382,6 +419,8 @@ mod tests {
 
     /// With an empty operations list, the returned graph should match
     /// the base graph exactly (same targets, costs, edges).
+    ///
+    /// Why: `apply_splits` must be a no-op when no splits are requested.
     #[test]
     fn apply_split_no_ops_returns_clone_of_base() {
         let (sg, tg) =
@@ -400,6 +439,8 @@ mod tests {
 
     /// Splitting a target with two independent symbols should produce
     /// two targets: the original (residual) and the new crate.
+    ///
+    /// Why: verifies the basic split mechanics create a new target.
     #[test]
     fn apply_split_produces_additional_target() {
         // Two independent symbols: A (10ms) and B (20ms).
@@ -408,7 +449,11 @@ mod tests {
         assert_eq!(tg.names.len(), 1);
 
         // Condense to find SCC IDs, then pick one to split out.
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Find which SCC contains "fn_a" so we can split it out.
         let scc_a = intra
@@ -435,13 +480,19 @@ mod tests {
     /// Splitting a target with two SCCs of known costs should distribute
     /// costs correctly: the new crate gets the downset cost, the
     /// residual keeps the remainder.
+    ///
+    /// Why: ensures cost conservation across the split boundary.
     #[test]
     fn apply_split_distributes_costs() {
         // Two independent symbols: A (10ms) and B (20ms).
         let (sg, tg) =
             make_simple_graph(&[("fn_a", 10.0, &[]), ("fn_b", 20.0, &[])]);
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Find which SCC contains "fn_a" (cost 10ms).
         let scc_a = intra
@@ -479,6 +530,8 @@ mod tests {
     /// When SCC A (top) depends on SCC B (bottom) and we split out B,
     /// the residual (containing A) must depend on the new crate
     /// (containing B). This tests the cross-boundary dependency edge.
+    ///
+    /// Why: dependency edges must be preserved to maintain build order.
     #[test]
     fn apply_split_adds_dependency_edge_when_cross_boundary() {
         // fn_a depends on fn_b. Splitting out fn_b means the residual
@@ -488,7 +541,11 @@ mod tests {
             ("fn_b", 20.0, &[]),
         ]);
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Find fn_b's SCC (the leaf/dependency).
         let scc_b = intra
@@ -524,6 +581,8 @@ mod tests {
     /// When selecting a top-of-chain SCC, the downset expansion should
     /// automatically include all transitive dependencies. The
     /// `SplitResult` should report which SCCs were auto-included.
+    ///
+    /// Why: UI feedback depends on correct auto-included reporting.
     #[test]
     fn apply_split_result_identifies_auto_included_sccs() {
         // Chain: fn_a -> fn_b -> fn_c. Selecting fn_a should auto-
@@ -534,7 +593,11 @@ mod tests {
             ("fn_c", 5.0, &[]),
         ]);
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Find fn_a's SCC (the top of the chain).
         let scc_a = intra
@@ -586,6 +649,8 @@ mod tests {
     /// 1. The resulting graph has 3 targets (residual + 2 new crates)
     /// 2. No cycles exist in the resulting graph
     /// 3. Costs sum to the original total
+    ///
+    /// Why: validates that repeated splits preserve DAG invariants.
     #[test]
     fn sequential_splits_produce_acyclic_graph() {
         // Diamond: fn_a -> fn_b, fn_a -> fn_c, fn_b -> fn_d, fn_c -> fn_d
@@ -597,7 +662,11 @@ mod tests {
             ("fn_d", 4.0, &[]),
         ]);
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Find SCC IDs.
         let scc_id = |name: &str| -> usize {
@@ -664,6 +733,8 @@ mod tests {
     ///
     /// After splitting out a subset of SCCs, the residual should still
     /// contain the unselected symbols with their costs.
+    ///
+    /// Why: ensures residual targets retain correct cost/symbol counts.
     #[test]
     fn split_residual_retains_unselected_symbols() {
         // Three independent symbols with different costs.
@@ -674,7 +745,11 @@ mod tests {
         ]);
         let original_cost = tg.costs[0];
 
-        let intra = target_graph::condense_target(&sg, "test-pkg/lib").unwrap();
+        let intra = target_graph::condense_target(
+            &sg,
+            &TargetId::new("test-pkg", "lib"),
+        )
+        .unwrap();
 
         // Split out only fn_a (cost 10).
         let scc_a = intra
@@ -721,6 +796,8 @@ mod tests {
     /// Design doc: split operations use SCC IDs not symbol paths.
     /// Verify that a split operation with a non-existent source target
     /// is handled gracefully (empty `SplitResult`, graph unchanged).
+    ///
+    /// Why: user input may reference invalid targets; behavior should be safe.
     #[test]
     fn split_nonexistent_target_returns_empty_result() {
         let (sg, tg) = make_simple_graph(&[("fn_a", 10.0, &[])]);

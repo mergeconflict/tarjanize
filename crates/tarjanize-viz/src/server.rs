@@ -8,15 +8,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::State;
 use axum::response::{Html, Json};
 use axum::routing::{get, post};
+use serde_with::{DurationMilliSecondsWithFrac, serde_as};
 use tarjanize_schedule::data::ScheduleData;
 use tarjanize_schedule::recommend::collect_symbol_external_targets;
 use tarjanize_schedule::schedule::TargetGraph;
-use tarjanize_schemas::{CostModel, SymbolGraph};
+use tarjanize_schemas::{CostModel, SymbolGraph, TargetId};
 
 /// Bundled JS produced by esbuild during `build.rs`. Contains renderer.ts
 /// with logic.ts inlined, pixi.js kept as an external import.
@@ -42,20 +44,30 @@ const INDEX_HTML: &str = include_str!("../templates/app.html");
 /// Immutable data (`symbol_graph`, `base_target_graph`, `cost_model`) is
 /// set once at startup. The `schedule` is guarded by `RwLock` for
 /// concurrent read access from handlers.
+///
+/// Why: keeps handlers lightweight while sharing the precomputed schedule.
 pub struct AppState {
     /// The original symbol graph, retained for intra-target SCC
     /// condensation when the user drills into a specific target.
     /// Wrapped in `RwLock` because `shatter_handler` updates it with
     /// group targets so that `/api/tree` can resolve shattered names.
+    ///
+    /// Why: tree rendering needs a mutable view that reflects shatters.
     pub symbol_graph: RwLock<SymbolGraph>,
     /// The base target graph (unsplit), built once at startup from the
     /// symbol graph and cost model.
+    ///
+    /// Why: shatter computations reuse the baseline graph to avoid drift.
     pub base_target_graph: TargetGraph,
     /// The auto-fitted cost model (if available). Stored so we don't
     /// need to re-fit when recomputing schedules.
+    ///
+    /// Why: re-fitting is expensive and must stay consistent during a session.
     pub cost_model: Option<CostModel>,
     /// Current schedule data, served by the schedule handler for the
     /// Gantt chart.
+    ///
+    /// Why: the UI polls this endpoint to render the timeline.
     pub schedule: RwLock<ScheduleData>,
 }
 
@@ -63,7 +75,12 @@ pub struct AppState {
 // avoid printing the full graph contents in logs. Shows field presence
 // rather than full data. Uses `finish_non_exhaustive()` because we
 // intentionally omit the `schedule` field (it's large).
+//
+// Why: logs should remain readable and avoid dumping large graphs.
 impl std::fmt::Debug for AppState {
+    /// Formats a compact debug view that avoids dumping full graphs.
+    ///
+    /// Why: debug output should stay readable in logs.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AppState")
             .field(
@@ -89,9 +106,13 @@ impl std::fmt::Debug for AppState {
 /// Identifies the target to shatter into its full SCC condensation
 /// graph. Each SCC becomes an independent target with raw attr cost
 /// (no per-target overhead), showing the theoretical maximum parallelism.
+///
+/// Why: the endpoint only needs a target id to recompute the schedule.
 #[derive(Debug, serde::Deserialize)]
 struct ShatterRequest {
     /// Target identifier in `{package}/{target}` format.
+    ///
+    /// Why: this matches the `TargetGraph` naming scheme.
     target_id: String,
 }
 
@@ -99,24 +120,177 @@ struct ShatterRequest {
 ///
 /// Contains the full target structure and a map of per-symbol cost
 /// breakdowns (attributed vs. shared meta/other costs).
+///
+/// Why: the sidebar needs both the tree structure and cost detail.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct TreeResponse {
     target: tarjanize_schemas::Target,
     /// Map from symbol path to cost breakdown.
     /// Key format matches `collect_symbol_external_targets` with empty prefix:
     /// e.g. `mod::SymbolName`.
+    ///
+    /// Why: the frontend uses paths as stable lookup keys for costs.
     symbol_costs: HashMap<String, SymbolCostBreakdown>,
 }
 
 /// Cost breakdown for a single symbol.
+///
+/// Why: the UI displays attr vs shared metadata/other contributions.
+#[serde_as]
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 struct SymbolCostBreakdown {
     /// Direct attribute cost (sum of event times).
-    attr: f64,
+    ///
+    /// Why: attr is the symbol's own compilation work.
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
+    attr: Duration,
     /// Share of metadata cost based on dependency ratio.
-    meta_share: f64,
+    ///
+    /// Why: metadata work scales with dependency fanout.
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
+    meta_share: Duration,
     /// Share of other cost based on dependency ratio.
-    other_share: f64,
+    ///
+    /// Why: remaining compiler work needs proportional attribution.
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
+    other_share: Duration,
+}
+
+/// Context for cost distribution across a target's symbols.
+///
+/// Why: groups shared parameters so tree traversal stays readable.
+struct CostContext<'a> {
+    /// Total metadata cost for the target.
+    meta: Duration,
+    /// Total non-metadata cost for the target.
+    other: Duration,
+    /// Total number of target-level dependencies (for ratio scaling).
+    total_deps: usize,
+    /// Per-symbol external dependency lists (path -> deps).
+    ext_deps: &'a HashMap<String, Vec<String>>,
+    /// Target-level dependency set, used to bound metadata scaling.
+    tgt_deps: &'a std::collections::HashSet<String>,
+}
+
+/// Sums event-time values into a `Duration`.
+///
+/// Why: we keep `Duration` as the internal representation while the
+/// schema serializes milliseconds for JSON consumers.
+fn sum_event_times_ms(map: &HashMap<String, Duration>) -> Duration {
+    map.values()
+        .copied()
+        .fold(Duration::ZERO, |acc, next| acc + next)
+}
+
+/// Computes a proportional share of a total `Duration`.
+///
+/// Why: shared costs are distributed by dependency count without
+/// introducing floating-point rounding errors in the attribution path.
+fn proportional_share(total: Duration, part: usize, whole: usize) -> Duration {
+    if part == 0 || whole == 0 {
+        return Duration::ZERO;
+    }
+
+    let total_nanos = total.as_nanos();
+    let share_nanos = total_nanos.saturating_mul(u128::from(part as u64))
+        / u128::from(whole as u64);
+    let share_nanos_u64 = u64::try_from(share_nanos)
+        .expect("duration share fits in u64 nanoseconds");
+
+    Duration::from_nanos(share_nanos_u64)
+}
+
+/// Builds a tree response with per-symbol cost breakdowns for a target.
+///
+/// Why: keeps handler logic small while centralizing cost attribution.
+fn build_tree_response(tgt: &tarjanize_schemas::Target) -> TreeResponse {
+    let meta = tgt
+        .timings
+        .event_times_ms
+        .iter()
+        .filter(|(k, _)| k.starts_with("metadata_decode_"))
+        .map(|(_, v)| *v)
+        .fold(Duration::ZERO, |acc, next| acc + next);
+    let other = tgt
+        .timings
+        .event_times_ms
+        .iter()
+        .filter(|(k, _)| !k.starts_with("metadata_decode_"))
+        .map(|(_, v)| *v)
+        .fold(Duration::ZERO, |acc, next| acc + next);
+
+    // Dependency counts are bounded by workspace size.
+    // Why: metadata/other costs must be apportioned across symbols.
+    let total_deps = tgt.dependencies.len();
+    let symbol_ext_deps = collect_symbol_external_targets(&tgt.root, "", "");
+
+    let ctx = CostContext {
+        meta,
+        other,
+        total_deps,
+        ext_deps: &symbol_ext_deps,
+        tgt_deps: &tgt.dependencies,
+    };
+    let mut symbol_costs = HashMap::new();
+    populate_costs(
+        &tgt.root,
+        &tarjanize_schemas::ModulePath::root(),
+        &ctx,
+        &mut symbol_costs,
+    );
+
+    TreeResponse {
+        target: tgt.clone(),
+        symbol_costs,
+    }
+}
+
+/// Walks a module tree and records per-symbol cost breakdowns.
+///
+/// Recurses through submodules so the sidebar can resolve fully-qualified
+/// symbol paths against the cost map.
+///
+/// Why: costs are computed top-down alongside dependency ratios.
+fn populate_costs(
+    module: &tarjanize_schemas::Module,
+    path: &tarjanize_schemas::ModulePath,
+    ctx: &CostContext<'_>,
+    costs: &mut HashMap<String, SymbolCostBreakdown>,
+) {
+    for (name, sym) in &module.symbols {
+        let full_path = if path.is_root() {
+            name.clone()
+        } else {
+            format!("{}::{name}", path.as_str())
+        };
+
+        let attr = sum_event_times_ms(&sym.event_times_ms);
+        let mut meta_share = Duration::ZERO;
+        let mut other_share = Duration::ZERO;
+
+        // Only allocate shared costs when dependency ratios are defined.
+        if ctx.total_deps > 0
+            && let Some(deps) = ctx.ext_deps.get(&full_path)
+        {
+            let count =
+                deps.iter().filter(|d| ctx.tgt_deps.contains(*d)).count();
+            meta_share = proportional_share(ctx.meta, count, ctx.total_deps);
+            other_share = proportional_share(ctx.other, count, ctx.total_deps);
+        }
+
+        costs.insert(
+            full_path,
+            SymbolCostBreakdown {
+                attr,
+                meta_share,
+                other_share,
+            },
+        );
+    }
+
+    for (sub_name, sub) in &module.submodules {
+        populate_costs(sub, &path.child(sub_name), ctx, costs);
+    }
 }
 
 /// Builds the axum router with all API routes.
@@ -130,6 +304,8 @@ struct SymbolCostBreakdown {
 /// - `GET /api/tree/:package/*target` -- module/symbol tree for a target
 /// - `POST /api/shatter` -- shatter a target into its SCCs (transient)
 /// - `GET /api/export` -- export the `SymbolGraph` as JSON
+///
+/// Why: centralizes route wiring so tests can validate the API surface.
 pub fn build_router(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(index_handler))
@@ -144,16 +320,22 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 }
 
 /// Serves the interactive split explorer page as plain HTML.
+///
+/// Why: keeps the frontend static and self-contained for local use.
 async fn index_handler() -> Html<&'static str> {
     Html(INDEX_HTML)
 }
 
 /// Serves the CSS stylesheet with the correct content type.
+///
+/// Why: explicit content types avoid browser MIME sniffing issues.
 async fn css_handler() -> ([(&'static str, &'static str); 1], &'static str) {
     ([("content-type", "text/css; charset=utf-8")], STYLE_CSS)
 }
 
 /// Serves the Gantt renderer JS bundle (ESM) with the correct content type.
+///
+/// Why: the renderer is an ESM bundle and must be delivered with JS MIME type.
 async fn bundle_js_handler() -> ([(&'static str, &'static str); 1], &'static str)
 {
     (
@@ -163,6 +345,8 @@ async fn bundle_js_handler() -> ([(&'static str, &'static str); 1], &'static str
 }
 
 /// Serves the sidebar JS bundle (IIFE) with the correct content type.
+///
+/// Why: the sidebar bundle is loaded separately from the renderer.
 async fn sidebar_js_handler()
 -> ([(&'static str, &'static str); 1], &'static str) {
     (
@@ -176,6 +360,8 @@ async fn sidebar_js_handler()
 /// The frontend fetches this on load to render the Gantt chart. The
 /// response includes summary statistics, per-target data, and the
 /// critical path.
+///
+/// Why: the UI polls this for a consistent schedule snapshot.
 async fn schedule_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<ScheduleData> {
@@ -190,10 +376,8 @@ async fn schedule_handler(
 /// of distributed costs (meta/other shares based on dependencies).
 ///
 /// Returns 404 if the package or target doesn't exist.
-#[expect(
-    clippy::too_many_lines,
-    reason = "handler keeps parsing, cost aggregation, and response assembly in one place"
-)]
+///
+/// Why: the sidebar needs both structure and cost attribution.
 async fn tree_handler(
     State(state): State<Arc<AppState>>,
     axum::extract::Path((package, target)): axum::extract::Path<(
@@ -201,78 +385,6 @@ async fn tree_handler(
         String,
     )>,
 ) -> Result<Json<TreeResponse>, axum::http::StatusCode> {
-    /// Walks a module tree and records per-symbol cost breakdowns.
-    ///
-    /// Recurses through submodules so the sidebar can resolve fully-qualified
-    /// symbol paths against the cost map.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "local helper keeps tree traversal close to handler data flow"
-    )]
-    fn populate_costs(
-        module: &tarjanize_schemas::Module,
-        path: &str,
-        meta: f64,
-        other: f64,
-        total_deps: u32,
-        ext_deps: &HashMap<String, Vec<String>>,
-        tgt_deps: &std::collections::HashSet<String>,
-        costs: &mut HashMap<String, SymbolCostBreakdown>,
-    ) {
-        for (name, sym) in &module.symbols {
-            let full_path = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{path}::{name}")
-            };
-
-            let attr: f64 = sym.event_times_ms.values().sum();
-
-            let mut meta_share = 0.0;
-            let mut other_share = 0.0;
-
-            // Only allocate shared costs when dependency ratios are defined.
-            if total_deps > 0
-                && let Some(deps) = ext_deps.get(&full_path)
-            {
-                let count_u32 = u32::try_from(
-                    deps.iter().filter(|d| tgt_deps.contains(*d)).count(),
-                )
-                .expect("dependency count fits u32");
-                let ratio = f64::from(count_u32) / f64::from(total_deps);
-                meta_share = meta * ratio;
-                other_share = other * ratio;
-            }
-
-            costs.insert(
-                full_path,
-                SymbolCostBreakdown {
-                    attr,
-                    meta_share,
-                    other_share,
-                },
-            );
-        }
-
-        for (name, sub) in &module.submodules {
-            let child_path = if path.is_empty() {
-                name.clone()
-            } else {
-                format!("{path}::{name}")
-            };
-            populate_costs(
-                sub,
-                &child_path,
-                meta,
-                other,
-                total_deps,
-                ext_deps,
-                tgt_deps,
-                costs,
-            );
-        }
-    }
-
     let sg = state
         .symbol_graph
         .read()
@@ -285,47 +397,7 @@ async fn tree_handler(
         .targets
         .get(&target)
         .ok_or(axum::http::StatusCode::NOT_FOUND)?;
-
-    // Calculate total meta/other costs for the target.
-    let meta: f64 = tgt
-        .timings
-        .event_times_ms
-        .iter()
-        .filter(|(k, _)| k.starts_with("metadata_decode_"))
-        .map(|(_, v)| v)
-        .sum();
-    let other: f64 = tgt
-        .timings
-        .event_times_ms
-        .iter()
-        .filter(|(k, _)| !k.starts_with("metadata_decode_"))
-        .map(|(_, v)| v)
-        .sum();
-
-    // Calculate dependency ratios and distribute costs.
-    // Dependency counts are bounded by workspace size; convert through u32
-    // to avoid clippy's precision-loss lint while keeping ratios stable.
-    let total_deps = u32::try_from(tgt.dependencies.len())
-        .expect("dependency count fits u32");
-    let symbol_ext_deps = collect_symbol_external_targets(&tgt.root, "", "");
-
-    let mut symbol_costs = HashMap::new();
-
-    populate_costs(
-        &tgt.root,
-        "",
-        meta,
-        other,
-        total_deps,
-        &symbol_ext_deps,
-        &tgt.dependencies,
-        &mut symbol_costs,
-    );
-
-    Ok(Json(TreeResponse {
-        target: tgt.clone(),
-        symbol_costs,
-    }))
+    Ok(Json(build_tree_response(tgt)))
 }
 
 /// Shatters a target by horizon, persisting the result.
@@ -337,6 +409,8 @@ async fn tree_handler(
 /// shatter.
 ///
 /// Returns 404 if the target doesn't exist or has no symbols.
+///
+/// Why: enables iterative what-if splitting without restarting the server.
 async fn shatter_handler(
     State(state): State<Arc<AppState>>,
     Json(req): Json<ShatterRequest>,
@@ -347,9 +421,11 @@ async fn shatter_handler(
             .read()
             .expect("symbol_graph lock poisoned");
         let schedule = state.schedule.read().expect("schedule lock poisoned");
+        let target_id = TargetId::parse(&req.target_id)
+            .ok_or(axum::http::StatusCode::BAD_REQUEST)?;
         tarjanize_schedule::recommend::shatter_target(
             &sg,
-            &req.target_id,
+            &target_id,
             &schedule,
             state.cost_model.as_ref(),
         )
@@ -358,6 +434,7 @@ async fn shatter_handler(
 
     // Persist both the shattered schedule and the updated symbol graph
     // so subsequent operations (including /api/tree) resolve group names.
+    // Why: UI endpoints must observe the same shatter state.
     let mut schedule = state.schedule.write().expect("schedule lock poisoned");
     *schedule = new_schedule.clone();
     let mut sg = state
@@ -373,6 +450,8 @@ async fn shatter_handler(
 ///
 /// Returns the full `SymbolGraph` so the frontend can download it as a
 /// file that can be used as input to subsequent pipeline stages.
+///
+/// Why: export is the handoff between visualization and CLI stages.
 async fn export_handler(
     State(state): State<Arc<AppState>>,
 ) -> Json<SymbolGraph> {
@@ -385,8 +464,6 @@ async fn export_handler(
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::*;
 
     /// Smoke test: building the router must not panic.
@@ -395,6 +472,8 @@ mod tests {
     /// accidentally use the pre-0.8 `:param` syntax instead of `{param}`,
     /// the panic happens here rather than silently passing all unit tests
     /// and blowing up at runtime.
+    ///
+    /// Why: route validation is the first failure point for bad patterns.
     #[test]
     #[expect(clippy::default_trait_access)]
     fn build_router_does_not_panic() {
@@ -440,12 +519,17 @@ mod tests {
     /// Contains a single package "test-pkg" with target "lib" holding
     /// two symbols (Foo and Bar) where Foo depends on Bar. This gives
     /// us two SCCs and a non-trivial schedule.
+    ///
+    /// Why: keeps API tests small while exercising non-trivial graph paths.
     fn test_state() -> Arc<AppState> {
         let prefix = "[test-pkg/lib]::";
 
         let bar = Symbol {
             file: "lib.rs".into(),
-            event_times_ms: HashMap::from([("typeck".into(), 5.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".into(),
+                Duration::from_millis(5),
+            )]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Struct".into(),
@@ -454,7 +538,10 @@ mod tests {
         };
         let foo = Symbol {
             file: "lib.rs".into(),
-            event_times_ms: HashMap::from([("typeck".into(), 10.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".into(),
+                Duration::from_millis(10),
+            )]),
             dependencies: HashSet::from([format!("{prefix}Bar")]),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".into(),
@@ -490,6 +577,8 @@ mod tests {
 
     /// GET /api/schedule should return 200 with valid JSON containing
     /// the schedule data (targets, `critical_path`, summary).
+    ///
+    /// Why: the frontend assumes this endpoint is a stable schedule source.
     #[tokio::test]
     async fn api_schedule_returns_valid_json() {
         let state = test_state();
@@ -520,6 +609,8 @@ mod tests {
     }
 
     /// GET /api/export should return a valid `SymbolGraph` JSON.
+    ///
+    /// Why: export is the handoff point for downstream CLI stages.
     #[tokio::test]
     async fn api_export_returns_valid_symbol_graph() {
         let state = test_state();
@@ -549,6 +640,8 @@ mod tests {
 
     /// POST /api/shatter should replace a target with its SCC DAG,
     /// returning a schedule with more targets than the original.
+    ///
+    /// Why: shatter must update the schedule for interactive exploration.
     #[tokio::test]
     async fn api_shatter_returns_expanded_schedule() {
         let state = test_state();
@@ -594,6 +687,8 @@ mod tests {
     }
 
     /// POST /api/shatter should return 404 for a nonexistent target.
+    ///
+    /// Why: the UI treats missing targets as a recoverable error.
     #[tokio::test]
     async fn api_shatter_404_for_missing_target() {
         let state = test_state();
@@ -622,6 +717,8 @@ mod tests {
 
     /// GET /api/tree/{package}/{target} should return the Target struct
     /// from the `SymbolGraph`, including the full module/symbol tree.
+    ///
+    /// Why: the sidebar depends on accurate tree data for symbol display.
     #[tokio::test]
     async fn api_tree_returns_target() {
         let state = test_state();
@@ -659,6 +756,8 @@ mod tests {
 
     /// GET /api/tree/{package}/{target} should return 404 for a
     /// nonexistent package or target.
+    ///
+    /// Why: missing targets should not crash the UI.
     #[tokio::test]
     async fn api_tree_404_for_missing_target() {
         let state = test_state();
@@ -680,13 +779,18 @@ mod tests {
     /// GET /api/tree/{package}/{*target} should handle target names
     /// containing slashes (e.g., `bin/main`). The catch-all `{*target}`
     /// parameter captures the entire remaining path.
+    ///
+    /// Why: binary targets often include slashes and must resolve correctly.
     #[tokio::test]
     async fn api_tree_handles_slash_in_target_name() {
         // Build a state with a "bin/main" target to exercise the
         // catch-all path parameter.
         let sym = Symbol {
             file: "main.rs".into(),
-            event_times_ms: HashMap::from([("typeck".into(), 3.0)]),
+            event_times_ms: HashMap::from([(
+                "typeck".into(),
+                Duration::from_millis(3),
+            )]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".into(),
@@ -749,6 +853,8 @@ mod tests {
     /// This is the core regression test: before the fix, shattered group
     /// names were not present in the `SymbolGraph`, causing 404 errors
     /// when the frontend tried to display the module tree for a group.
+    ///
+    /// Why: group targets are the primary UI drill-down after shatter.
     #[tokio::test]
     async fn api_tree_returns_group_after_shatter() {
         let state = test_state();
@@ -819,17 +925,7 @@ mod tests {
 
         // The group should have at least one symbol (the test fixture
         // has Foo and Bar; they share horizon 0 so both land in group_0).
-        let sym_count = count_symbols_in_module(&target.root);
+        let sym_count = target.root.count_symbols();
         assert!(sym_count > 0, "group target should contain symbols, got 0");
-    }
-
-    /// Recursively counts symbols in a module tree.
-    fn count_symbols_in_module(module: &tarjanize_schemas::Module) -> usize {
-        module.symbols.len()
-            + module
-                .submodules
-                .values()
-                .map(count_symbols_in_module)
-                .sum::<usize>()
     }
 }

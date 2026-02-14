@@ -17,8 +17,11 @@
 use std::collections::HashSet;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
-use tarjanize_schemas::{Crate, Module, SymbolGraph, SymbolKind};
+use tarjanize_schemas::{
+    Module, SymbolGraph, SymbolKind, Target, duration_to_ms_f64,
+};
 
 // =============================================================================
 // HELPER FUNCTIONS
@@ -26,10 +29,10 @@ use tarjanize_schemas::{Crate, Module, SymbolGraph, SymbolKind};
 
 /// Iterate over all crates (compilation units) in the symbol graph.
 ///
-/// With the Package/Target/Crate structure, crates are nested under
+/// With the Package/Target structure, targets are nested under
 /// `packages[pkg].targets[target]`. This helper flattens that for tests
 /// that need to iterate over all crates.
-fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
+fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Target> {
     graph.packages.values().flat_map(|pkg| pkg.targets.values())
 }
 
@@ -41,7 +44,7 @@ fn iter_all_crates(graph: &SymbolGraph) -> impl Iterator<Item = &Crate> {
 fn get_crate_by_name<'a>(
     graph: &'a SymbolGraph,
     crate_name: &str,
-) -> Option<&'a Crate> {
+) -> Option<&'a Target> {
     // Try package name with hyphens (e.g., "my-crate")
     if let Some(pkg) = graph.packages.get(crate_name) {
         return pkg.targets.get("lib");
@@ -728,10 +731,11 @@ fn test_cost_from_profile() {
     let (_, symbol) = find_symbol(&graph, "profiled_fn").expect("should exist");
     // Cost should be positive (from profile data).
     // We check frontend cost since that's what gets populated for most symbols.
+    let event_sum = tarjanize_schemas::sum_event_times(&symbol.event_times_ms);
     assert!(
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        event_sum >= Duration::ZERO,
         "Cost should be non-negative: event_times_sum={}",
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
+        duration_to_ms_f64(event_sum),
     );
 }
 
@@ -740,10 +744,11 @@ fn test_cost_impl_profile_match() {
     let graph = extract_fixture("cost_impl_profile_match");
     // Impl block should have cost from profile.
     let (_, symbol) = find_symbol(&graph, "{{impl}}").expect("should exist");
+    let event_sum = tarjanize_schemas::sum_event_times(&symbol.event_times_ms);
     assert!(
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        event_sum >= Duration::ZERO,
         "Impl cost should be non-negative: event_times_sum={}",
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
+        duration_to_ms_f64(event_sum),
     );
 }
 
@@ -866,8 +871,9 @@ fn test_cost_empty_function() {
     // Empty functions still have cost (from type checking, etc.).
     let (_, symbol) = find_symbol(&graph, "empty_fn").expect("should exist");
     // We just verify the symbol exists and has non-negative cost.
+    let event_sum = tarjanize_schemas::sum_event_times(&symbol.event_times_ms);
     assert!(
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        event_sum >= Duration::ZERO,
         "Empty fn should have non-negative cost"
     );
 }
@@ -884,10 +890,11 @@ fn test_cost_sum_nested() {
     // Parent function should exist and have positive cost that includes nested fn.
     let (_, symbol) =
         find_symbol(&graph, "outer_with_nested").expect("should exist");
+    let event_sum = tarjanize_schemas::sum_event_times(&symbol.event_times_ms);
     assert!(
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        event_sum >= Duration::ZERO,
         "Outer fn should have non-negative cost including nested: event_times_sum={}",
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
+        duration_to_ms_f64(event_sum),
     );
     // Nested function should NOT appear as separate symbol.
     assert_no_symbol(&graph, "nested_helper");
@@ -899,10 +906,11 @@ fn test_cost_sum_closures() {
     // Parent function should exist and have positive cost that includes closures.
     let (_, symbol) =
         find_symbol(&graph, "outer_with_closures").expect("should exist");
+    let event_sum = tarjanize_schemas::sum_event_times(&symbol.event_times_ms);
     assert!(
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms) >= 0.0,
+        event_sum >= Duration::ZERO,
         "Outer fn should have non-negative cost including closures: event_times_sum={}",
-        tarjanize_schemas::sum_event_times(&symbol.event_times_ms),
+        duration_to_ms_f64(event_sum),
     );
     // Closures should NOT appear as separate symbols.
     assert_no_symbol(&graph, "{{closure}}");

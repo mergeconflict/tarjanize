@@ -9,6 +9,7 @@ import {
   criticalPathThrough,
   searchFilter,
   slackColor,
+  pointInRect,
 } from "../crates/tarjanize-viz/templates/logic.js";
 
 // ---------------------------------------------------------------------------
@@ -134,5 +135,26 @@ describe("slackColor", () => {
 
   it("handles zero maxSlack without division by zero", () => {
     expect(slackColor(0, 0)).toBe("hsl(0, 80%, 50%)");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pointInRect
+// ---------------------------------------------------------------------------
+
+describe("pointInRect", () => {
+  const rect = { left: 10, right: 110, top: 20, bottom: 220 };
+
+  it("returns true for points inside the rectangle", () => {
+    expect(pointInRect(10, 20, rect)).toBe(true);
+    expect(pointInRect(50, 100, rect)).toBe(true);
+    expect(pointInRect(110, 220, rect)).toBe(true);
+  });
+
+  it("returns false for points outside the rectangle", () => {
+    expect(pointInRect(9, 20, rect)).toBe(false);
+    expect(pointInRect(111, 20, rect)).toBe(false);
+    expect(pointInRect(10, 19, rect)).toBe(false);
+    expect(pointInRect(10, 221, rect)).toBe(false);
   });
 });

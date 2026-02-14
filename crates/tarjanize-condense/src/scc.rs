@@ -15,12 +15,17 @@ use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::unionfind::UnionFind;
 use tarjanize_cost::{ModelFit, model_fit};
 use tarjanize_schemas::{
-    CostModel, Crate, Module, Package, Symbol, SymbolGraph, SymbolKind,
-    TargetTimings, sum_event_times,
+    CostModel, Module, Package, QualifiedSymbolPath, Symbol, SymbolGraph,
+    SymbolKind, Target, TargetId, TargetTimings, duration_to_ms_f64,
+    sum_event_times,
 };
-use tracing::debug;
+use tracing::{debug, trace};
+
+use crate::rewrite::{build_module_tree, compute_path_mapping};
 
 /// Extracts impl anchors from a symbol kind, if it's an impl.
+///
+/// Why: anchor discovery drives orphan-rule enforcement and back-edge wiring.
 fn impl_anchors(kind: &SymbolKind) -> Option<&HashSet<String>> {
     match kind {
         SymbolKind::Impl { anchors, .. } => Some(anchors),
@@ -28,23 +33,10 @@ fn impl_anchors(kind: &SymbolKind) -> Option<&HashSet<String>> {
     }
 }
 
-/// Parse a symbol path in the `[package/target]::module::symbol` format.
-///
-/// Returns `(prefix, rest)` where:
-/// - `prefix` is the bracketed portion like `[package/target]`
-/// - `rest` is the remaining path like `module::symbol`
-///
-/// If the path doesn't start with `[`, returns `None` (old format path).
-fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
-    if !path.starts_with('[') {
-        return None;
-    }
-    // Find the closing bracket.
-    let bracket_end = path.find(']')?;
-    let prefix = &path[..=bracket_end];
-    // The rest should start with `::`
-    let rest = path.get(bracket_end + 1..)?.strip_prefix("::")?;
-    Some((prefix, rest))
+/// Alias for `QualifiedSymbolPath::parse_prefix` — kept as a local helper
+/// for readability in pattern-match contexts.
+pub(crate) fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
+    QualifiedSymbolPath::parse_prefix(path)
 }
 
 /// Tries to resolve a sub-symbol dependency path to a known container.
@@ -56,6 +48,8 @@ fn parse_bracketed_path(path: &str) -> Option<(&str, &str)> {
 ///
 /// Returns `None` if the path doesn't start with `[` (not a bracketed path)
 /// or if stripping the last segment still doesn't resolve.
+///
+/// Why: we prefer a conservative fallback over dropping edges entirely.
 fn resolve_sub_symbol_path(
     index: &SymbolIndex<'_>,
     dep: &str,
@@ -80,6 +74,8 @@ fn resolve_sub_symbol_path(
 /// Dependencies are processed in reverse condensation order (higher indices
 /// first, i.e., closer to roots) so that deps with larger reachable sets are
 /// processed first, maximizing redundancy elimination.
+///
+/// Why: reducing edges improves partitioning heuristics while preserving reachability.
 fn hmr_reduce(
     initial_reachable: HashSet<usize>,
     deps: &[usize],
@@ -108,8 +104,10 @@ fn hmr_reduce(
 /// Symbols and their paths are indexed by their insertion order; when we build
 /// the index, we traverse the module tree and insert each symbol and its path
 /// into `symbols` and `paths` respectively.
+///
+/// Why: the condense pipeline needs stable indices for fast lookup and rewrites.
 #[derive(Default)]
-struct SymbolIndex<'a> {
+pub(crate) struct SymbolIndex<'a> {
     /// Symbols indexed by position.
     symbols: Vec<&'a Symbol>,
     /// Paths indexed by position. Also provides reverse lookup.
@@ -130,17 +128,19 @@ impl<'a> SymbolIndex<'a> {
     ///
     /// The path format uses brackets to delimit the package/target portion,
     /// which makes parsing unambiguous (brackets don't appear in Rust paths).
+    ///
+    /// Why: SCC and rewrite stages require O(1) lookup by symbol path.
     fn build(symbol_graph: &'a SymbolGraph) -> Self {
         let mut index = SymbolIndex::default();
         for (package_name, package) in &symbol_graph.packages {
             for (target_key, crate_data) in &package.targets {
                 // Paths use [package/target]::module::symbol format.
                 // This matches the format used by the orchestrator for dependencies.
-                let crate_prefix = format!("[{package_name}/{target_key}]");
-                let target_id = format!("{package_name}/{target_key}");
+                let target_id = TargetId::new(package_name, target_key);
+                let crate_prefix = format!("[{target_id}]");
                 index.add_module(
                     package_name,
-                    &target_id,
+                    target_id.as_str(),
                     &crate_prefix,
                     &crate_data.root,
                 );
@@ -150,6 +150,8 @@ impl<'a> SymbolIndex<'a> {
     }
 
     /// Recursively adds symbols from a module to the index.
+    ///
+    /// Why: preserves module hierarchy while flattening for fast graph builds.
     fn add_module(
         &mut self,
         crate_name: &str,
@@ -172,31 +174,45 @@ impl<'a> SymbolIndex<'a> {
     }
 
     /// Returns the index for a path, if it exists.
+    ///
+    /// Why: edge construction needs quick mapping from dependency path to node.
     fn get_index(&self, path: &str) -> Option<usize> {
         self.paths.get_index_of(path)
     }
 
     /// Returns the path at the given index.
-    fn get_path(&self, index: usize) -> &str {
-        self.paths.get_index(index).expect("valid index")
+    ///
+    /// Why: path rewrites and debug logs need stable, index-based lookup.
+    pub(crate) fn get_path(&self, index: usize) -> &str {
+        self.paths
+            .get_index(index)
+            .expect("index was obtained from paths and must be in range")
     }
 
     /// Returns the symbol at the given index.
-    fn get_symbol(&self, index: usize) -> &'a Symbol {
+    ///
+    /// Why: condense needs symbol metadata without repeated map walks.
+    pub(crate) fn get_symbol(&self, index: usize) -> &'a Symbol {
         self.symbols[index]
     }
 
     /// Returns the original crate name for a symbol.
+    ///
+    /// Why: synthetic crate naming derives from contributing original crates.
     fn get_original_crate(&self, index: usize) -> &str {
         &self.original_crates[index]
     }
 
     /// Returns the original target key (e.g., `"pkg/lib"`) for a symbol.
-    fn get_original_target(&self, index: usize) -> &str {
+    ///
+    /// Why: target-level timing data is keyed by original package/target IDs.
+    pub(crate) fn get_original_target(&self, index: usize) -> &str {
         &self.original_targets[index]
     }
 
     /// Returns the number of symbols in the index.
+    ///
+    /// Why: sizing graphs and iterating depends on stable index length.
     fn len(&self) -> usize {
         self.symbols.len()
     }
@@ -210,10 +226,8 @@ impl<'a> SymbolIndex<'a> {
 /// 3. Merges SCCs using union-find based on the merge criterion
 /// 4. Fixes anchor constraints for orphan rule compliance
 /// 5. Builds and returns the optimized `SymbolGraph`
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "SCC count limited by symbol count; real workspaces have far fewer than 2^32 symbols"
-)]
+///
+/// Why: this is the single Phase 2 entry point used by the CLI and tests.
 #[expect(
     clippy::too_many_lines,
     reason = "Complex algorithm with many steps; splitting would obscure the flow"
@@ -223,6 +237,7 @@ pub(crate) fn condense_and_partition(
     cost_model: Option<&CostModel>,
 ) -> SymbolGraph {
     // Handle empty graph case.
+    // Why: avoids building empty petgraph structures and keeps output minimal.
     if symbol_graph.packages.is_empty() {
         return SymbolGraph {
             packages: HashMap::new(),
@@ -230,8 +245,9 @@ pub(crate) fn condense_and_partition(
     }
 
     // Step 1: Build symbol index for O(1) lookups.
+    // Why: the SCC build and rewrite phases are path-centric.
     let index = SymbolIndex::build(symbol_graph);
-    debug!(symbol_count = index.len(), "Built symbol index");
+    trace!(symbol_count = index.len(), "Built symbol index");
 
     if index.len() == 0 {
         return SymbolGraph {
@@ -240,6 +256,7 @@ pub(crate) fn condense_and_partition(
     }
 
     // Step 2: Build DiGraph with symbol indices as node weights.
+    // Why: SCC condensation operates on an explicit symbol dependency graph.
     let mut graph = DiGraph::<usize, ()>::with_capacity(index.len(), 0);
     for i in 0..index.len() {
         graph.add_node(i);
@@ -264,7 +281,7 @@ pub(crate) fn condense_and_partition(
         }
     }
     if sub_symbol_resolved > 0 {
-        debug!(
+        trace!(
             sub_symbol_resolved,
             "Resolved sub-symbol dependencies by stripping trailing segments"
         );
@@ -274,6 +291,7 @@ pub(crate) fn condense_and_partition(
     // For each impl, add an edge from one of its anchors back to the impl.
     // This creates a cycle that condensation will collapse into a single SCC,
     // ensuring the impl and anchor end up in the same crate (orphan rule).
+    // Why: orphan-rule constraints must be enforced before SCC condensation.
     //
     // TODO: Investigate better heuristics for choosing which anchor to use.
     // Currently we use minimum in-degree as a rough proxy for "niche" — fewer
@@ -313,7 +331,7 @@ pub(crate) fn condense_and_partition(
             back_edge_count += 1;
         }
     }
-    debug!(
+    trace!(
         back_edge_count,
         "Added synthetic back-edges for anchor constraints"
     );
@@ -321,9 +339,10 @@ pub(crate) fn condense_and_partition(
     // Step 3: Run condensation. Returns DiGraph<Vec<usize>, ()>.
     // make_acyclic=true removes self-loops and deduplicates edges between SCCs.
     // We only need to know whether dependencies exist, not their multiplicity.
+    // Why: SCCs are the atomic units we can safely merge or keep separate.
     let condensed = condensation(graph, true);
     let scc_count = condensed.node_count();
-    debug!(scc_count, "Computed SCCs");
+    trace!(scc_count, "Computed SCCs");
 
     // Step 4: Precompute reachable sets for each SCC using HMR algorithm.
     // For each SCC, reachable[scc] is the set of all SCCs reachable from it.
@@ -336,6 +355,7 @@ pub(crate) fn condense_and_partition(
         (0..scc_count).map(|i| HashSet::from([i])).collect();
 
     // Build adjacency list (SCC dependencies).
+    // Why: HMR reduction and set merging need direct dependency lists.
     let scc_deps: Vec<Vec<usize>> = (0..scc_count)
         .map(|i| {
             condensed
@@ -346,6 +366,7 @@ pub(crate) fn condense_and_partition(
         .collect();
 
     // Build reverse adjacency list (SCC dependents).
+    // Why: merging uses dependent sets to decide where to attach SCCs.
     let mut scc_dependents: Vec<Vec<usize>> = vec![Vec::new(); scc_count];
     for (from, deps) in scc_deps.iter().enumerate() {
         for &to in deps {
@@ -356,6 +377,7 @@ pub(crate) fn condense_and_partition(
     // Process in forward order (leaves first in condensation order).
     // For each SCC, compute reachable set by HMR: process dependencies in topo
     // order, keeping only non-redundant edges.
+    // Why: we want reachable sets to drive redundancy removal and merging.
     for scc_id in 0..scc_count {
         let mut deps: Vec<usize> = scc_deps[scc_id].clone();
         // Sort dependencies by topo order (lower index = earlier in condensation
@@ -372,17 +394,18 @@ pub(crate) fn condense_and_partition(
             // If dep is already reachable, the edge scc_id→dep is redundant.
         }
     }
-    debug!("Computed SCC reachable sets");
+    trace!("Computed SCC reachable sets");
 
     // Step 5: Build symbol_to_scc mapping and log SCC contents.
-    let mut symbol_to_scc = vec![0u32; index.len()];
+    // Why: later stages need per-symbol SCC IDs to group and rewrite paths.
+    let mut symbol_to_scc = vec![0usize; index.len()];
     for node_idx in condensed.node_indices() {
-        let scc_id = node_idx.index() as u32;
+        let scc_id = node_idx.index();
         let symbols: Vec<&str> = condensed[node_idx]
             .iter()
             .map(|&i| index.get_path(i))
             .collect();
-        debug!(scc_id, ?symbols, "SCC contents");
+        trace!(scc_id, ?symbols, "SCC contents");
         for &symbol_idx in &condensed[node_idx] {
             symbol_to_scc[symbol_idx] = scc_id;
         }
@@ -390,17 +413,20 @@ pub(crate) fn condense_and_partition(
 
     // Step 6: Initialize union-find and set-level tracking structures.
     // petgraph's UnionFind uses path compression (find_mut) and union-by-rank.
-    let mut uf: UnionFind<u32> = UnionFind::new(scc_count);
+    // Why: union-find gives near-O(1) merges as we collapse SCC sets.
+    let mut uf: UnionFind<usize> = UnionFind::new(scc_count);
 
     // For each set (initially each SCC is its own set), track:
     // - set_external_deps: external dependencies (SCCs outside the set), after
     //   removing redundant edges via HMR
     // - set_reachable: reachable SCCs from this set (for HMR redundancy checks)
     // We use the representative's index as the key.
+    // Why: set-level deps drive merge decisions while avoiding redundant edges.
     //
     // Initialize by applying HMR to each SCC's dependencies to remove redundant
     // edges. An edge scc→dep is redundant if dep is reachable through some other
     // dependency.
+    // Why: reduces noise in dependency sets before merging begins.
     let mut set_external_deps: Vec<HashSet<usize>> = scc_deps
         .iter()
         .enumerate()
@@ -417,7 +443,8 @@ pub(crate) fn condense_and_partition(
     // so we iterate in reverse to get dependents first.
     // We use incremental HMR: after each merge, we recompute the set's external
     // deps and reachable set, removing edges that become redundant at set level.
-    debug!("=== Dependent-based merging (using incremental HMR) ===");
+    // Why: merging based on dependents preserves parallelism where possible.
+    trace!("=== Dependent-based merging (using incremental HMR) ===");
     for scc_id in (0..scc_count).rev() {
         // Get the symbols in this SCC for logging.
         let scc_symbols: Vec<&str> = condensed[NodeIndex::new(scc_id)]
@@ -430,13 +457,12 @@ pub(crate) fn condense_and_partition(
 
         // Find the effective dependent sets: sets where the edge to this SCC
         // is not redundant (i.e., scc_id is in that set's external_deps).
-        let effective_dependent_sets: HashSet<u32> = all_dependents
+        let effective_dependent_sets: HashSet<usize> = all_dependents
             .iter()
             .filter_map(|&dep| {
-                let dep_set = uf.find_mut(dep as u32);
-                let dep_set_idx = dep_set as usize;
+                let dep_set = uf.find_mut(dep);
                 // Check if this set has a non-redundant edge to scc_id.
-                set_external_deps[dep_set_idx]
+                set_external_deps[dep_set]
                     .contains(&scc_id)
                     .then_some(dep_set)
             })
@@ -452,7 +478,7 @@ pub(crate) fn condense_and_partition(
                 // until stable. This would reduce the number of isolated
                 // single-symbol crates that add per-crate overhead without
                 // enabling any parallelism.
-                debug!(
+                trace!(
                     scc_id,
                     ?scc_symbols,
                     "Root SCC (no effective dependents), stays in own set"
@@ -461,59 +487,59 @@ pub(crate) fn condense_and_partition(
             1 => {
                 // All effective dependents in same set - merge this SCC into
                 // that set, then update the set's external deps and reachable.
-                let target_set =
-                    *effective_dependent_sets.iter().next().unwrap();
-                uf.union(scc_id as u32, target_set);
+                let target_set = *effective_dependent_sets
+                    .iter()
+                    .next()
+                    .expect("single-element set must have one entry");
+                uf.union(scc_id, target_set);
 
                 // Get the actual representative after the union (might differ
                 // from target_set due to union-by-rank).
-                let new_rep = uf.find_mut(scc_id as u32);
-                let new_rep_idx = new_rep as usize;
+                let new_rep = uf.find_mut(scc_id);
 
                 // If the representative changed, move the old set's data.
-                let target_set_idx = target_set as usize;
                 if new_rep != target_set {
-                    set_external_deps[new_rep_idx] =
-                        std::mem::take(&mut set_external_deps[target_set_idx]);
-                    set_reachable[new_rep_idx] =
-                        std::mem::take(&mut set_reachable[target_set_idx]);
+                    set_external_deps[new_rep] =
+                        std::mem::take(&mut set_external_deps[target_set]);
+                    set_reachable[new_rep] =
+                        std::mem::take(&mut set_reachable[target_set]);
                 }
 
                 // Update set tracking: merge this SCC into the target set.
                 // Add this SCC's external deps (except those internal to the
                 // set), then recompute reachable using HMR.
-                set_external_deps[new_rep_idx].remove(&scc_id);
+                set_external_deps[new_rep].remove(&scc_id);
                 for &dep in &scc_deps[scc_id] {
                     // Only add if external to the merged set.
-                    if uf.find_mut(dep as u32) != new_rep {
-                        set_external_deps[new_rep_idx].insert(dep);
+                    if uf.find_mut(dep) != new_rep {
+                        set_external_deps[new_rep].insert(dep);
                     }
                 }
 
                 // Recompute non-redundant external deps via HMR.
                 // Start with the SCCs in this merged set as the initial reachable.
                 let sccs_in_set: HashSet<usize> = (0..scc_count)
-                    .filter(|&s| uf.find_mut(s as u32) == new_rep)
+                    .filter(|&s| uf.find_mut(s) == new_rep)
                     .collect();
                 let all_deps: Vec<usize> =
-                    set_external_deps[new_rep_idx].iter().copied().collect();
+                    set_external_deps[new_rep].iter().copied().collect();
                 let (new_external_deps, new_reachable) =
                     hmr_reduce(sccs_in_set, &all_deps, &scc_reachable);
 
-                set_external_deps[new_rep_idx] = new_external_deps;
-                set_reachable[new_rep_idx] = new_reachable;
+                set_external_deps[new_rep] = new_external_deps;
+                set_reachable[new_rep] = new_reachable;
 
-                debug!(
+                trace!(
                     scc_id,
                     ?scc_symbols,
                     target_set,
-                    external_deps = ?set_external_deps[new_rep_idx],
+                    external_deps = ?set_external_deps[new_rep],
                     "Merged into dependent's set"
                 );
             }
             _ => {
                 // Effective dependents in different sets - this is a boundary.
-                debug!(
+                trace!(
                     scc_id,
                     ?scc_symbols,
                     ?effective_dependent_sets,
@@ -524,8 +550,8 @@ pub(crate) fn condense_and_partition(
     }
 
     // Step 8: Group symbols by union-find set.
-    debug!("=== Final partition assignments ===");
-    let mut set_to_symbols: HashMap<u32, Vec<usize>> = HashMap::new();
+    trace!("=== Final partition assignments ===");
+    let mut set_to_symbols: HashMap<usize, Vec<usize>> = HashMap::new();
     for (symbol_idx, &scc_id) in symbol_to_scc.iter().enumerate() {
         let set_id = uf.find_mut(scc_id);
         set_to_symbols.entry(set_id).or_default().push(symbol_idx);
@@ -535,7 +561,7 @@ pub(crate) fn condense_and_partition(
     for (&set_id, symbol_indices) in &set_to_symbols {
         let symbols: Vec<&str> =
             symbol_indices.iter().map(|&i| index.get_path(i)).collect();
-        debug!(set_id, ?symbols, "Final partition");
+        trace!(set_id, ?symbols, "Final partition");
     }
     debug!(
         crate_count = set_to_symbols.len(),
@@ -546,18 +572,189 @@ pub(crate) fn condense_and_partition(
     build_output_graph(&index, set_to_symbols, symbol_graph, cost_model)
 }
 
+/// Sums per-target event durations grouped by metadata vs. non-metadata.
+///
+/// Returns two maps: `(target_meta, target_other)` where keys are
+/// `"package/target"` strings and values are summed durations for
+/// metadata-decode events and all other events respectively.
+///
+/// Why: synthetic targets inherit overhead from their constituent original
+/// targets, requiring per-target metadata/other breakdowns.
+fn collect_per_target_event_sums(
+    original_graph: &SymbolGraph,
+) -> (HashMap<String, Duration>, HashMap<String, Duration>) {
+    let mut target_meta = HashMap::new();
+    let mut target_other = HashMap::new();
+
+    for (pkg, p) in &original_graph.packages {
+        for (tgt, crate_data) in &p.targets {
+            let target_id = format!("{pkg}/{tgt}");
+            let (mut meta, mut other) = (Duration::ZERO, Duration::ZERO);
+            for (k, v) in &crate_data.timings.event_times_ms {
+                if k.starts_with("metadata_decode_") {
+                    meta += *v;
+                } else {
+                    other += *v;
+                }
+            }
+            target_meta.insert(target_id.clone(), meta);
+            target_other.insert(target_id, other);
+        }
+    }
+
+    (target_meta, target_other)
+}
+
+/// Fits a fallback regression model from the original graph's timing data.
+///
+/// Only used when no external `CostModel` is provided. Builds the
+/// 3-variable regression data (attr, meta, other → wall) and fits it.
+///
+/// Why: backward-compatible path for when `tarjanize cost` hasn't been run.
+fn fit_fallback_model(
+    original_graph: &SymbolGraph,
+    target_meta: &HashMap<String, Duration>,
+    target_other: &HashMap<String, Duration>,
+) -> Option<ModelFit> {
+    let mut regression_data: Vec<Vec<f64>> = Vec::new();
+    for (pkg, p) in &original_graph.packages {
+        for (tgt, crate_data) in &p.targets {
+            let wall = duration_to_ms_f64(crate_data.timings.wall_time);
+            if wall <= 0.0 {
+                continue;
+            }
+            let target_id = format!("{pkg}/{tgt}");
+            let attr = crate_data.root.collect_frontend_cost();
+            let meta = target_meta
+                .get(&target_id)
+                .copied()
+                .unwrap_or(Duration::ZERO);
+            let other = target_other
+                .get(&target_id)
+                .copied()
+                .unwrap_or(Duration::ZERO);
+            regression_data.push(vec![
+                duration_to_ms_f64(attr),
+                duration_to_ms_f64(meta),
+                duration_to_ms_f64(other),
+                wall,
+            ]);
+        }
+    }
+    model_fit(&regression_data)
+}
+
+/// Context shared across all partitions during output graph construction.
+///
+/// Groups the read-only data that `create_synthetic_target` needs,
+/// avoiding a long parameter list on every call.
+///
+/// Why: `build_output_graph` constructs this once and passes a reference
+/// to each per-partition call.
+struct OutputContext<'a> {
+    index: &'a SymbolIndex<'a>,
+    path_mapping: &'a HashMap<String, String>,
+    symbol_to_synthetic: &'a [String],
+    target_meta: &'a HashMap<String, Duration>,
+    target_other: &'a HashMap<String, Duration>,
+    cost_model: Option<&'a CostModel>,
+    fallback_model: Option<&'a ModelFit>,
+}
+
+/// Creates a synthetic target from a partition's symbols.
+///
+/// Builds the module tree, sums attributed event times, derives
+/// dependencies from symbol-level edges, estimates meta/other overhead
+/// using the max-constituent heuristic, and predicts wall time.
+///
+/// Why: each partition becomes a separate synthetic package in the output.
+fn create_synthetic_target(
+    ctx: &OutputContext<'_>,
+    crate_name: &str,
+    symbol_indices: &[usize],
+) -> Target {
+    let root_module =
+        build_module_tree(ctx.index, symbol_indices, ctx.path_mapping);
+
+    // Sum per-symbol attributed event times for the synthetic target.
+    let attr = symbol_indices
+        .iter()
+        .map(|&i| sum_event_times(&ctx.index.get_symbol(i).event_times_ms))
+        .fold(Duration::ZERO, |acc, next| acc + next);
+    let attr_ms = duration_to_ms_f64(attr);
+
+    // Collect constituent original targets for this partition.
+    let constituent_targets: HashSet<&str> = symbol_indices
+        .iter()
+        .map(|&i| ctx.index.get_original_target(i))
+        .collect();
+
+    // Derive synthetic target dependencies from symbol-level edges.
+    // For each symbol in this partition, check its dependencies — if any
+    // point to symbols in a different partition, that partition's synthetic
+    // target becomes a dependency. This is cycle-free by construction
+    // because the symbol graph is a DAG after SCC condensation.
+    let my_target = format!("{crate_name}/synthetic");
+    let synthetic_deps: HashSet<String> = symbol_indices
+        .iter()
+        .flat_map(|&sym_idx| ctx.index.get_symbol(sym_idx).dependencies.iter())
+        .filter_map(|dep_path| {
+            let dep_idx = ctx.index.get_index(dep_path)?;
+            let dep_target = &ctx.symbol_to_synthetic[dep_idx];
+            (dep_target != &my_target).then(|| dep_target.clone())
+        })
+        .collect();
+
+    // Estimate meta/other for the synthetic crate using the
+    // max-constituent heuristic: a synthetic crate inherits at least
+    // as much metadata/other overhead as its largest constituent.
+    //
+    // TODO: Cost model inflation. The max-constituent heuristic assigns
+    // the full overhead of the largest original target to every fragment,
+    // even single-symbol crates. This inflates predicted wall times.
+    // Should scale meta/other proportionally by symbol count relative
+    // to the original target.
+    let meta = constituent_targets
+        .iter()
+        .filter_map(|t| ctx.target_meta.get(*t))
+        .copied()
+        .fold(Duration::ZERO, Duration::max);
+    let other = constituent_targets
+        .iter()
+        .filter_map(|t| ctx.target_other.get(*t))
+        .copied()
+        .fold(Duration::ZERO, Duration::max);
+    let meta_ms = duration_to_ms_f64(meta);
+    let other_ms = duration_to_ms_f64(other);
+
+    // Predict wall time: external CostModel coefficients if provided,
+    // otherwise internally fitted regression (or raw attr fallback).
+    let wall_time_ms = if let Some(cm) = ctx.cost_model {
+        cm.predict(attr_ms, meta_ms, other_ms)
+    } else {
+        predict_wall_time(ctx.fallback_model, attr_ms, meta_ms, other_ms)
+    };
+
+    Target {
+        timings: TargetTimings {
+            wall_time: Duration::from_secs_f64(wall_time_ms / 1000.0),
+            ..Default::default()
+        },
+        root: root_module,
+        dependencies: synthetic_deps,
+    }
+}
+
 /// Builds the output `SymbolGraph` from grouped symbols.
 ///
 /// This uses a two-pass approach:
 /// 1. Compute all new paths (old path → new path mapping)
 /// 2. Build the output graph, rewriting dependencies using the mapping
-#[expect(
-    clippy::too_many_lines,
-    reason = "three-variable model setup adds unavoidable per-target computation"
-)]
+///
+/// Why: path rewriting and output assembly must stay consistent and deterministic.
 fn build_output_graph(
     index: &SymbolIndex<'_>,
-    set_to_symbols: HashMap<u32, Vec<usize>>,
+    set_to_symbols: HashMap<usize, Vec<usize>>,
     original_graph: &SymbolGraph,
     cost_model: Option<&CostModel>,
 ) -> SymbolGraph {
@@ -569,9 +766,8 @@ fn build_output_graph(
     let mut used_names: HashSet<String> = HashSet::new();
 
     // Compute crate names for each set.
-    let mut set_crate_data: Vec<(u32, String, Vec<usize>)> = Vec::new();
+    let mut set_crate_data: Vec<(usize, String, Vec<usize>)> = Vec::new();
     for (set_id, symbol_indices) in sets {
-        // Collect unique original crates contributing to this set.
         let original_crates_set: HashSet<&str> = symbol_indices
             .iter()
             .map(|&i| index.get_original_crate(i))
@@ -598,13 +794,10 @@ fn build_output_graph(
     let path_mapping = compute_path_mapping(index, &set_crate_names);
 
     // Build mapping from symbol index → synthetic target name.
-    // Used to derive synthetic target dependencies from symbol-level edges.
-    //
-    // We derive deps from the symbol graph (which is acyclic after SCC
-    // condensation) rather than the original target-level deps. The original
-    // target deps include dev-dependency edges (test→lib) that create cycles
-    // when condensation cross-partitions test and lib symbols from different
-    // packages.
+    // Derived from the symbol graph (acyclic after SCC condensation)
+    // rather than original target-level deps, which include dev-dependency
+    // edges (test→lib) that create cycles when condensation cross-partitions
+    // test and lib symbols from different packages.
     let mut symbol_to_synthetic: Vec<String> = vec![String::new(); index.len()];
     for (_set_id, crate_name, symbol_indices) in &set_crate_data {
         let target_name = format!("{crate_name}/synthetic");
@@ -613,145 +806,32 @@ fn build_output_graph(
         }
     }
 
-    // Pre-compute per-target metadata and other (non-metadata) event sums.
-    // Used by both the external CostModel path and the internal fallback.
-    let target_meta: HashMap<String, f64> = original_graph
-        .packages
-        .iter()
-        .flat_map(|(pkg, p)| {
-            p.targets.iter().map(move |(tgt, crate_data)| {
-                let target_id = format!("{pkg}/{tgt}");
-                let meta: f64 = crate_data
-                    .timings
-                    .event_times_ms
-                    .iter()
-                    .filter(|(k, _)| k.starts_with("metadata_decode_"))
-                    .map(|(_, v)| v)
-                    .sum();
-                (target_id, meta)
-            })
-        })
-        .collect();
+    // Pre-compute per-target metadata and other event sums.
+    let (target_meta, target_other) =
+        collect_per_target_event_sums(original_graph);
 
-    let target_other: HashMap<String, f64> = original_graph
-        .packages
-        .iter()
-        .flat_map(|(pkg, p)| {
-            p.targets.iter().map(move |(tgt, crate_data)| {
-                let target_id = format!("{pkg}/{tgt}");
-                let other: f64 = crate_data
-                    .timings
-                    .event_times_ms
-                    .iter()
-                    .filter(|(k, _)| !k.starts_with("metadata_decode_"))
-                    .map(|(_, v)| v)
-                    .sum();
-                (target_id, other)
-            })
-        })
-        .collect();
-
-    // Internal model fitting (only used when no external CostModel is
-    // provided). Kept as the backward-compatible fallback path.
-    let model = if cost_model.is_none() {
-        let mut regression_data: Vec<Vec<f64>> = Vec::new();
-        for (pkg, p) in &original_graph.packages {
-            for (tgt, crate_data) in &p.targets {
-                let wall = crate_data.timings.wall_time.as_secs_f64() * 1000.0;
-                if wall <= 0.0 {
-                    continue;
-                }
-                let target_id = format!("{pkg}/{tgt}");
-                let attr = collect_symbol_attr(&crate_data.root);
-                let meta = target_meta.get(&target_id).copied().unwrap_or(0.0);
-                let other =
-                    target_other.get(&target_id).copied().unwrap_or(0.0);
-                regression_data.push(vec![attr, meta, other, wall]);
-            }
-        }
-        model_fit(&regression_data)
+    // Internal model fitting fallback (only when no external CostModel).
+    let fallback = if cost_model.is_none() {
+        fit_fallback_model(original_graph, &target_meta, &target_other)
     } else {
         None
     };
 
-    // Pass 2: Build output graph using the mapping.
-    // Each partition becomes a separate package. The target type is determined
-    // from the original target type of the symbols (they all share the same type
-    // since symbols from different target types can't form cycles).
+    let ctx = OutputContext {
+        index,
+        path_mapping: &path_mapping,
+        symbol_to_synthetic: &symbol_to_synthetic,
+        target_meta: &target_meta,
+        target_other: &target_other,
+        cost_model,
+        fallback_model: fallback.as_ref(),
+    };
+
+    // Pass 2: Build output graph. Each partition becomes a separate package.
     let mut packages = HashMap::new();
     for (_set_id, crate_name, symbol_indices) in set_crate_data {
-        let root_module =
-            build_module_tree(index, &symbol_indices, &path_mapping);
-
-        // Sum per-symbol attributed event times for the synthetic target.
-        let attr: f64 = symbol_indices
-            .iter()
-            .map(|&i| sum_event_times(&index.get_symbol(i).event_times_ms))
-            .sum();
-
-        // Collect constituent original targets for this partition.
-        let constituent_targets: HashSet<&str> = symbol_indices
-            .iter()
-            .map(|&i| index.get_original_target(i))
-            .collect();
-
-        // Derive synthetic target dependencies from symbol-level edges.
-        // For each symbol in this partition, check its dependencies — if any
-        // point to symbols in a different partition, that partition's synthetic
-        // target becomes a dependency. This is cycle-free by construction
-        // because the symbol graph is a DAG after SCC condensation.
-        //
-        // External deps (symbols not in the index, e.g., std) are ignored
-        // since they're outside the workspace and not in our graph.
-        let my_target = format!("{crate_name}/synthetic");
-        let synthetic_deps: HashSet<String> = symbol_indices
-            .iter()
-            .flat_map(|&sym_idx| index.get_symbol(sym_idx).dependencies.iter())
-            .filter_map(|dep_path| {
-                let dep_idx = index.get_index(dep_path)?;
-                let dep_target = &symbol_to_synthetic[dep_idx];
-                (dep_target != &my_target).then(|| dep_target.clone())
-            })
-            .collect();
-
-        // Estimate meta/other for the synthetic crate using the
-        // max-constituent heuristic: a synthetic crate inherits at least
-        // as much metadata/other overhead as its largest constituent.
-        //
-        // TODO: Cost model inflation. The max-constituent heuristic assigns
-        // the full overhead of the largest original target to every fragment,
-        // even single-symbol crates. This inflates predicted wall times.
-        // Should scale meta/other proportionally by symbol count relative
-        // to the original target (e.g., a fragment with 10% of symbols
-        // gets 10% of the meta/other overhead).
-        let meta: f64 = constituent_targets
-            .iter()
-            .filter_map(|t| target_meta.get(*t))
-            .copied()
-            .fold(0.0_f64, f64::max);
-        let other: f64 = constituent_targets
-            .iter()
-            .filter_map(|t| target_other.get(*t))
-            .copied()
-            .fold(0.0_f64, f64::max);
-
-        // Predict wall time: external CostModel coefficients if provided,
-        // otherwise internally fitted regression (or raw attr fallback).
-        let wall_time_ms = if let Some(cm) = cost_model {
-            cm.predict(attr, meta, other)
-        } else {
-            predict_wall_time(model.as_ref(), attr, meta, other)
-        };
-        let dependencies = synthetic_deps;
-
-        let crate_data = Crate {
-            timings: TargetTimings {
-                wall_time: Duration::from_secs_f64(wall_time_ms / 1000.0),
-                ..Default::default()
-            },
-            root: root_module,
-            dependencies,
-        };
+        let crate_data =
+            create_synthetic_target(&ctx, &crate_name, &symbol_indices);
 
         let mut targets = HashMap::new();
         targets.insert("synthetic".to_string(), crate_data);
@@ -761,25 +841,12 @@ fn build_output_graph(
     SymbolGraph { packages }
 }
 
-/// Recursively sums all per-symbol `event_times_ms` values in a module tree.
-///
-/// This is the total attributed self-time for a target — the first predictor
-/// in the two-variable regression model.
-fn collect_symbol_attr(module: &Module) -> f64 {
-    let mut total = 0.0;
-    for symbol in module.symbols.values() {
-        total += sum_event_times(&symbol.event_times_ms);
-    }
-    for submodule in module.submodules.values() {
-        total += collect_symbol_attr(submodule);
-    }
-    total
-}
-
 /// Predicts wall time using the fitted regression model.
 ///
 /// Falls back to the raw symbol attribution sum when no model is available
 /// (e.g., insufficient profiling data for regression).
+///
+/// Why: preserves backward-compatible behavior while using models when possible.
 fn predict_wall_time(
     model: Option<&ModelFit>,
     attr: f64,
@@ -792,251 +859,6 @@ fn predict_wall_time(
     }
 }
 
-/// Computes a mapping from old symbol paths to new symbol paths.
-///
-/// This handles conflict resolution: if two symbols from different original
-/// targets would have the same path in the new crate, they get placed in
-/// `conflict_from_{package_target}` submodules (with `/` replaced by `_`).
-fn compute_path_mapping(
-    index: &SymbolIndex<'_>,
-    set_crate_names: &[(u32, String, Vec<usize>)],
-) -> HashMap<String, String> {
-    let mut mapping = HashMap::new();
-
-    for (_set_id, crate_name, symbol_indices) in set_crate_names {
-        // Group symbols by their relative path (module path + symbol name).
-        let mut path_to_symbols: HashMap<SymbolPathKey, SymbolOccurrences> =
-            HashMap::new();
-
-        for &symbol_idx in symbol_indices {
-            let full_path = index.get_path(symbol_idx);
-            let original_target = index.get_original_target(symbol_idx);
-
-            // Parse path in new format: [package/target]::module::symbol
-            let rest = if let Some((_, rest)) = parse_bracketed_path(full_path)
-            {
-                rest
-            } else {
-                // Fallback to old format: crate::module::symbol
-                full_path.split_once("::").map_or(full_path, |(_, r)| r)
-            };
-
-            let parts: Vec<&str> = rest.split("::").collect();
-            if parts.is_empty() {
-                continue;
-            }
-
-            // Last part is symbol name, everything else is module path.
-            let symbol_name = parts[parts.len() - 1].to_string();
-            let module_parts: Vec<String> = parts[..parts.len() - 1]
-                .iter()
-                .map(|s| (*s).to_string())
-                .collect();
-
-            path_to_symbols
-                .entry((module_parts, symbol_name))
-                .or_default()
-                .push((symbol_idx, original_target.to_string()));
-        }
-
-        // Compute new paths, handling conflicts.
-        // Output paths use the same bracketed format as input: [package/synthetic]::path
-        for ((module_path, symbol_name), occurrences) in path_to_symbols {
-            if occurrences.len() == 1 {
-                // No conflict - symbol keeps its relative path in the new crate.
-                let (symbol_idx, _) = &occurrences[0];
-                let old_path = index.get_path(*symbol_idx).to_string();
-
-                let new_path = if module_path.is_empty() {
-                    format!("[{crate_name}/synthetic]::{symbol_name}")
-                } else {
-                    format!(
-                        "[{}/synthetic]::{}::{}",
-                        crate_name,
-                        module_path.join("::"),
-                        symbol_name
-                    )
-                };
-
-                mapping.insert(old_path, new_path);
-            } else {
-                // Conflict — use the full target ID (e.g., "pkg/lib")
-                // with `/` sanitized to `_` for valid module names.
-                for (symbol_idx, original_target) in &occurrences {
-                    let old_path = index.get_path(*symbol_idx).to_string();
-
-                    let conflict_module = format!(
-                        "conflict_from_{}",
-                        original_target.replace('/', "_")
-                    );
-                    let new_path = if module_path.is_empty() {
-                        format!(
-                            "[{crate_name}/synthetic]::{conflict_module}::{symbol_name}"
-                        )
-                    } else {
-                        format!(
-                            "[{}/synthetic]::{}::{conflict_module}::{symbol_name}",
-                            crate_name,
-                            module_path.join("::")
-                        )
-                    };
-
-                    mapping.insert(old_path, new_path);
-                }
-            }
-        }
-    }
-
-    mapping
-}
-
-/// Builds a module tree from a list of symbol indices.
-///
-/// Handles conflict detection: if two symbols from different original targets
-/// would have the same path, they are placed in `conflict_from_{package_target}`
-/// submodules (with `/` replaced by `_`).
-/// Key for grouping symbols: (module path segments, symbol name).
-type SymbolPathKey = (Vec<String>, String);
-
-/// Value for symbol grouping: list of (symbol index, original target).
-///
-/// The target identifier uses the `"package/target"` format (e.g.,
-/// `"mypkg/lib"`, `"mypkg/test"`) rather than just the package name.
-/// This ensures symbols from different targets of the same package
-/// (lib vs test) produce distinct conflict submodules.
-type SymbolOccurrences = Vec<(usize, String)>;
-
-fn build_module_tree(
-    index: &SymbolIndex<'_>,
-    symbol_indices: &[usize],
-    path_mapping: &HashMap<String, String>,
-) -> Module {
-    // Group symbols by their module path (relative to the new crate).
-    let mut path_to_symbols: HashMap<SymbolPathKey, SymbolOccurrences> =
-        HashMap::new();
-
-    for &symbol_idx in symbol_indices {
-        let full_path = index.get_path(symbol_idx);
-        let original_target = index.get_original_target(symbol_idx);
-
-        // Parse path in new format: [package/target]::module::symbol
-        let rest = if let Some((_, rest)) = parse_bracketed_path(full_path) {
-            rest
-        } else {
-            // Fallback to old format: crate::module::symbol
-            full_path.split_once("::").map_or(full_path, |(_, r)| r)
-        };
-
-        let parts: Vec<&str> = rest.split("::").collect();
-        if parts.is_empty() {
-            continue; // Invalid path
-        }
-
-        // Last part is symbol name, everything else is module path.
-        let symbol_name = parts[parts.len() - 1].to_string();
-        let module_parts: Vec<String> = parts[..parts.len() - 1]
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect();
-
-        path_to_symbols
-            .entry((module_parts, symbol_name))
-            .or_default()
-            .push((symbol_idx, original_target.to_string()));
-    }
-
-    // Build the module tree, handling conflicts.
-    let mut root = Module {
-        symbols: HashMap::new(),
-        submodules: HashMap::new(),
-    };
-
-    for ((module_path, symbol_name), occurrences) in path_to_symbols {
-        if occurrences.len() == 1 {
-            // No conflict - place symbol at its original path.
-            let (symbol_idx, _) = &occurrences[0];
-            let symbol = index.get_symbol(*symbol_idx);
-            let target_module = get_or_create_module(&mut root, &module_path);
-            let new_symbol = rewrite_symbol(symbol, path_mapping);
-            target_module.symbols.insert(symbol_name, new_symbol);
-        } else {
-            // Conflict — use the full target ID (e.g., "pkg/lib")
-            // with `/` sanitized to `_` for valid module names.
-            for (symbol_idx, original_target) in &occurrences {
-                let symbol = index.get_symbol(*symbol_idx);
-
-                // Create path with conflict submodule.
-                let mut conflict_path = module_path.clone();
-                conflict_path.push(format!(
-                    "conflict_from_{}",
-                    original_target.replace('/', "_")
-                ));
-
-                let target_module =
-                    get_or_create_module(&mut root, &conflict_path);
-                let new_symbol = rewrite_symbol(symbol, path_mapping);
-                target_module
-                    .symbols
-                    .insert(symbol_name.clone(), new_symbol);
-            }
-        }
-    }
-
-    root
-}
-
-/// Rewrites a symbol's paths (dependencies and anchors) using the path mapping.
-fn rewrite_symbol(
-    symbol: &Symbol,
-    path_mapping: &HashMap<String, String>,
-) -> Symbol {
-    let rewrite = |path: &String| -> String {
-        path_mapping
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| path.clone())
-    };
-
-    let new_dependencies = symbol.dependencies.iter().map(rewrite).collect();
-
-    let new_kind = match &symbol.kind {
-        SymbolKind::ModuleDef { kind, visibility } => SymbolKind::ModuleDef {
-            kind: kind.clone(),
-            visibility: *visibility,
-        },
-        SymbolKind::Impl { name, anchors } => SymbolKind::Impl {
-            name: name.clone(),
-            anchors: anchors.iter().map(rewrite).collect(),
-        },
-    };
-
-    Symbol {
-        file: symbol.file.clone(),
-        event_times_ms: symbol.event_times_ms.clone(),
-        dependencies: new_dependencies,
-        kind: new_kind,
-    }
-}
-
-/// Gets or creates a nested module at the given path.
-fn get_or_create_module<'a>(
-    root: &'a mut Module,
-    path: &[String],
-) -> &'a mut Module {
-    let mut current = root;
-    for segment in path {
-        current =
-            current
-                .submodules
-                .entry(segment.clone())
-                .or_insert_with(|| Module {
-                    symbols: HashMap::new(),
-                    submodules: HashMap::new(),
-                });
-    }
-    current
-}
-
 #[cfg(test)]
 mod tests {
     use tarjanize_schemas::Visibility;
@@ -1047,11 +869,29 @@ mod tests {
     ///
     /// For test crates, we use the package name as both package and crate name,
     /// with "lib" as the default target.
+    ///
+    /// Why: keeps fixture paths consistent with bracketed path parsing.
     fn path(package: &str, symbol: &str) -> String {
         format!("[{package}/lib]::{symbol}")
     }
 
+    /// Converts f64 milliseconds to `Duration` for test fixtures.
+    ///
+    /// Why: keeps test inputs readable while matching production units.
+    fn ms(val: f64) -> Duration {
+        Duration::from_secs_f64(val / 1000.0)
+    }
+
+    /// Converts a `Duration` to f64 milliseconds for numeric assertions.
+    ///
+    /// Why: tests compare against ms literals while production uses `Duration`.
+    fn ms_f64(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
     /// Helper to create a simple symbol for testing.
+    ///
+    /// Why: reduces boilerplate across graph-building tests.
     fn make_symbol(deps: &[&str]) -> Symbol {
         Symbol {
             file: "test.rs".to_string(),
@@ -1065,8 +905,10 @@ mod tests {
     }
 
     /// Helper to create a crate with default overhead for testing.
-    fn make_crate(symbols: HashMap<String, Symbol>) -> Crate {
-        Crate {
+    ///
+    /// Why: test fixtures reuse a consistent crate shape.
+    fn make_crate(symbols: HashMap<String, Symbol>) -> Target {
+        Target {
             root: Module {
                 symbols,
                 submodules: HashMap::new(),
@@ -1076,14 +918,18 @@ mod tests {
     }
 
     /// Creates a package with a single "lib" target containing the given crate.
-    fn make_package(crate_data: Crate) -> Package {
+    ///
+    /// Why: most tests only need the standard lib target layout.
+    fn make_package(crate_data: Target) -> Package {
         let mut targets = HashMap::new();
         targets.insert("lib".to_string(), crate_data);
         Package { targets }
     }
 
     /// Creates a `SymbolGraph` from a map of package names to crates.
-    fn make_graph(crates: HashMap<String, Crate>) -> SymbolGraph {
+    ///
+    /// Why: centralizes fixture assembly for tests.
+    fn make_graph(crates: HashMap<String, Target>) -> SymbolGraph {
         let packages = crates
             .into_iter()
             .map(|(name, crate_data)| (name, make_package(crate_data)))
@@ -1093,8 +939,10 @@ mod tests {
 
     /// Helper to get all synthetic crates from packages (for test assertions).
     /// Returns a map from package name to crate data.
+    ///
+    /// Why: tests need a stable way to inspect synthetic targets.
     #[expect(dead_code, reason = "available for future tests")]
-    fn get_synthetic_crates(graph: &SymbolGraph) -> HashMap<&str, &Crate> {
+    fn get_synthetic_crates(graph: &SymbolGraph) -> HashMap<&str, &Target> {
         graph
             .packages
             .iter()
@@ -1105,31 +953,34 @@ mod tests {
     }
 
     /// Helper to get the synthetic crate from a package (condense output).
-    fn get_synthetic(pkg: &Package) -> &tarjanize_schemas::Crate {
+    fn get_synthetic(pkg: &Package) -> &Target {
         pkg.targets
             .get("synthetic")
             .expect("expected synthetic target")
     }
 
     /// Helper to get the root module from a package (assumes single target).
+    ///
+    /// Why: most tests use a single synthetic target per package.
     fn get_root(pkg: &Package) -> &Module {
         &get_synthetic(pkg).root
     }
 
     /// Helper to count total symbols across all packages (recursive).
+    ///
+    /// Why: tests assert that partitioning preserves total symbol count.
     fn count_total_symbols(graph: &SymbolGraph) -> usize {
-        fn count_module(module: &Module) -> usize {
-            module.symbols.len()
-                + module.submodules.values().map(count_module).sum::<usize>()
-        }
         graph
             .packages
             .values()
             .flat_map(|pkg| pkg.targets.values())
-            .map(|c| count_module(&c.root))
+            .map(|c| c.root.count_symbols())
             .sum()
     }
 
+    /// Single-symbol graphs should stay in the original crate.
+    ///
+    /// Why: baseline behavior must avoid unnecessary churn.
     #[test]
     fn test_single_symbol_stays_in_crate() {
         let mut symbols = HashMap::new();
@@ -1146,6 +997,9 @@ mod tests {
         assert!(result.packages.contains_key("my_crate"));
     }
 
+    /// Linear chains should merge into one crate.
+    ///
+    /// Why: a single dependent path provides no parallelism benefit.
     #[test]
     fn test_chain_merges_into_one_crate() {
         // a → b → c (chain with single dependents)
@@ -1169,6 +1023,9 @@ mod tests {
         assert_eq!(get_root(crate_module).symbols.len(), 3);
     }
 
+    /// Forks should split into multiple crates around shared dependencies.
+    ///
+    /// Why: independent roots can compile in parallel once shared deps merge.
     #[test]
     fn test_fork_creates_multiple_crates() {
         // A and B both depend on C.
@@ -1199,6 +1056,9 @@ mod tests {
         assert_eq!(total_symbols, 4);
     }
 
+    /// Diamonds should merge into one crate.
+    ///
+    /// Why: shared join points eliminate useful parallelism for this shape.
     #[test]
     fn test_diamond_merges_into_one() {
         // Diamond: A depends on B and C, both B and C depend on D.
@@ -1225,6 +1085,9 @@ mod tests {
         assert_eq!(get_root(crate_module).symbols.len(), 4);
     }
 
+    /// Cycles must remain a single SCC and crate.
+    ///
+    /// Why: splitting cycles would violate dependency ordering.
     #[test]
     fn test_cycle_forms_single_scc() {
         // foo and bar form a cycle - they must stay together.
@@ -1252,6 +1115,9 @@ mod tests {
         assert_eq!(get_root(crate_module).symbols.len(), 2);
     }
 
+    /// Empty graphs should produce empty output.
+    ///
+    /// Why: the pipeline must handle no-op inputs safely.
     #[test]
     fn test_empty_graph() {
         let symbol_graph = SymbolGraph {
@@ -1263,6 +1129,9 @@ mod tests {
         assert!(result.packages.is_empty());
     }
 
+    /// External dependents should keep shared deps split for parallelism.
+    ///
+    /// Why: collapsing shared nodes can reduce achievable parallelism.
     #[test]
     fn test_external_dependent_preserves_parallelism() {
         // Diamond with external E depending on D.
@@ -1288,6 +1157,9 @@ mod tests {
         assert_eq!(result.packages.len(), 3);
     }
 
+    /// Dependencies must be rewritten to the new crate paths.
+    ///
+    /// Why: rewritten graphs must remain internally consistent.
     #[test]
     fn test_dependencies_rewritten_to_new_paths() {
         // A depends on C, B depends on C.
@@ -1324,6 +1196,9 @@ mod tests {
         assert!(found_a, "Symbol 'a' not found in result");
     }
 
+    /// Cross-crate deps must be rewritten to merged synthetic crate paths.
+    ///
+    /// Why: merged crates must remain internally consistent after rewrite.
     #[test]
     fn test_cross_crate_dependencies_rewritten() {
         // Two crates: crate_a has 'foo' depending on 'bar' in crate_b.
@@ -1369,6 +1244,9 @@ mod tests {
         assert!(dep.ends_with("::bar"), "Dependency should end with ::bar");
     }
 
+    /// Redundant edges should not force boundary crates.
+    ///
+    /// Why: transitive reduction should prevent unnecessary splits.
     #[test]
     fn test_redundant_dependency_should_not_create_boundary() {
         // Graph with a redundant dependency edge:
@@ -1430,6 +1308,9 @@ mod tests {
         assert_eq!(partitions, vec![vec!["A"], vec!["B"], vec!["C", "D"]]);
     }
 
+    /// Set-level transitive reduction must be recomputed after merges.
+    ///
+    /// Why: redundancy can appear only after SCCs are unioned.
     #[test]
     fn test_set_level_transitive_reduction() {
         // Graph where redundancy only becomes apparent after merging:
@@ -1518,6 +1399,9 @@ mod tests {
         assert_eq!(partitions, vec![vec!["A", "E"], vec!["B"], vec!["C", "D"]]);
     }
 
+    /// Anchor constraints should be enforced via synthetic back-edges.
+    ///
+    /// Why: orphan-rule anchors must cohabit the final crate.
     #[test]
     fn test_anchor_constraints_handled_by_back_edges() {
         // Test that anchor constraints are satisfied via synthetic back-edges.
@@ -1593,6 +1477,9 @@ mod tests {
         );
     }
 
+    /// Synthetic wall times should sum per-symbol costs when no model exists.
+    ///
+    /// Why: fallback timing must be predictable and additive.
     #[test]
     fn test_synthetic_wall_times_from_per_symbol_costs() {
         // Verify that merged crates get synthetic wall-clock times computed
@@ -1610,7 +1497,10 @@ mod tests {
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 100.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(100.0),
+                )]),
                 dependencies: [path("my_crate", "b")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1622,7 +1512,10 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 200.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(200.0),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1634,7 +1527,7 @@ mod tests {
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            tarjanize_schemas::Crate {
+            Target {
                 root: Module {
                     symbols,
                     submodules: HashMap::new(),
@@ -1660,6 +1553,9 @@ mod tests {
         );
     }
 
+    /// Single-symbol crates should retain their symbol-attributed wall time.
+    ///
+    /// Why: per-crate timings are used downstream for scheduling heuristics.
     #[test]
     fn test_synthetic_wall_times_per_crate() {
         // Verify each single-symbol crate has wall_time_ms matching
@@ -1672,7 +1568,10 @@ mod tests {
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(50.0),
+                )]),
                 dependencies: [path("my_crate", "c")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1684,7 +1583,10 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 80.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(80.0),
+                )]),
                 dependencies: [path("my_crate", "c")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1696,7 +1598,10 @@ mod tests {
             "c".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 30.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(30.0),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1708,7 +1613,7 @@ mod tests {
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            tarjanize_schemas::Crate {
+            Target {
                 root: Module {
                     symbols,
                     submodules: HashMap::new(),
@@ -1731,15 +1636,18 @@ mod tests {
             assert_eq!(root.symbols.len(), 1);
 
             let symbol = root.symbols.values().next().unwrap();
-            let wall_ms = timings.wall_time.as_secs_f64() * 1000.0;
+            let wall_ms = ms_f64(timings.wall_time);
+            let symbol_ms = ms_f64(sum_event_times(&symbol.event_times_ms));
             assert!(
-                (wall_ms - sum_event_times(&symbol.event_times_ms)).abs()
-                    < 0.01,
+                (wall_ms - symbol_ms).abs() < 0.01,
                 "wall_time should match symbol total event_times_ms"
             );
         }
     }
 
+    /// Model-based predictions should override raw attr sums when available.
+    ///
+    /// Why: regression-based estimates are the intended cost model behavior.
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -1761,7 +1669,9 @@ mod tests {
         // After merge, the synthetic crate containing {a, b} should have
         // its wall_time_ms predicted by the model, not just attr sum.
 
-        // Helper to make a package with one symbol and profiling data.
+        /// Helper to make a package with one symbol and profiling data.
+        ///
+        /// Why: keeps the regression fixture setup readable.
         fn make_profiled_package(
             symbol_name: &str,
             symbol_attr: f64,
@@ -1777,7 +1687,7 @@ mod tests {
                     file: "test.rs".to_string(),
                     event_times_ms: HashMap::from([(
                         "typeck".to_string(),
-                        symbol_attr,
+                        ms(symbol_attr),
                     )]),
                     dependencies: deps,
                     kind: SymbolKind::ModuleDef {
@@ -1786,12 +1696,12 @@ mod tests {
                     },
                 },
             );
-            let crate_data = Crate {
+            let crate_data = Target {
                 timings: TargetTimings {
-                    wall_time: Duration::from_secs_f64(wall / 1000.0),
+                    wall_time: ms(wall),
                     event_times_ms: HashMap::from([
-                        ("metadata_decode_entry_foo".to_string(), meta),
-                        ("check_mod_type_wf".to_string(), other),
+                        ("metadata_decode_entry_foo".to_string(), ms(meta)),
+                        ("check_mod_type_wf".to_string(), ms(other)),
                     ]),
                 },
                 root: Module {
@@ -1811,7 +1721,10 @@ mod tests {
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 100.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(100.0),
+                )]),
                 dependencies: [path("pkg_a", "b")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1823,7 +1736,10 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(50.0),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1831,14 +1747,14 @@ mod tests {
                 },
             },
         );
-        let pkg_a_crate = Crate {
+        let pkg_a_crate = Target {
             timings: TargetTimings {
                 // attr = 100 + 50 = 150, meta = 20, other = 10
                 // wall = 2*150 + 3*20 + 1.5*10 = 375
-                wall_time: Duration::from_secs_f64(375.0 / 1000.0),
+                wall_time: ms(375.0),
                 event_times_ms: HashMap::from([
-                    ("metadata_decode_entry_foo".to_string(), 20.0),
-                    ("check_mod_type_wf".to_string(), 10.0),
+                    ("metadata_decode_entry_foo".to_string(), ms(20.0)),
+                    ("check_mod_type_wf".to_string(), ms(10.0)),
                 ]),
             },
             root: Module {
@@ -1909,6 +1825,9 @@ mod tests {
         );
     }
 
+    /// External `CostModel` inputs should drive wall-time prediction.
+    ///
+    /// Why: caller-provided models must override internal heuristics.
     #[test]
     fn test_cost_model_based_prediction() {
         // When an external CostModel is provided, synthetic crate wall
@@ -1935,7 +1854,10 @@ mod tests {
             "a".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 50.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(50.0),
+                )]),
                 dependencies: [path("my_crate", "c")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1947,7 +1869,10 @@ mod tests {
             "b".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 80.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(80.0),
+                )]),
                 dependencies: [path("my_crate", "c")].into_iter().collect(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1959,7 +1884,10 @@ mod tests {
             "c".to_string(),
             Symbol {
                 file: "test.rs".to_string(),
-                event_times_ms: HashMap::from([("typeck".to_string(), 30.0)]),
+                event_times_ms: HashMap::from([(
+                    "typeck".to_string(),
+                    ms(30.0),
+                )]),
                 dependencies: HashSet::new(),
                 kind: SymbolKind::ModuleDef {
                     kind: "Function".to_string(),
@@ -1971,7 +1899,7 @@ mod tests {
         let mut crates = HashMap::new();
         crates.insert(
             "my_crate".to_string(),
-            Crate {
+            Target {
                 root: Module {
                     symbols,
                     submodules: HashMap::new(),
@@ -2002,6 +1930,9 @@ mod tests {
         }
     }
 
+    /// Synthetic deps should come from symbol edges, not target deps.
+    ///
+    /// Why: target-level dev-deps can introduce cycles not present in symbols.
     #[test]
     fn test_synthetic_deps_from_symbol_edges() {
         // Verify that synthetic target dependencies are derived from
@@ -2068,6 +1999,9 @@ mod tests {
         }
     }
 
+    /// Sub-symbol dependency paths should resolve to their container symbols.
+    ///
+    /// Why: associated items should not drop dependency edges.
     #[test]
     fn test_sub_symbol_dependency_resolves_to_container() {
         // When a symbol depends on a sub-symbol path that isn't in the
@@ -2115,6 +2049,9 @@ mod tests {
         );
     }
 
+    /// Sub-symbol fallback must not strip beyond one level.
+    ///
+    /// Why: over-stripping could create spurious edges between unrelated items.
     #[test]
     fn test_sub_symbol_fallback_does_not_over_strip() {
         // When stripping the last segment also doesn't resolve, the
@@ -2154,6 +2091,9 @@ mod tests {
         );
     }
 
+    /// Synthetic deps must use new target IDs after rewriting.
+    ///
+    /// Why: downstream phases assume `/synthetic` target names are canonical.
     #[test]
     fn test_synthetic_deps_remapped_to_new_target_ids() {
         // Verify that dependencies between synthetic crates use new target

@@ -1,799 +1,399 @@
-// renderer.ts — PixiJS v8 renderer for the tarjanize build schedule Gantt chart.
+// renderer.ts — PixiJS v8 Gantt chart renderer for the build schedule.
 //
-// Imports pure functions from logic.ts and reads schedule data from
-// window.DATA (injected by the HTML template). Execution starts
-// immediately at module load time — no wrapping function.
-//
-// Exposes `window.updateSchedule(newData)` so the app can re-render
-// the Gantt chart with modified schedule data (e.g., after shatter).
+// Entry point for the renderer ESM bundle. Builds the chart from
+// globalThis.DATA, handles interactions (hover, click, pan, zoom,
+// search), and exposes globalThis.updateSchedule for live data swaps.
+
+/* eslint-disable @typescript-eslint/prefer-destructuring -- false positives on already-destructured code */
+/* eslint-disable @typescript-eslint/init-declarations -- undefined sentinels need uninitialized declarations */
 
 import { Application, Container, Graphics, Text } from "pixi.js";
+import type { FederatedPointerEvent } from "pixi.js";
 import {
-  criticalPathThrough,
-  slackColor,
-  timeToX,
-  laneToY,
-  searchFilter,
-  formatMs,
-  niceTimeStep,
+  criticalPathThrough, slackColor, timeToX, laneToY,
+  searchFilter, formatMs, niceTimeStep, pointInRect,
 } from "./logic.ts";
+import {
+  CHART_PADDING_LEFT, CHART_PADDING_RIGHT, AXIS_HEIGHT, BAR_HEIGHT_RATIO,
+  MIN_LANE_HEIGHT, MAX_LANE_HEIGHT, LABEL_MIN_LANE_PX, LABEL_PAD_PX,
+  FONT_SIZE, TEXT_RESOLUTION, PARALLELISM_DECIMALS, TICK_HEIGHT,
+  DEFAULT_ALPHA, HIGHLIGHT_ALPHA, DIM_ALPHA, ZOOM_FACTOR, MIN_SCALE,
+  COLOR_BACKGROUND, COLOR_WHITE, COLOR_AXIS_BG, COLOR_AXIS_BORDER,
+  COLOR_AXIS_TICK, COLOR_AXIS_LABEL, THIN_STROKE_WIDTH,
+  HALF_DIVISOR, ORIGIN, UNIT, NEGATIVE_UNIT, ZOOM_DIRECTION_POSITIVE,
+} from "./constants.ts";
+import { hslToHex } from "./color.ts";
+import { showTooltip, positionTooltip, hideTooltip } from "./tooltip.ts";
+import { drawEdges, clearEdges, type EdgeContext } from "./edges.ts";
+import type { ScheduleData } from "../../../types/generated/ScheduleData";
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
+interface BarGraphics extends Graphics { targetIndex: number }
 
-// Left padding in the chart area to avoid bars starting at the very edge.
-const CHART_PADDING_LEFT = 20;
-
-// Right padding so the last bar doesn't hug the viewport boundary.
-const CHART_PADDING_RIGHT = 40;
-
-// Height in pixels reserved for the fixed time axis at the bottom.
-const AXIS_HEIGHT = 30;
-
-// Bar height as a fraction of lane height, leaving a small gap between lanes.
-const BAR_HEIGHT_RATIO = 0.8;
-
-// Alpha for non-critical-path bars when nothing is hovered.
-const DEFAULT_ALPHA = 0.4;
-
-// Alpha for bars on the critical path through the hovered target.
-const HIGHLIGHT_ALPHA = 1.0;
-
-// Alpha for dimmed bars during hover (not on the local critical path).
-const DIM_ALPHA = 0.15;
-
-// Alpha for one-hop dependency edges (not on critical path).
-const EDGE_OFFPATH_ALPHA = 0.25;
-
-// Minimum / maximum lane height bounds for the adaptive calculation.
-// When lane_count exceeds what fits on screen at MIN height, the chart
-// extends beyond the viewport — vertical panning handles the overflow.
-const MIN_LANE_HEIGHT = 1;
-const MAX_LANE_HEIGHT = 20;
-
-// Zoom speed factor. Each wheel tick multiplies or divides the scale by this.
-const ZOOM_FACTOR = 1.1;
-
-// Minimum screen-space lane height (pixels) to show labels. Below this the
-// font doesn't fit and adjacent-lane labels overlap vertically.
-const LABEL_MIN_LANE_PX = 14;
-
-// ---------------------------------------------------------------------------
-// Mutable state: reassigned when updateSchedule() rebuilds the chart
-// ---------------------------------------------------------------------------
-
-// Current schedule data references. Updated by buildChart().
-let targets = window.DATA.targets;
-let summary = window.DATA.summary;
-
-// Store references so we can update alpha/tint on hover and search.
-let barGraphics = [];
-let barColors = [];
-let barLabels = [];
-let barClipMasks = [];
-
-// Layout parameters, recomputed on each buildChart() and resize.
-let laneHeight = 1;
-let scale = 1;
-
-// Track whether we're currently hovering (to avoid conflicts with search).
-let hoveredIdx = null;
-
-// Track the current search match set. null means no active filter.
-let searchMatches = null;
-
-// ---------------------------------------------------------------------------
-// Populate sidebar stats
-// ---------------------------------------------------------------------------
-
-// Expose formatMs on the window so the sidebar UI can reuse it for
-// updating stats without duplicating the formatting logic.
-window.formatMs = formatMs;
-
-// Populate sidebar stats from the current DATA.
-function populateSidebarStats() {
-  document.getElementById("stat-cp").textContent = formatMs(summary.critical_path_ms);
-  document.getElementById("stat-total").textContent = formatMs(summary.total_cost_ms);
-  document.getElementById("stat-parallel").textContent = summary.parallelism_ratio.toFixed(2) + "x";
-  document.getElementById("stat-targets").textContent = summary.target_count;
-  document.getElementById("stat-symbols").textContent = summary.symbol_count;
-  document.getElementById("stat-lanes").textContent = summary.lane_count;
+function isBarGraphics(value: unknown): value is BarGraphics {
+  return value instanceof Graphics && "targetIndex" in value;
 }
 
+let { targets, summary } = globalThis.DATA;
+let barGraphics: Graphics[] = [];
+let barColors: number[] = [];
+let barLabels: Text[] = [];
+let barClipMasks: Graphics[] = [];
+let laneHeight = UNIT;
+let scale = UNIT;
+let hoveredIndex: number | undefined;
+let searchMatches: Set<number> | undefined;
+
+globalThis.formatMs = formatMs;
+
+// ---------------------------------------------------------------------------
+// Sidebar stats
+// ---------------------------------------------------------------------------
+
+function populateSidebarStats(): void {
+  const statCp = document.querySelector("#stat-cp");
+  const statTotal = document.querySelector("#stat-total");
+  const statParallel = document.querySelector("#stat-parallel");
+  const statTargets = document.querySelector("#stat-targets");
+  const statSymbols = document.querySelector("#stat-symbols");
+  const statLanes = document.querySelector("#stat-lanes");
+  if (statCp !== null) { statCp.textContent = formatMs(summary.critical_path_ms); }
+  if (statTotal !== null) { statTotal.textContent = formatMs(summary.total_cost_ms); }
+  if (statParallel !== null) { statParallel.textContent = `${summary.parallelism_ratio.toFixed(PARALLELISM_DECIMALS)}x`; }
+  if (statTargets !== null) { statTargets.textContent = String(summary.target_count); }
+  if (statSymbols !== null) { statSymbols.textContent = String(summary.symbol_count); }
+  if (statLanes !== null) { statLanes.textContent = String(summary.lane_count); }
+}
 populateSidebarStats();
 
 // ---------------------------------------------------------------------------
-// Create PixiJS application
+// PixiJS application and containers
 // ---------------------------------------------------------------------------
 
-const viewport = document.getElementById("viewport");
+const viewport = document.querySelector<HTMLElement>("#viewport");
 const app = new Application();
 await app.init({
-  resizeTo: viewport,
-  background: 0x1a1a2e,
+  resizeTo: viewport ?? undefined,
+  background: COLOR_BACKGROUND,
   antialias: true,
   autoDensity: true,
-  resolution: window.devicePixelRatio || 1,
+  resolution: globalThis.devicePixelRatio === ORIGIN ? UNIT : globalThis.devicePixelRatio,
 });
-viewport.appendChild(app.canvas);
-
-// ---------------------------------------------------------------------------
-// Scene graph
-// ---------------------------------------------------------------------------
-//
-// app.stage
-//   chartContainer          — receives pan/zoom transforms
-//     barsContainer         — one Graphics per target bar
-//     labelsContainer       — Text objects, visibility-culled by zoom level
-//   edgesContainer          — dependency edges in screen space (not panned/zoomed)
-//   axisContainer           — fixed time axis at the bottom (not panned/zoomed)
+if (viewport !== null) { viewport.append(app.canvas); }
 
 const chartContainer = new Container();
 chartContainer.cullable = true;
 app.stage.addChild(chartContainer);
-
 const barsContainer = new Container();
 barsContainer.cullable = true;
 chartContainer.addChild(barsContainer);
-
-// Edges are drawn in screen space (not inside chartContainer) so stroke
-// widths stay constant regardless of non-uniform zoom.
 const edgesContainer = new Container();
 edgesContainer.cullable = true;
 app.stage.addChild(edgesContainer);
-
 const labelsContainer = new Container();
 labelsContainer.cullable = true;
 chartContainer.addChild(labelsContainer);
-
-// Axis container is a sibling of chartContainer (not affected by pan/zoom).
-// Added after chartContainer so it renders on top.
 const axisContainer = new Container();
 app.stage.addChild(axisContainer);
 
-// ---------------------------------------------------------------------------
-// Parse HSL string to a PixiJS-compatible hex integer
-// ---------------------------------------------------------------------------
-
-// Convert an "hsl(h, s%, l%)" string to a 0xRRGGBB integer. PixiJS v8 fill
-// accepts numeric colors. We do the conversion once per bar at creation time
-// so hover/redraw can reuse the stored value.
-function hslToHex(hslStr) {
-  const match = hslStr.match(/hsl\((\d+),\s*(\d+)%,\s*(\d+)%\)/);
-  if (!match) return 0xffffff;
-
-  let h = parseInt(match[1]) / 360;
-  const s = parseInt(match[2]) / 100;
-  const l = parseInt(match[3]) / 100;
-
-  // HSL to RGB conversion using the standard algorithm.
-  let r, g, b;
-  if (s === 0) {
-    r = g = b = l;
-  } else {
-    const hue2rgb = (p, q, t) => {
-      if (t < 0) t += 1;
-      if (t > 1) t -= 1;
-      if (t < 1 / 6) return p + (q - p) * 6 * t;
-      if (t < 1 / 2) return q;
-      if (t < 2 / 3) return p + (q - p) * (2 / 3 - t) * 6;
-      return p;
-    };
-    const q = l < 0.5 ? l * (1 + s) : l + s - l * s;
-    const p = 2 * l - q;
-    r = hue2rgb(p, q, h + 1 / 3);
-    g = hue2rgb(p, q, h);
-    b = hue2rgb(p, q, h - 1 / 3);
-  }
-
-  const toInt = (v) => Math.round(v * 255);
-  return (toInt(r) << 16) | (toInt(g) << 8) | toInt(b);
+function edgeContext(): EdgeContext {
+  return { edgesContainer, chartContainer, targets, scale, laneHeight };
 }
 
 // ---------------------------------------------------------------------------
-// Build chart: creates all bars, labels, and initial layout from current DATA
+// Chart building
 // ---------------------------------------------------------------------------
 
-// Builds (or rebuilds) the entire Gantt chart from the current
-// `window.DATA`. Clears all PixiJS containers and recreates bars,
-// labels, clip masks, layout, and axis. Called once on init and again
-// by `updateSchedule()`.
-function buildChart() {
-  // Update mutable references from the current DATA.
-  targets = window.DATA.targets;
-  summary = window.DATA.summary;
-
-  // Clear existing scene content.
+function buildChart(): void {
+  ({ targets, summary } = globalThis.DATA);
   barsContainer.removeChildren();
   labelsContainer.removeChildren();
   edgesContainer.removeChildren();
   axisContainer.removeChildren();
-
-  // Reset arrays.
   barGraphics = [];
   barColors = [];
   barLabels = [];
   barClipMasks = [];
-
-  // Reset hover/search state since indices are invalidated.
-  hoveredIdx = null;
-  searchMatches = null;
-
-  // Precompute max slack for color mapping.
-  const maxSlack = targets.reduce((m, t) => Math.max(m, t.slack), 0);
-
-  // Adaptive lane height: fill the canvas (minus axis) but clamp to readable bounds.
+  hoveredIndex = undefined;
+  searchMatches = undefined;
+  let maxSlack = ORIGIN;
+  for (const target of targets) { maxSlack = Math.max(maxSlack, target.slack); }
   const canvasHeight = app.screen.height - AXIS_HEIGHT;
-  laneHeight = Math.max(
-    MIN_LANE_HEIGHT,
-    Math.min(MAX_LANE_HEIGHT, canvasHeight / summary.lane_count)
-  );
-
-  // Initial scale: fit the entire critical path into the viewport width.
-  const viewportWidth = app.screen.width;
-  scale = summary.critical_path_ms > 0
-    ? (viewportWidth - CHART_PADDING_LEFT - CHART_PADDING_RIGHT) / summary.critical_path_ms
-    : 1;
-
-  // Reset pan/zoom transforms so the new chart starts at the origin.
-  chartContainer.scale.set(1, 1);
-  chartContainer.position.set(0, 0);
-
-  // Build bars and labels.
-  for (let i = 0; i < targets.length; i++) {
-    const t = targets[i];
+  laneHeight = Math.max(MIN_LANE_HEIGHT, Math.min(MAX_LANE_HEIGHT, canvasHeight / summary.lane_count));
+  const { width: viewportWidth } = app.screen;
+  scale = summary.critical_path_ms > ORIGIN
+    ? (viewportWidth - CHART_PADDING_LEFT - CHART_PADDING_RIGHT) / summary.critical_path_ms : UNIT;
+  chartContainer.scale.set(UNIT, UNIT);
+  chartContainer.position.set(ORIGIN, ORIGIN);
+  for (const [index, t] of targets.entries()) {
     const x = CHART_PADDING_LEFT + timeToX(t.start, scale);
     const y = laneToY(t.lane, laneHeight);
     const w = timeToX(t.cost, scale);
     const h = laneHeight * BAR_HEIGHT_RATIO;
-
     const color = hslToHex(slackColor(t.slack, maxSlack));
     const alpha = t.on_critical_path ? HIGHLIGHT_ALPHA : DEFAULT_ALPHA;
-
-    const bar = new Graphics();
-    bar.rect(0, 0, w, h).fill({ color });
+    const bar: BarGraphics = Object.assign(new Graphics(), { targetIndex: index });
+    bar.rect(ORIGIN, ORIGIN, w, h).fill({ color });
     bar.x = x;
     bar.y = y;
     bar.alpha = alpha;
-
-    // Enable pointer events for hover interactions.
     bar.eventMode = "static";
     bar.cursor = "pointer";
-
-    // Stash index for event handlers.
-    bar.targetIndex = i;
-
     bar.on("pointerover", onBarPointerOver);
     bar.on("pointerout", onBarPointerOut);
     bar.on("pointermove", onBarPointerMove);
     bar.on("pointertap", onBarClick);
-
     barsContainer.addChild(bar);
     barGraphics.push(bar);
     barColors.push(color);
-
-    // Create a text label clipped to the bar bounds. A separate Graphics
-    // rectangle acts as the stencil mask (using the bar itself would hide it,
-    // since PixiJS doesn't render mask sources).
-    // Resolution 4 rasterizes the bitmap at 4x CSS pixels, keeping text
-    // crisp up to 4x zoom.
     const clipMask = new Graphics();
-    clipMask.rect(0, 0, w, h).fill({ color: 0xffffff });
+    clipMask.rect(ORIGIN, ORIGIN, w, h).fill({ color: COLOR_WHITE });
     clipMask.x = x;
     clipMask.y = y;
     labelsContainer.addChild(clipMask);
-
     const label = new Text({
       text: t.name,
-      style: { fontSize: 10, fill: 0xffffff, fontFamily: "monospace" },
-      resolution: 4,
+      style: { fontSize: FONT_SIZE, fill: COLOR_WHITE, fontFamily: "monospace" },
+      resolution: TEXT_RESOLUTION,
     });
-    label.x = x + 3;
-    label.y = y + (h - 10) / 2;
+    label.x = x + LABEL_PAD_PX;
+    label.y = y + (h - FONT_SIZE) / HALF_DIVISOR;
     label.visible = false;
     label.mask = clipMask;
-
     labelsContainer.addChild(label);
     barLabels.push(label);
     barClipMasks.push(clipMask);
   }
-
-  // Initial label visibility and axis.
   updateLabels();
   updateAxis();
 }
 
-// ---------------------------------------------------------------------------
-// Label visibility (zoom-dependent)
-// ---------------------------------------------------------------------------
-
-// Show or hide labels based on lane height, and counter-scale them so text
-// doesn't stretch with zoom. The labels live inside chartContainer (so their
-// positions track the bars), but we set inverse scale on each label to keep
-// the font at its natural pixel size. We also reposition labels so the
-// padding from the bar edge stays constant in screen pixels. The clip masks
-// are NOT counter-scaled — they match the bar bounds which stretch with zoom.
-function updateLabels() {
-  const scaleX = chartContainer.scale.x;
-  const scaleY = chartContainer.scale.y;
+function updateLabels(): void {
+  const { x: scaleX, y: scaleY } = chartContainer.scale;
   const screenLaneHeight = laneHeight * scaleY;
   const visible = screenLaneHeight > LABEL_MIN_LANE_PX;
   const h = laneHeight * BAR_HEIGHT_RATIO;
-
-  for (let i = 0; i < targets.length; i++) {
-    barLabels[i].visible = visible;
-    barLabels[i].scale.x = 1 / scaleX;
-    barLabels[i].scale.y = 1 / scaleY;
-    // Reposition so padding from bar edge is constant in screen pixels.
-    // 3 / scaleX world units = 3 screen pixels from the bar's left edge.
-    barLabels[i].x = barGraphics[i].x + 3 / scaleX;
-    barLabels[i].y = barGraphics[i].y + (h - 10 / scaleY) / 2;
+  for (let index = ORIGIN; index < targets.length; index += UNIT) {
+    barLabels[index].visible = visible;
+    barLabels[index].scale.x = UNIT / scaleX;
+    barLabels[index].scale.y = UNIT / scaleY;
+    barLabels[index].x = barGraphics[index].x + LABEL_PAD_PX / scaleX;
+    barLabels[index].y = barGraphics[index].y + (h - FONT_SIZE / scaleY) / HALF_DIVISOR;
   }
 }
 
-// ---------------------------------------------------------------------------
-// Time axis
-// ---------------------------------------------------------------------------
-
-// Redraw the fixed time axis at the bottom of the canvas. Called on every
-// zoom, pan, and resize. The axis shows tick marks and time labels that
-// adapt to the current horizontal zoom level.
-function updateAxis() {
+function updateAxis(): void {
   axisContainer.removeChildren();
-
-  const screenW = app.screen.width;
-  const screenH = app.screen.height;
-
-  // Background rectangle to occlude chart content scrolling underneath.
-  const bg = new Graphics();
-  bg.rect(0, screenH - AXIS_HEIGHT, screenW, AXIS_HEIGHT)
-    .fill({ color: 0x16213e });
-  axisContainer.addChild(bg);
-
-  // Thin top border for visual separation.
+  const { width: screenW, height: screenH } = app.screen;
+  const background = new Graphics();
+  background.rect(ORIGIN, screenH - AXIS_HEIGHT, screenW, AXIS_HEIGHT).fill({ color: COLOR_AXIS_BG });
+  axisContainer.addChild(background);
   const border = new Graphics();
-  border.setStrokeStyle({ width: 1, color: 0x333333 });
-  border.moveTo(0, screenH - AXIS_HEIGHT);
+  border.setStrokeStyle({ width: THIN_STROKE_WIDTH, color: COLOR_AXIS_BORDER });
+  border.moveTo(ORIGIN, screenH - AXIS_HEIGHT);
   border.lineTo(screenW, screenH - AXIS_HEIGHT);
   border.stroke();
   axisContainer.addChild(border);
-
-  // Effective pixels per millisecond at the current zoom level.
   const pixelsPerMs = scale * chartContainer.scale.x;
   const step = niceTimeStep(pixelsPerMs);
-
-  // Convert screen edges to time coordinates to find the visible range.
-  // worldX = (screenX - chartContainer.x) / chartContainer.scale.x
-  // timeMs = (worldX - CHART_PADDING_LEFT) / scale
-  const timeAtLeft = ((0 - chartContainer.x) / chartContainer.scale.x - CHART_PADDING_LEFT) / scale;
+  const timeAtLeft = ((ORIGIN - chartContainer.x) / chartContainer.scale.x - CHART_PADDING_LEFT) / scale;
   const timeAtRight = ((screenW - chartContainer.x) / chartContainer.scale.x - CHART_PADDING_LEFT) / scale;
-
-  // Clamp start to >= 0 (no negative times).
-  const firstTick = Math.max(0, Math.ceil(timeAtLeft / step)) * step;
-
-  const tickG = new Graphics();
-  tickG.setStrokeStyle({ width: 1, color: 0x666666 });
-
+  const firstTick = Math.max(ORIGIN, Math.ceil(timeAtLeft / step)) * step;
+  const tickGraphics = new Graphics();
+  tickGraphics.setStrokeStyle({ width: THIN_STROKE_WIDTH, color: COLOR_AXIS_TICK });
   for (let t = firstTick; t <= timeAtRight; t += step) {
-    // Convert time back to screen X.
     const worldX = CHART_PADDING_LEFT + timeToX(t, scale);
     const screenX = worldX * chartContainer.scale.x + chartContainer.x;
-
-    // 6px tick mark.
-    tickG.moveTo(screenX, screenH - AXIS_HEIGHT);
-    tickG.lineTo(screenX, screenH - AXIS_HEIGHT + 6);
-
-    // Time label.
+    tickGraphics.moveTo(screenX, screenH - AXIS_HEIGHT);
+    tickGraphics.lineTo(screenX, screenH - AXIS_HEIGHT + TICK_HEIGHT);
     const label = new Text({
       text: formatMs(t),
-      style: { fontSize: 10, fill: 0x999999, fontFamily: "monospace" },
+      style: { fontSize: FONT_SIZE, fill: COLOR_AXIS_LABEL, fontFamily: "monospace" },
     });
-    label.x = screenX + 3;
-    label.y = screenH - AXIS_HEIGHT + 6;
+    label.x = screenX + LABEL_PAD_PX;
+    label.y = screenH - AXIS_HEIGHT + TICK_HEIGHT;
     axisContainer.addChild(label);
   }
-
-  tickG.stroke();
-  axisContainer.addChild(tickG);
+  tickGraphics.stroke();
+  axisContainer.addChild(tickGraphics);
 }
 
-// ---------------------------------------------------------------------------
-// Tooltip
-// ---------------------------------------------------------------------------
-
-const tooltipEl = document.getElementById("tooltip");
-
-// Show the tooltip with details for target at `idx`.
-function showTooltip(idx, globalX, globalY) {
-  const t = targets[idx];
-  tooltipEl.innerHTML = `
-    <div class="tt-name">${t.name}</div>
-    <div class="tt-row"><span>Cost:</span><span>${formatMs(t.cost)}</span></div>
-    <div class="tt-row"><span>Start:</span><span>${formatMs(t.start)}</span></div>
-    <div class="tt-row"><span>Finish:</span><span>${formatMs(t.finish)}</span></div>
-    <div class="tt-row"><span>Slack:</span><span>${formatMs(t.slack)}</span></div>
-    <div class="tt-row"><span>Symbols:</span><span>${t.symbol_count}</span></div>
-    <div class="tt-row"><span>Deps:</span><span>${t.deps.length}</span></div>
-    <div class="tt-row"><span>Dependents:</span><span>${t.dependents.length}</span></div>
-  `;
-  tooltipEl.style.display = "block";
-  positionTooltip(globalX, globalY);
-}
-
-// Position the tooltip near the cursor, keeping it within the viewport.
-function positionTooltip(x, y) {
-  const pad = 12;
-  const rect = tooltipEl.getBoundingClientRect();
-  let left = x + pad;
-  let top = y + pad;
-
-  // Prevent overflow on the right.
-  if (left + rect.width > window.innerWidth) {
-    left = x - rect.width - pad;
-  }
-  // Prevent overflow at the bottom.
-  if (top + rect.height > window.innerHeight) {
-    top = y - rect.height - pad;
-  }
-
-  tooltipEl.style.left = `${left}px`;
-  tooltipEl.style.top = `${top}px`;
-}
-
-function hideTooltip() {
-  tooltipEl.style.display = "none";
-}
-
-// ---------------------------------------------------------------------------
-// Edge drawing
-// ---------------------------------------------------------------------------
-
-// Draw dependency edges when a bar is hovered. Edges on the critical path
-// through the hovered target are solid and bright; one-hop deps/dependents
-// are dashed and faint.
-function drawEdges(idx) {
-  // Clear previous edges.
-  edgesContainer.removeChildren();
-
-  const cpSet = new Set(criticalPathThrough(idx, targets));
-  const t = targets[idx];
-
-  // Collect edges to draw: critical path edges first, then one-hop.
-  // Critical path edges connect consecutive nodes in the cpSet chain.
-  const cpArray = criticalPathThrough(idx, targets);
-  for (let i = 0; i < cpArray.length - 1; i++) {
-    drawEdge(cpArray[i], cpArray[i + 1], true);
-  }
-
-  // One-hop deps that aren't on the critical path.
-  for (const dep of t.deps) {
-    if (!cpSet.has(dep)) {
-      drawEdge(dep, idx, false);
-    }
-  }
-
-  // One-hop dependents that aren't on the critical path.
-  for (const dependent of t.dependents) {
-    if (!cpSet.has(dependent)) {
-      drawEdge(idx, dependent, false);
-    }
-  }
-}
-
-// Convert a world-space coordinate to screen space using the current
-// chartContainer transform.
-function worldToScreen(wx, wy) {
-  return {
-    x: wx * chartContainer.scale.x + chartContainer.x,
-    y: wy * chartContainer.scale.y + chartContainer.y,
-  };
-}
-
-// Draw a single directed edge from source to destination target.
-//
-// Edges are drawn in screen space (edgesContainer is outside chartContainer)
-// so stroke widths stay constant regardless of zoom. Critical path edges use
-// a solid bezier curve; off-path edges use a dashed straight line.
-function drawEdge(fromIdx, toIdx, isCritical) {
-  const from = targets[fromIdx];
-  const to = targets[toIdx];
-
-  // Source: right edge of the from-bar, vertically centered (world space).
-  const w1 = worldToScreen(
-    CHART_PADDING_LEFT + timeToX(from.finish, scale),
-    laneToY(from.lane, laneHeight) + (laneHeight * BAR_HEIGHT_RATIO) / 2,
-  );
-
-  // Destination: left edge of the to-bar, vertically centered (world space).
-  const w2 = worldToScreen(
-    CHART_PADDING_LEFT + timeToX(to.start, scale),
-    laneToY(to.lane, laneHeight) + (laneHeight * BAR_HEIGHT_RATIO) / 2,
-  );
-
-  const x1 = w1.x, y1 = w1.y, x2 = w2.x, y2 = w2.y;
-
-  const g = new Graphics();
-  const color = isCritical ? 0x00d4ff : 0x888888;
-  const alpha = isCritical ? 0.8 : EDGE_OFFPATH_ALPHA;
-
-  if (isCritical) {
-    // Solid bezier curve for critical path edges. The control points
-    // create a gentle S-curve that looks cleaner than a straight line
-    // when lanes differ.
-    const cpx = (x1 + x2) / 2;
-    g.setStrokeStyle({ width: 2, color, alpha });
-    g.moveTo(x1, y1);
-    g.bezierCurveTo(cpx, y1, cpx, y2, x2, y2);
-    g.stroke();
-  } else {
-    // Dashed line for one-hop off-path edges. PixiJS v8 doesn't have
-    // native dash support, so we approximate with short segments.
-    const dashLen = 6;
-    const gapLen = 4;
-    const dx = x2 - x1;
-    const dy = y2 - y1;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < 1) {
-      edgesContainer.addChild(g);
-      return;
-    }
-    const ux = dx / dist;
-    const uy = dy / dist;
-
-    g.setStrokeStyle({ width: 1, color, alpha });
-    let d = 0;
-    while (d < dist) {
-      const segEnd = Math.min(d + dashLen, dist);
-      g.moveTo(x1 + ux * d, y1 + uy * d);
-      g.lineTo(x1 + ux * segEnd, y1 + uy * segEnd);
-      d = segEnd + gapLen;
-    }
-    g.stroke();
-  }
-
-  edgesContainer.addChild(g);
-}
-
-function clearEdges() {
-  edgesContainer.removeChildren();
-}
-
-// ---------------------------------------------------------------------------
-// Hover handlers
-// ---------------------------------------------------------------------------
-
-function onBarPointerOver(event) {
-  const idx = event.currentTarget.targetIndex;
-  hoveredIdx = idx;
-
-  // Compute the critical path through this target.
-  const cp = new Set(criticalPathThrough(idx, targets));
-
-  // Highlight critical-path bars, dim everything else.
-  for (let i = 0; i < barGraphics.length; i++) {
-    if (cp.has(i)) {
-      barGraphics[i].alpha = HIGHLIGHT_ALPHA;
-    } else {
-      barGraphics[i].alpha = DIM_ALPHA;
-    }
-  }
-
-  // Draw dependency edges.
-  drawEdges(idx);
-
-  // Show tooltip. Convert PixiJS canvas-local coordinates to window
-  // coordinates using the viewport's actual screen position (accounts
-  // for the sidebar offset).
-  const global = event.global;
-  const vpRect = viewport.getBoundingClientRect();
-  showTooltip(idx, global.x + vpRect.left, global.y + vpRect.top);
-}
-
-function onBarPointerMove(event) {
-  if (hoveredIdx == null) return;
-  const global = event.global;
-  const vpRect = viewport.getBoundingClientRect();
-  positionTooltip(global.x + vpRect.left, global.y + vpRect.top);
-}
-
-function onBarPointerOut() {
-  hoveredIdx = null;
-
-  // Restore default alpha values.
-  for (let i = 0; i < barGraphics.length; i++) {
-    barGraphics[i].alpha = targets[i].on_critical_path
-      ? HIGHLIGHT_ALPHA
-      : DEFAULT_ALPHA;
-  }
-
-  // Apply any active search filter on top of defaults.
-  applySearchHighlight();
-
-  clearEdges();
-  hideTooltip();
-}
-
-// Dispatch a custom event when a bar is clicked so the sidebar (in
-// app.html) can fetch and render target details.
-function onBarClick(event) {
-  const idx = event.currentTarget.targetIndex;
-  const t = targets[idx];
-  window.dispatchEvent(
-    new CustomEvent("target-click", { detail: { name: t.name, index: idx } })
-  );
-}
-
-// ---------------------------------------------------------------------------
-// Pan and zoom
-// ---------------------------------------------------------------------------
-
-// Track drag state for panning.
-let isDragging = false;
-let dragStartX = 0;
-let dragStartY = 0;
-let containerStartX = 0;
-let containerStartY = 0;
-
-// Use the viewport div for pointer events (PixiJS canvas is inside it).
-viewport.addEventListener("pointerdown", (e) => {
-  // Only pan on the canvas background (not on bars, which handle their own
-  // events). We detect this by checking if the target is the canvas element
-  // or the viewport itself.
-  isDragging = true;
-  dragStartX = e.clientX;
-  dragStartY = e.clientY;
-  containerStartX = chartContainer.x;
-  containerStartY = chartContainer.y;
-});
-
-window.addEventListener("pointermove", (e) => {
-  if (!isDragging) return;
-  const dx = e.clientX - dragStartX;
-  const dy = e.clientY - dragStartY;
-  chartContainer.x = containerStartX + dx;
-  chartContainer.y = containerStartY + dy;
-  updateLabels();
-  updateAxis();
-  if (hoveredIdx != null) drawEdges(hoveredIdx);
-});
-
-window.addEventListener("pointerup", () => {
-  isDragging = false;
-});
-
-// Wheel zoom: horizontal zoom on plain wheel, vertical zoom on Shift+wheel.
-//
-// The math: we want the world-space point under the cursor to stay fixed
-// after the scale change. We compute the world point from the cursor's
-// screen position, update the scale, then recompute the container's
-// position so the world point maps back to the same screen position.
-viewport.addEventListener("wheel", (e) => {
-  e.preventDefault();
-
-  const direction = e.deltaY < 0 ? 1 : -1;
-  const factor = direction > 0 ? ZOOM_FACTOR : 1 / ZOOM_FACTOR;
-
-  // Cursor position relative to the viewport.
-  const rect = viewport.getBoundingClientRect();
-
-  if (e.shiftKey) {
-    // Shift+wheel: vertical zoom centered on cursor Y.
-    const cursorY = e.clientY - rect.top;
-    const worldY = (cursorY - chartContainer.y) / chartContainer.scale.y;
-    chartContainer.scale.y = Math.max(1, chartContainer.scale.y * factor);
-    chartContainer.y = cursorY - worldY * chartContainer.scale.y;
-  } else {
-    // Plain wheel: horizontal zoom centered on cursor X.
-    const cursorX = e.clientX - rect.left;
-    const worldX = (cursorX - chartContainer.x) / chartContainer.scale.x;
-    chartContainer.scale.x = Math.max(1, chartContainer.scale.x * factor);
-    chartContainer.x = cursorX - worldX * chartContainer.scale.x;
-  }
-
-  updateLabels();
-  updateAxis();
-  if (hoveredIdx != null) drawEdges(hoveredIdx);
-}, { passive: false });
-
-// ---------------------------------------------------------------------------
-// Search
-// ---------------------------------------------------------------------------
-
-const searchInput = document.getElementById("search-input");
-searchInput.addEventListener("input", () => {
-  const query = searchInput.value.trim();
-  if (query === "") {
-    searchMatches = null;
-  } else {
-    searchMatches = new Set(searchFilter(query, targets));
-  }
-  applySearchHighlight();
-});
-
-// Apply search highlighting: matching bars stay at normal alpha, non-matching
-// bars are dimmed. If no search is active, restore defaults.
-function applySearchHighlight() {
-  // Don't override hover highlighting.
-  if (hoveredIdx != null) return;
-
-  if (searchMatches == null) {
-    // No active search — restore defaults.
-    for (let i = 0; i < barGraphics.length; i++) {
-      barGraphics[i].alpha = targets[i].on_critical_path
-        ? HIGHLIGHT_ALPHA
-        : DEFAULT_ALPHA;
-    }
-  } else {
-    for (let i = 0; i < barGraphics.length; i++) {
-      if (searchMatches.has(i)) {
-        barGraphics[i].alpha = HIGHLIGHT_ALPHA;
-      } else {
-        barGraphics[i].alpha = DIM_ALPHA;
-      }
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Resize handling
-// ---------------------------------------------------------------------------
-
-// Recompute lane height and bar positions when the window resizes.
-window.addEventListener("resize", () => {
-  laneHeight = Math.max(
-    MIN_LANE_HEIGHT,
-    Math.min(MAX_LANE_HEIGHT, (app.screen.height - AXIS_HEIGHT) / summary.lane_count)
-  );
-  rebuildBars();
-  updateLabels();
-  updateAxis();
-});
-
-// Rebuild all bar positions and sizes after layout parameters change.
-// This is cheaper than recreating Graphics objects — we just clear and
-// redraw the rect in each existing Graphics.
-function rebuildBars() {
-  for (let i = 0; i < targets.length; i++) {
-    const t = targets[i];
+function rebuildBars(): void {
+  for (const [index, t] of targets.entries()) {
     const x = CHART_PADDING_LEFT + timeToX(t.start, scale);
     const y = laneToY(t.lane, laneHeight);
     const w = timeToX(t.cost, scale);
     const h = laneHeight * BAR_HEIGHT_RATIO;
-
-    const bar = barGraphics[i];
+    const { [index]: bar } = barGraphics;
     bar.clear();
-    bar.rect(0, 0, w, h).fill({ color: barColors[i] });
+    bar.rect(ORIGIN, ORIGIN, w, h).fill({ color: barColors[index] });
     bar.x = x;
     bar.y = y;
-
-    const label = barLabels[i];
-    label.x = x + 3;
-    label.y = y + (h - 10) / 2;
-
-    const mask = barClipMasks[i];
+    const { [index]: label } = barLabels;
+    label.x = x + LABEL_PAD_PX;
+    label.y = y + (h - FONT_SIZE) / HALF_DIVISOR;
+    const { [index]: mask } = barClipMasks;
     mask.clear();
-    mask.rect(0, 0, w, h).fill({ color: 0xffffff });
+    mask.rect(ORIGIN, ORIGIN, w, h).fill({ color: COLOR_WHITE });
     mask.x = x;
     mask.y = y;
   }
 }
 
 // ---------------------------------------------------------------------------
-// Initial render
+// Interactions: hover, click, search
 // ---------------------------------------------------------------------------
+
+function isPointerInViewport(event: FederatedPointerEvent): boolean {
+  if (viewport === null) return true;
+  const rectangle = viewport.getBoundingClientRect();
+  const { clientX, clientY } = event;
+  return pointInRect(clientX, clientY, rectangle);
+}
+
+function clearHoverState(): void {
+  hoveredIndex = undefined;
+  for (const [index, barGraphic] of barGraphics.entries()) {
+    barGraphic.alpha = targets[index].on_critical_path ? HIGHLIGHT_ALPHA : DEFAULT_ALPHA;
+  }
+  applySearchHighlight();
+  clearEdges(edgesContainer);
+  hideTooltip();
+}
+
+function applySearchHighlight(): void {
+  if (hoveredIndex !== undefined) return;
+  if (searchMatches === undefined) {
+    for (const [index, barGraphic] of barGraphics.entries()) {
+      barGraphic.alpha = targets[index].on_critical_path ? HIGHLIGHT_ALPHA : DEFAULT_ALPHA;
+    }
+  } else {
+    for (const [index, barGraphic] of barGraphics.entries()) {
+      barGraphic.alpha = searchMatches.has(index) ? HIGHLIGHT_ALPHA : DIM_ALPHA;
+    }
+  }
+}
+
+function onBarPointerOver(event: FederatedPointerEvent): void {
+  if (!isPointerInViewport(event)) { clearHoverState(); return; }
+  if (!isBarGraphics(event.currentTarget)) return;
+  const { targetIndex: index } = event.currentTarget;
+  hoveredIndex = index;
+  const cp = new Set(criticalPathThrough(index, targets));
+  for (const [barIndex, barGraphic] of barGraphics.entries()) {
+    barGraphic.alpha = cp.has(barIndex) ? HIGHLIGHT_ALPHA : DIM_ALPHA;
+  }
+  drawEdges(edgeContext(), index);
+  const { global } = event;
+  if (viewport !== null) {
+    const vpRect = viewport.getBoundingClientRect();
+    showTooltip(targets, index, global.x + vpRect.left, global.y + vpRect.top);
+  }
+}
+
+function onBarPointerMove(event: FederatedPointerEvent): void {
+  if (hoveredIndex === undefined) return;
+  if (!isPointerInViewport(event)) { clearHoverState(); return; }
+  const { global } = event;
+  if (viewport !== null) {
+    const vpRect = viewport.getBoundingClientRect();
+    positionTooltip(global.x + vpRect.left, global.y + vpRect.top);
+  }
+}
+
+function onBarPointerOut(): void { clearHoverState(); }
+
+function onBarClick(event: FederatedPointerEvent): void {
+  if (!isBarGraphics(event.currentTarget)) return;
+  const { targetIndex: index } = event.currentTarget;
+  const { name } = targets[index];
+  globalThis.dispatchEvent(new CustomEvent("target-click", { detail: { name, index } }));
+}
+
+if (viewport !== null) {
+  viewport.addEventListener("pointerleave", () => {
+    if (hoveredIndex !== undefined) clearHoverState();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Pan and zoom
+// ---------------------------------------------------------------------------
+
+let isDragging = false;
+let dragStartX = ORIGIN;
+let dragStartY = ORIGIN;
+let containerStartX = ORIGIN;
+let containerStartY = ORIGIN;
+
+if (viewport !== null) {
+  viewport.addEventListener("pointerdown", (event: PointerEvent) => {
+    isDragging = true;
+    ({ clientX: dragStartX, clientY: dragStartY } = event);
+    ({ x: containerStartX, y: containerStartY } = chartContainer);
+  });
+}
+globalThis.addEventListener("pointermove", (event: PointerEvent) => {
+  if (!isDragging) return;
+  const { clientX, clientY } = event;
+  chartContainer.x = containerStartX + clientX - dragStartX;
+  chartContainer.y = containerStartY + clientY - dragStartY;
+  updateLabels();
+  updateAxis();
+  if (hoveredIndex !== undefined) drawEdges(edgeContext(), hoveredIndex);
+});
+globalThis.addEventListener("pointerup", () => { isDragging = false; });
+
+if (viewport !== null) {
+  viewport.addEventListener("wheel", (event: WheelEvent) => {
+    event.preventDefault();
+    const direction = event.deltaY < ORIGIN ? UNIT : NEGATIVE_UNIT;
+    const factor = direction > ZOOM_DIRECTION_POSITIVE ? ZOOM_FACTOR : UNIT / ZOOM_FACTOR;
+    const rectangle = viewport.getBoundingClientRect();
+    if (event.shiftKey) {
+      const cursorY = event.clientY - rectangle.top;
+      const worldY = (cursorY - chartContainer.y) / chartContainer.scale.y;
+      chartContainer.scale.y = Math.max(MIN_SCALE, chartContainer.scale.y * factor);
+      chartContainer.y = cursorY - worldY * chartContainer.scale.y;
+    } else {
+      const cursorX = event.clientX - rectangle.left;
+      const worldX = (cursorX - chartContainer.x) / chartContainer.scale.x;
+      chartContainer.scale.x = Math.max(MIN_SCALE, chartContainer.scale.x * factor);
+      chartContainer.x = cursorX - worldX * chartContainer.scale.x;
+    }
+    updateLabels();
+    updateAxis();
+    if (hoveredIndex !== undefined) drawEdges(edgeContext(), hoveredIndex);
+  }, { passive: false });
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+const searchInput = document.querySelector<HTMLInputElement>("#search-input");
+if (searchInput !== null) {
+  searchInput.addEventListener("input", () => {
+    const query = searchInput.value.trim();
+    searchMatches = query === "" ? undefined : new Set(searchFilter(query, targets));
+    applySearchHighlight();
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Resize and init
+// ---------------------------------------------------------------------------
+
+globalThis.addEventListener("resize", () => {
+  laneHeight = Math.max(MIN_LANE_HEIGHT, Math.min(MAX_LANE_HEIGHT, (app.screen.height - AXIS_HEIGHT) / summary.lane_count));
+  rebuildBars();
+  updateLabels();
+  updateAxis();
+});
 
 buildChart();
 
-// ---------------------------------------------------------------------------
-// updateSchedule: re-render the Gantt chart with new schedule data
-// ---------------------------------------------------------------------------
-
-// Exposed on the window so app.html can call it after shatter. Accepts
-// a new ScheduleData object, replaces window.DATA, rebuilds all PixiJS
-// content, and updates sidebar stats.
-window.updateSchedule = function(newData) {
-  window.DATA = newData;
+globalThis.updateSchedule = function updateSchedule(newData: ScheduleData): void {
+  globalThis.DATA = newData;
   buildChart();
   populateSidebarStats();
 };

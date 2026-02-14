@@ -13,6 +13,8 @@
 //! The `CostModel` predicts compilation wall time from three predictors
 //! (attributed, metadata, other). When no `CostModel` is available, falls
 //! back to per-symbol cost sums.
+//!
+//! Why: provides a lightweight, local UI for exploring split strategies.
 
 pub mod data;
 mod error;
@@ -21,6 +23,7 @@ pub mod server;
 use std::io::Read;
 use std::sync::{Arc, RwLock};
 
+#[doc(inline)]
 pub use error::VizError;
 use tarjanize_schemas::SymbolGraph;
 
@@ -32,6 +35,8 @@ use tarjanize_schemas::SymbolGraph;
 /// served page automatically.
 ///
 /// The server runs until terminated (Ctrl+C).
+///
+/// Why: the viz server is intended as a long-lived interactive session.
 pub async fn run_server(mut input: impl Read) -> Result<(), VizError> {
     let mut json = String::new();
     input.read_to_string(&mut json)?;
@@ -66,7 +71,7 @@ pub async fn run_server(mut input: impl Read) -> Result<(), VizError> {
     let addr = listener.local_addr().map_err(VizError::io)?;
     let url = format!("http://{addr}");
 
-    eprintln!("Listening on {url}");
+    tracing::debug!(url = %url, "server listening");
     let _ = open::that(&url);
 
     axum::serve(listener, app).await.map_err(VizError::io)?;

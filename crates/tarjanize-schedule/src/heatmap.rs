@@ -5,28 +5,37 @@
 //! Zero-slack SCCs are on the internal critical path -- splitting them
 //! would reduce the target's compilation time. High-slack SCCs have room
 //! to spare and are not bottlenecks.
+//!
+//! Why: heatmaps help prioritize split points by showing internal critical
+//! paths within a target.
 
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tarjanize_schemas::serde_duration;
+use serde_with::{DurationMilliSecondsWithFrac, serde_as};
 
 use crate::target_graph::IntraTargetGraph;
 
 /// Heat map data for a single SCC node.
+///
+/// Why: the UI needs per-node timing and slack to visualize hotspots.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SccHeat {
     /// SCC node index (matches `SccNode.id`).
     pub id: usize,
     /// Earliest start time within the intra-target schedule.
-    #[serde(rename = "start_ms", with = "serde_duration")]
+    #[serde(rename = "start_ms")]
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
     pub start: Duration,
     /// Earliest finish time (start + cost).
-    #[serde(rename = "finish_ms", with = "serde_duration")]
+    #[serde(rename = "finish_ms")]
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
     pub finish: Duration,
     /// Slack: how much this SCC could be delayed without extending the
     /// target's internal critical path. Zero means on critical path.
-    #[serde(rename = "slack_ms", with = "serde_duration")]
+    #[serde(rename = "slack_ms")]
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
     pub slack: Duration,
     /// Whether this SCC is on the internal critical path.
     pub on_critical_path: bool,
@@ -39,19 +48,23 @@ pub struct SccHeat {
     /// the global schedule)."
     #[serde(
         rename = "improvement_ms",
-        with = "serde_duration::option",
         skip_serializing_if = "Option::is_none"
     )]
+    #[serde_as(as = "Option<DurationMilliSecondsWithFrac>")]
     pub improvement: Option<Duration>,
 }
 
 /// Heat map data for an entire target.
+///
+/// Why: a single payload simplifies rendering and filtering in the UI.
+#[serde_as]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HeatmapData {
     /// Per-SCC heat data, indexed by SCC id.
     pub sccs: Vec<SccHeat>,
     /// The internal critical path length.
-    #[serde(rename = "critical_path_ms", with = "serde_duration")]
+    #[serde(rename = "critical_path_ms")]
+    #[serde_as(as = "DurationMilliSecondsWithFrac")]
     pub critical_path: Duration,
 }
 
@@ -60,6 +73,8 @@ pub struct HeatmapData {
 /// Runs forward/backward DP identical to the target-level schedule
 /// to assign earliest start/finish times and slack to each SCC node.
 /// Uses exact `Duration` arithmetic — no epsilon-based comparisons.
+///
+/// Why: heatmap data must mirror scheduling semantics to be meaningful.
 pub fn compute_heatmap(graph: &IntraTargetGraph) -> HeatmapData {
     let n = graph.nodes.len();
     if n == 0 {
@@ -170,6 +185,8 @@ mod tests {
     /// Helper to build an `IntraTargetGraph` from (id, `cost_ms`) pairs
     /// and edges. Uses `Duration::from_millis` for exact millisecond
     /// values (avoids f64-to-Duration conversion precision issues).
+    ///
+    /// Why: keeps fixtures concise while preserving deterministic timing.
     fn make_graph(
         nodes: &[(usize, u64)],
         edges: &[(usize, usize)],
@@ -190,10 +207,15 @@ mod tests {
     }
 
     /// Shorthand for `Duration::from_millis` in assertions.
+    ///
+    /// Why: keeps expected values readable in tests.
     fn ms(v: u64) -> Duration {
         Duration::from_millis(v)
     }
 
+    /// Single nodes should be on the critical path with zero slack.
+    ///
+    /// Why: validates base-case heatmap behavior.
     #[test]
     fn heatmap_single_node() {
         let g = make_graph(&[(0, 10)], &[]);
@@ -214,6 +236,9 @@ mod tests {
         );
     }
 
+    /// Chains should mark all SCCs on the internal critical path.
+    ///
+    /// Why: confirms slack propagation in a linear DAG.
     #[test]
     fn heatmap_chain_all_on_critical_path() {
         // Chain: A(10) -> B(20) -> C(5)
@@ -236,6 +261,9 @@ mod tests {
         assert_eq!(h.critical_path, ms(35), "critical path should be 35ms");
     }
 
+    /// Forks should assign slack to the shorter branch.
+    ///
+    /// Why: validates slack calculation on branching graphs.
     #[test]
     #[expect(
         clippy::many_single_char_names,
@@ -260,6 +288,9 @@ mod tests {
         assert_eq!(c.slack, ms(15), "C slack should be 15ms");
     }
 
+    /// Diamonds should compute slack at join points.
+    ///
+    /// Why: ensures slack logic works with converging dependencies.
     #[test]
     fn heatmap_diamond() {
         // Diamond: A(5) -> B(10), A(5) -> C(3), B -> D(2), C -> D(2)
@@ -277,6 +308,9 @@ mod tests {
         assert_eq!(c.slack, ms(7), "C slack should be 7ms");
     }
 
+    /// Independent nodes should have slack on the shorter node.
+    ///
+    /// Why: slack is based on the max finish time in the DAG.
     #[test]
     fn heatmap_independent_nodes() {
         // Two independent nodes: A(10), B(5)
@@ -293,6 +327,9 @@ mod tests {
         assert_eq!(b.slack, ms(5), "B slack should be 5ms");
     }
 
+    /// Start and finish times should match dependency ordering.
+    ///
+    /// Why: start times are used to position SCCs in visualizations.
     #[test]
     fn heatmap_start_times_are_correct() {
         // Chain: A(10) -> B(20)

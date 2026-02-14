@@ -21,6 +21,8 @@ serde.workspace = true
 open.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tracing.workspace = true
+serde_with.workspace = true
 
 [dev-dependencies]
 http.workspace = true

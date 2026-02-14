@@ -95,12 +95,22 @@ pub struct MagsacParams {
 impl Default for MagsacParams {
     fn default() -> Self {
         Self {
+            // 99% probability that at least one sample is all-inlier.
             confidence: 0.99,
+            // Generous upper bound; early termination usually stops sooner.
             max_iterations: 2_000,
+            // Avoid terminating before the adaptive iteration count stabilizes.
             min_iterations: 50,
+            // IRLS refinement passes. One pass suffices for most datasets;
+            // two catches edge cases where the first refinement shifts weights
+            // enough to change the inlier set.
             irls_iters: 2,
             sigma_max: SigmaMax::FromOls {
+                // 90th percentile of OLS residuals: captures the "inlier
+                // envelope" while excluding gross outliers above p90.
                 percentile: 0.90,
+                // Floor prevents sigma from collapsing to zero on perfectly
+                // linear data, which would make every residual an outlier.
                 min_sigma: 1e-6,
             },
             seed: 0x6d_61_67_73_61_63_2b_2b, // "magsac++"
@@ -356,6 +366,9 @@ fn sigma_consensus_plus_plus(
         count_inliers(data, &initial_model, n_vars, reference_threshold);
 
     let max_threshold = K_99 * sigma_max;
+    // E1(k²/2) is the outlier loss constant from the MAGSAC++ paper
+    // (Baráth et al., 2020, Eq. 4). The k²/2 argument arises from
+    // substituting the chi-squared quantile into the loss kernel.
     let e1_k = expint_e1(K_99 * K_99 / 2.0);
 
     let mut current_model = initial_model;
@@ -414,6 +427,7 @@ fn magsac_score(
     sigma_max: f64,
 ) -> f64 {
     let max_threshold = K_99 * sigma_max;
+    // E1(k²/2): outlier loss constant (see IRLS refinement for derivation).
     let e1_k = expint_e1(K_99 * K_99 / 2.0);
     let outlier_loss =
         sigma_max * INV_SQRT_2PI * (1.0 - (-K_99 * K_99 / 2.0).exp());
@@ -425,7 +439,10 @@ fn magsac_score(
         let loss = if residual >= max_threshold {
             outlier_loss
         } else {
+            // x = r²/(2σ²) from the MAGSAC++ sigma-consensus loss
+            // (Baráth et al., 2020, Eq. 4).
             let x = (residual * residual) / (2.0 * sigma_max * sigma_max);
+            // Floor at 1e-12 to avoid log(0) in the E1 series expansion.
             let e1_x = expint_e1(x.max(1e-12));
             let term_a = sigma_max * sigma_max * (1.0 - (-x).exp());
             let diff = (e1_x - e1_k).max(0.0);
@@ -600,7 +617,9 @@ fn solve_gaussian(augmented: &mut [Vec<f64>], n: usize) -> Option<LinearModel> {
         }
 
         // If pivot is near-zero, this predictor has no signal. Set its
-        // coefficient to zero and skip this column.
+        // coefficient to zero and skip this column. The 1e-15 threshold
+        // is ~10x f64 machine epsilon — small enough to catch true zeros
+        // but large enough to absorb accumulated rounding.
         if max_val < 1e-15 {
             // Zero out the column to prevent numerical noise.
             for aug_row in augmented.iter_mut().take(n).skip(col) {
@@ -632,7 +651,8 @@ fn solve_gaussian(augmented: &mut [Vec<f64>], n: usize) -> Option<LinearModel> {
     let mut coeffs = vec![0.0; n];
     for col in (0..n).rev() {
         if augmented[col][col].abs() < 1e-15 {
-            // Degenerate column — coefficient stays zero.
+            // Degenerate column — coefficient stays zero (same threshold
+            // as forward elimination above).
             coeffs[col] = 0.0;
             continue;
         }
@@ -669,7 +689,9 @@ fn estimate_sigma_max_from_ols(
             (y - model.predict(&row[..n_vars])).abs()
         })
         .collect();
-    residuals.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    residuals.sort_by(|a, b| {
+        a.partial_cmp(b).expect("residuals must not contain NaN")
+    });
     let p = percentile.clamp(0.0, 1.0);
     #[expect(
         clippy::cast_possible_truncation,
@@ -729,6 +751,7 @@ fn required_iterations(
 /// via the normal equations.
 fn is_degenerate_predictor(data: &[Vec<f64>], n_vars: usize) -> bool {
     for col in 0..n_vars {
+        // Same near-zero threshold as Gaussian elimination pivot check.
         if data.iter().all(|row| row[col].abs() < 1e-15) {
             return true;
         }
@@ -806,6 +829,8 @@ fn expint_e1(x: f64) -> f64 {
     }
 
     if x <= 1.0 {
+        // Power series: E1(x) = -ln(x) - γ - Σ_{k=1}^∞ (-x)^k / (k·k!)
+        // 60 terms provide full f64 precision for x ≤ 1.
         let mut sum = 0.0;
         let mut term = 1.0;
         for k in 1..=60 {
@@ -813,12 +838,15 @@ fn expint_e1(x: f64) -> f64 {
             term *= -x / kf;
             let add = term / kf;
             sum += add;
+            // 1e-16 ≈ f64 machine epsilon; further terms won't change the sum.
             if add.abs() < 1e-16 {
                 break;
             }
         }
         -x.ln() - EULER_GAMMA - sum
     } else {
+        // Continued fraction (asymptotic expansion): E1(x) ≈ e^{-x}/x · Σ
+        // 60 terms suffice; early exit on divergence for large x.
         let mut sum = 1.0;
         let mut term = 1.0;
         let mut prev_abs = f64::INFINITY;
@@ -831,6 +859,7 @@ fn expint_e1(x: f64) -> f64 {
             }
             sum += term;
             prev_abs = abs_term;
+            // Same convergence tolerance as the power series branch.
             if abs_term < 1e-16 {
                 break;
             }
@@ -855,6 +884,7 @@ impl XorShift64 {
     }
 
     fn next_u64(&mut self) -> u64 {
+        // Marsaglia's xorshift64 with shifts (13, 7, 17) — period 2^64-1.
         let mut x = self.state;
         x ^= x << 13;
         x ^= x >> 7;

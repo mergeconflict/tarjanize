@@ -1,3 +1,9 @@
+//! CLI for tarjanize post-processing commands.
+//!
+//! Provides `condense`, `cost`, and `viz` subcommands that operate on
+//! the `SymbolGraph` JSON produced by `cargo tarjanize`. Each subcommand
+//! accepts optional `-i`/`-o` flags for file I/O or defaults to stdio.
+
 use std::fs::File;
 use std::io::{BufReader, BufWriter, Read, Write};
 
@@ -188,8 +194,8 @@ fn main() -> Result<()> {
                     serde_json::to_writer_pretty(writer, &model)
                         .map_err(std::io::Error::other)?;
                 } else {
-                    eprintln!(
-                        "WARNING: No cost model could be fitted \
+                    tracing::warn!(
+                        "No cost model could be fitted \
                          (insufficient profiling data)"
                     );
                 }

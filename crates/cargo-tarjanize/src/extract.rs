@@ -22,6 +22,7 @@ use rustc_hir::Attribute;
 use rustc_hir::attrs::AttributeKind;
 use rustc_hir::def::DefKind;
 use rustc_hir::def_id::{DefId, LOCAL_CRATE, LocalDefId};
+use rustc_hir::definitions::DefPathData;
 use rustc_middle::thir::{self, ExprKind, PatKind};
 use rustc_middle::ty::{self, Ty, TyCtxt, Visibility as TyVisibility};
 use tarjanize_schemas::{Module, Symbol, SymbolKind, Visibility};
@@ -31,6 +32,9 @@ use tarjanize_schemas::{Module, Symbol, SymbolKind, Visibility};
 /// Symbol keys use rustc's `DefPath` format (e.g., `crate::module::{{impl}}[1]`),
 /// which matches the format used by `-Zself-profile`. This allows direct lookup
 /// of profile timing data without any mapping.
+///
+/// Why: the driver must return a stable, profile-compatible symbol hierarchy.
+#[derive(Debug)]
 pub struct ExtractionResult {
     /// The extracted module hierarchy.
     pub module: Module,
@@ -49,6 +53,8 @@ pub struct ExtractionResult {
 /// This separation ensures no symbol duplication between lib and test targets.
 ///
 /// Returns the module tree and a map from profile keys to symbol paths.
+///
+/// Why: this is the core entry point for symbol graph extraction.
 pub fn extract_crate(
     tcx: TyCtxt<'_>,
     crate_name: &str,
@@ -62,6 +68,8 @@ pub fn extract_crate(
 }
 
 /// State for symbol extraction.
+///
+/// Why: bundles rustc context, filters, and caches for the extraction walk.
 struct Extractor<'tcx> {
     tcx: TyCtxt<'tcx>,
     crate_name: String,
@@ -83,6 +91,9 @@ struct Extractor<'tcx> {
 }
 
 impl<'tcx> Extractor<'tcx> {
+    /// Create a new extractor bound to a crate and workspace.
+    ///
+    /// Why: centralizes normalization and cache setup for extraction.
     fn new(
         tcx: TyCtxt<'tcx>,
         crate_name: &str,
@@ -107,6 +118,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract all top-level items in the crate.
+    ///
+    /// Why: the symbol graph starts from crate-level items and expands inward.
     fn extract_all_items(&mut self) {
         // Iterate all items in the crate.
         let items = self.tcx.hir_crate_items(());
@@ -128,7 +141,7 @@ impl<'tcx> Extractor<'tcx> {
                 extracted += 1;
             }
         }
-        tracing::info!(
+        tracing::debug!(
             crate_name = %self.crate_name,
             test_only = self.test_only,
             total_items,
@@ -139,6 +152,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a single item and its nested items.
+    ///
+    /// Why: ensures each `DefKind` is normalized into a Symbol with deps.
     fn extract_item(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let def_kind = self.tcx.def_kind(def_id);
@@ -236,6 +251,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a function or method.
+    ///
+    /// Why: functions are primary dependency carriers via signatures/bodies.
     fn extract_function(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         // Use raw DefPath as key - matches profile data format directly.
@@ -297,6 +314,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract an ADT (struct, enum, or union).
+    ///
+    /// Why: ADTs define type-level dependencies and drive impl anchors.
     fn extract_adt(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -328,6 +347,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a trait definition.
+    ///
+    /// Why: trait bounds and supertraits create dependency edges.
     fn extract_trait(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -351,6 +372,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a type alias.
+    ///
+    /// Why: aliases can hide dependencies that must be preserved.
     fn extract_type_alias(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -376,6 +399,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a const or static item.
+    ///
+    /// Why: const/static bodies and types depend on other symbols.
     fn extract_const_or_static(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -414,6 +439,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract a macro definition.
+    ///
+    /// Why: macros are compilation units even without type-level deps.
     fn extract_macro(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -443,6 +470,8 @@ impl<'tcx> Extractor<'tcx> {
     /// For `pub use other_crate::Foo`, the dependency points to `Foo` in the
     /// other crate. For glob re-exports (`pub use other_crate::*`), we record
     /// a dependency on the module being re-exported.
+    ///
+    /// Why: re-exports are real compilation work and shape dependency edges.
     fn extract_use(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -487,6 +516,8 @@ impl<'tcx> Extractor<'tcx> {
     /// Extern crate declarations load crate metadata and establish namespace
     /// bindings. While mostly obsolete in edition 2018+, they still appear
     /// (especially for `std`) and have real compilation cost.
+    ///
+    /// Why: extern crate edges still influence compilation scheduling.
     fn extract_extern_crate(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
         let key = self.raw_def_path(def_id);
@@ -529,6 +560,8 @@ impl<'tcx> Extractor<'tcx> {
     /// Uses `DefPath` format as the symbol key (e.g., `crate::module::{{impl}}[1]`)
     /// to match `-Zself-profile` output. The human-readable name (e.g.,
     /// `impl Trait for Type`) is stored in `SymbolKind::Impl.name`.
+    ///
+    /// Why: impl anchors are required to respect the orphan rule downstream.
     fn extract_impl(&mut self, local_def_id: LocalDefId) {
         let def_id = local_def_id.to_def_id();
 
@@ -543,7 +576,12 @@ impl<'tcx> Extractor<'tcx> {
         self.collect_impl_deps(def_id, &mut deps);
 
         // Extract anchors for orphan rule.
-        let anchors = self.extract_impl_anchors(def_id);
+        let anchors = crate::anchors::extract_impl_anchors(
+            self.tcx,
+            def_id,
+            &|did| self.is_workspace_crate(did),
+            &|did| self.raw_def_path(did),
+        );
 
         let symbol = Symbol {
             file: self.source_file(local_def_id),
@@ -564,6 +602,8 @@ impl<'tcx> Extractor<'tcx> {
     // -------------------------------------------------------------------------
 
     /// Collect dependencies from a function's signature (params, return type, bounds).
+    ///
+    /// Why: signature types encode cross-symbol dependencies even without bodies.
     fn collect_signature_deps(
         &self,
         def_id: DefId,
@@ -590,6 +630,8 @@ impl<'tcx> Extractor<'tcx> {
     /// to capture type alias references that get resolved away in semantic queries.
     /// For example, `fn foo(_: MyAlias)` where `type MyAlias = i32` - the semantic
     /// signature shows `i32`, but we want to capture the dep on `MyAlias`.
+    ///
+    /// Why: HIR retains alias identity that typeck erases.
     fn collect_hir_signature_deps(
         &self,
         local_def_id: LocalDefId,
@@ -623,6 +665,8 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// This recursively walks the HIR type tree to find path types that resolve
     /// to type aliases or other definitions we care about.
+    ///
+    /// Why: alias references must be preserved for accurate dependency edges.
     fn collect_hir_ty_deps(
         &self,
         ty: &rustc_hir::Ty<'_>,
@@ -678,6 +722,8 @@ impl<'tcx> Extractor<'tcx> {
     /// compilation costs are aggregated to the parent via profile normalization.
     /// This function collects their dependencies so they become part of the parent's
     /// dependency set.
+    ///
+    /// Why: nested items are collapsed into their parent symbol for scheduling.
     fn collect_nested_item_deps(
         &self,
         local_def_id: LocalDefId,
@@ -741,6 +787,8 @@ impl<'tcx> Extractor<'tcx> {
     /// This supplements THIR body analysis by walking HIR to capture const references
     /// in range pattern bounds. THIR evaluates these bounds at lowering time, losing
     /// the original const `DefId`s. HIR preserves them as `PatExpr` nodes.
+    ///
+    /// Why: range bounds can hide const dependencies that THIR drops.
     fn collect_hir_body_deps(
         &self,
         local_def_id: LocalDefId,
@@ -751,6 +799,7 @@ impl<'tcx> Extractor<'tcx> {
         use rustc_hir::{Pat, PatExprKind, PatKind};
 
         // Visitor to find range patterns and extract const refs from bounds.
+        // Why: range bounds encode const deps outside THIR.
         struct RangePatternVisitor<'a, 'tcx> {
             extractor: &'a Extractor<'tcx>,
             deps: &'a mut HashSet<String>,
@@ -775,6 +824,8 @@ impl<'tcx> Extractor<'tcx> {
 
         impl<'tcx> RangePatternVisitor<'_, 'tcx> {
             /// Extract a const reference from a range bound pattern expression.
+            ///
+            /// Why: const ranges must be attributed to their defining symbols.
             fn extract_const_from_pat_expr(
                 &mut self,
                 pat_expr: &rustc_hir::PatExpr<'tcx>,
@@ -806,6 +857,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from an ADT's fields and bounds.
+    ///
+    /// Why: ADT fields and generics encode type-level dependencies.
     fn collect_adt_deps(&self, def_id: DefId, deps: &mut HashSet<String>) {
         let adt_def = self.tcx.adt_def(def_id);
 
@@ -828,6 +881,8 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// Handles `struct Foo<T = DefaultType>(T)` where `DefaultType` is a dependency,
     /// and `struct Buffer<const N: usize = DEFAULT_SIZE>` where `DEFAULT_SIZE` is a dependency.
+    ///
+    /// Why: defaults can reference other symbols that must be tracked.
     fn collect_default_type_params(
         &self,
         def_id: DefId,
@@ -883,6 +938,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from a trait's supertraits and associated items.
+    ///
+    /// Why: trait bounds and assoc items introduce additional edges.
     fn collect_trait_deps(&self, def_id: DefId, deps: &mut HashSet<String>) {
         // Supertraits via predicates.
         for (pred, _span) in self.tcx.predicates_of(def_id).predicates {
@@ -925,6 +982,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from an impl block.
+    ///
+    /// Why: impls depend on self type, trait, and associated items.
     fn collect_impl_deps(&self, def_id: DefId, deps: &mut HashSet<String>) {
         // Self type.
         let self_ty = self.tcx.type_of(def_id).skip_binder();
@@ -968,6 +1027,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from generic bounds (where clauses).
+    ///
+    /// Why: bounds introduce trait and type dependencies.
     fn collect_generic_bounds_deps(
         &self,
         def_id: DefId,
@@ -979,6 +1040,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from a predicate (trait bound, etc.).
+    ///
+    /// Why: predicate clauses reference traits and types that must be tracked.
     fn collect_predicate_deps(
         &self,
         pred: ty::Clause<'tcx>,
@@ -1009,6 +1072,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Collect dependencies from a type.
+    ///
+    /// Why: type trees are the primary source of dependency edges.
     fn collect_type_deps(&self, ty: Ty<'tcx>, deps: &mut HashSet<String>) {
         // Walk all types in the type tree.
         for inner in ty.walk() {
@@ -1118,6 +1183,8 @@ impl<'tcx> Extractor<'tcx> {
     /// - `NamedConst { def_id }` for named const references
     /// - `Pat.extra.expanded_const` for const patterns
     /// - `ZstLiteral` with `FnDef` type for function references
+    ///
+    /// Why: THIR preserves symbol references that MIR erases.
     fn collect_thir_body_deps(
         &self,
         local_def_id: LocalDefId,
@@ -1185,10 +1252,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Walk a THIR expression and collect dependencies.
-    #[expect(
-        clippy::too_many_lines,
-        reason = "large match on ExprKind variants"
-    )]
+    ///
+    /// Why: expressions encode references to functions, consts, and statics.
     fn walk_thir_expr(
         &self,
         thir: &thir::Thir<'tcx>,
@@ -1196,34 +1261,73 @@ impl<'tcx> Extractor<'tcx> {
         deps: &mut HashSet<String>,
     ) {
         let expr = &thir.exprs[expr_id];
+        let _handled = self.walk_thir_expr_refs(thir, expr, deps)
+            || self.walk_thir_expr_compound(thir, expr, deps)
+            || self.walk_thir_expr_ops(thir, expr, deps)
+            || self.walk_thir_expr_asm(thir, expr, deps)
+            || self.walk_thir_expr_misc(thir, expr, deps);
+    }
 
+    /// Handle direct reference-like THIR expressions.
+    ///
+    /// Why: centralizes def-id extraction for leaf references.
+    /// Kept `thir` in the signature for symmetry with other walkers.
+    fn walk_thir_expr_refs(
+        &self,
+        _thir: &thir::Thir<'tcx>,
+        expr: &thir::Expr<'tcx>,
+        deps: &mut HashSet<String>,
+    ) -> bool {
         match &expr.kind {
-            // Static reference, named const reference, and thread-local static reference
-            // all just capture a DefId dependency.
             ExprKind::StaticRef { def_id, .. }
             | ExprKind::NamedConst { def_id, .. }
             | ExprKind::ThreadLocalRef(def_id) => {
                 self.maybe_add_dep(*def_id, deps);
+                true
             }
+            ExprKind::ZstLiteral { .. } => {
+                if let ty::TyKind::FnDef(def_id, args) = expr.ty.kind() {
+                    self.maybe_add_dep(*def_id, deps);
+                    for arg in *args {
+                        if let Some(ty) = arg.as_type() {
+                            self.collect_type_deps(ty, deps);
+                        }
+                    }
+                }
+                true
+            }
+            ExprKind::ConstBlock { did, .. } => {
+                if let Some(local_did) = did.as_local() {
+                    self.collect_thir_body_deps(local_did, deps);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
 
-            // Function/method calls.
+    /// Handle compound THIR expressions with nested bodies.
+    ///
+    /// Why: complex expressions require recursive traversal to capture deps.
+    fn walk_thir_expr_compound(
+        &self,
+        thir: &thir::Thir<'tcx>,
+        expr: &thir::Expr<'tcx>,
+        deps: &mut HashSet<String>,
+    ) -> bool {
+        match &expr.kind {
             ExprKind::Call { fun, args, .. } => {
-                // Walk the function expression to get the callee.
                 self.walk_thir_expr(thir, *fun, deps);
-                // Walk arguments.
                 for arg in args {
                     self.walk_thir_expr(thir, *arg, deps);
                 }
+                true
             }
-
-            // ADT construction (struct, enum variant).
             ExprKind::Adt(adt_expr) => {
                 self.maybe_add_dep(adt_expr.adt_def.did(), deps);
-                // Walk field values.
                 for field in &adt_expr.fields {
                     self.walk_thir_expr(thir, field.expr, deps);
                 }
-                // Walk base expression if present (struct update syntax).
                 match &adt_expr.base {
                     thir::AdtExprBase::Base(base) => {
                         self.walk_thir_expr(thir, base.base, deps);
@@ -1231,40 +1335,31 @@ impl<'tcx> Extractor<'tcx> {
                     thir::AdtExprBase::DefaultFields(_)
                     | thir::AdtExprBase::None => {}
                 }
+                true
             }
-
-            // Closures - recurse into their body.
             ExprKind::Closure(closure_expr) => {
-                // The closure has its own DefId and THIR body.
-                // closure_id is already a LocalDefId.
                 self.collect_thir_body_deps(closure_expr.closure_id, deps);
+                true
             }
-
-            // Match expressions - walk arms and scrutinee.
             ExprKind::Match {
                 scrutinee, arms, ..
             } => {
                 self.walk_thir_expr(thir, *scrutinee, deps);
                 for arm_id in arms {
                     let arm = &thir.arms[*arm_id];
-                    // Walk the pattern - this is where const patterns appear.
                     self.walk_thir_pattern(&arm.pattern, deps);
-                    // Walk guard if present.
                     if let Some(guard) = &arm.guard {
                         self.walk_thir_expr(thir, *guard, deps);
                     }
-                    // Walk body.
                     self.walk_thir_expr(thir, arm.body, deps);
                 }
+                true
             }
-
-            // Let expressions (if-let, let-else).
             ExprKind::Let { expr, pat } => {
                 self.walk_thir_expr(thir, *expr, deps);
                 self.walk_thir_pattern(pat, deps);
+                true
             }
-
-            // Block - walk statements and optional tail expression.
             ExprKind::Block { block } => {
                 let block = &thir.blocks[*block];
                 for stmt_id in &block.stmts {
@@ -1280,8 +1375,6 @@ impl<'tcx> Extractor<'tcx> {
                             if let Some(init) = initializer {
                                 self.walk_thir_expr(thir, *init, deps);
                             }
-                            // else_block is a BlockId for let-else syntax.
-                            // Walk the block's statements and optional tail expr.
                             if let Some(else_block_id) = else_block {
                                 let else_blk = &thir.blocks[*else_block_id];
                                 for else_stmt_id in &else_blk.stmts {
@@ -1306,18 +1399,30 @@ impl<'tcx> Extractor<'tcx> {
                 if let Some(tail) = block.expr {
                     self.walk_thir_expr(thir, tail, deps);
                 }
+                true
             }
+            _ => false,
+        }
+    }
 
-            // Binary operations, logical ops, and assignments all have lhs/rhs.
+    /// Handle operator and control-flow THIR expressions.
+    ///
+    /// Why: these nodes forward dependency traversal to their children.
+    fn walk_thir_expr_ops(
+        &self,
+        thir: &thir::Thir<'tcx>,
+        expr: &thir::Expr<'tcx>,
+        deps: &mut HashSet<String>,
+    ) -> bool {
+        match &expr.kind {
             ExprKind::Binary { lhs, rhs, .. }
             | ExprKind::LogicalOp { lhs, rhs, .. }
             | ExprKind::Assign { lhs, rhs }
             | ExprKind::AssignOp { lhs, rhs, .. } => {
                 self.walk_thir_expr(thir, *lhs, deps);
                 self.walk_thir_expr(thir, *rhs, deps);
+                true
             }
-
-            // Unary operations.
             ExprKind::Unary { arg, .. }
             | ExprKind::Cast { source: arg }
             | ExprKind::PointerCoercion { source: arg, .. }
@@ -1331,15 +1436,13 @@ impl<'tcx> Extractor<'tcx> {
             | ExprKind::PlaceTypeAscription { source: arg, .. }
             | ExprKind::ValueTypeAscription { source: arg, .. } => {
                 self.walk_thir_expr(thir, *arg, deps);
+                true
             }
-
-            // Index operation.
             ExprKind::Index { lhs, index } => {
                 self.walk_thir_expr(thir, *lhs, deps);
                 self.walk_thir_expr(thir, *index, deps);
+                true
             }
-
-            // If expression.
             ExprKind::If {
                 cond,
                 then,
@@ -1351,125 +1454,112 @@ impl<'tcx> Extractor<'tcx> {
                 if let Some(else_expr) = else_opt {
                     self.walk_thir_expr(thir, *else_expr, deps);
                 }
+                true
             }
-
-            // Loop expressions.
             ExprKind::Loop { body } => {
                 self.walk_thir_expr(thir, *body, deps);
+                true
             }
-
-            // Return/break with optional value.
             ExprKind::Return { value } | ExprKind::Break { value, .. } => {
                 if let Some(val) = value {
                     self.walk_thir_expr(thir, *val, deps);
                 }
+                true
             }
-
-            // Array/tuple expressions.
             ExprKind::Array { fields } | ExprKind::Tuple { fields } => {
                 for field in fields {
                     self.walk_thir_expr(thir, *field, deps);
                 }
+                true
             }
+            _ => false,
+        }
+    }
 
-            // Inline asm outputs/inputs.
-            ExprKind::InlineAsm(asm_expr) => {
-                for op in &asm_expr.operands {
-                    match op {
-                        thir::InlineAsmOperand::In { expr, .. }
-                        | thir::InlineAsmOperand::Out {
-                            expr: Some(expr),
-                            ..
-                        }
-                        | thir::InlineAsmOperand::InOut { expr, .. } => {
-                            self.walk_thir_expr(thir, *expr, deps);
-                        }
-                        thir::InlineAsmOperand::SplitInOut {
-                            in_expr,
-                            out_expr,
-                            ..
-                        } => {
-                            self.walk_thir_expr(thir, *in_expr, deps);
-                            if let Some(out) = out_expr {
-                                self.walk_thir_expr(thir, *out, deps);
-                            }
-                        }
-                        // Symbol operands reference functions or statics by symbol name.
-                        thir::InlineAsmOperand::SymFn { value, .. } => {
-                            // SymFn contains an expression that references the function.
-                            self.walk_thir_expr(thir, *value, deps);
-                        }
-                        thir::InlineAsmOperand::SymStatic { def_id } => {
-                            // SymStatic directly contains the DefId of the static.
-                            self.maybe_add_dep(*def_id, deps);
-                        }
-                        // Out with no expr, Const, and Label don't contain expressions
-                        // or dependencies we need to extract.
-                        thir::InlineAsmOperand::Out { expr: None, .. }
-                        | thir::InlineAsmOperand::Const { .. }
-                        | thir::InlineAsmOperand::Label { .. } => {}
+    /// Handle inline assembly THIR expressions.
+    ///
+    /// Why: asm operands can reference functions or statics.
+    fn walk_thir_expr_asm(
+        &self,
+        thir: &thir::Thir<'tcx>,
+        expr: &thir::Expr<'tcx>,
+        deps: &mut HashSet<String>,
+    ) -> bool {
+        let ExprKind::InlineAsm(asm_expr) = &expr.kind else {
+            return false;
+        };
+        for op in &asm_expr.operands {
+            match op {
+                thir::InlineAsmOperand::In { expr, .. }
+                | thir::InlineAsmOperand::Out {
+                    expr: Some(expr), ..
+                }
+                | thir::InlineAsmOperand::InOut { expr, .. } => {
+                    self.walk_thir_expr(thir, *expr, deps);
+                }
+                thir::InlineAsmOperand::SplitInOut {
+                    in_expr,
+                    out_expr,
+                    ..
+                } => {
+                    self.walk_thir_expr(thir, *in_expr, deps);
+                    if let Some(out) = out_expr {
+                        self.walk_thir_expr(thir, *out, deps);
                     }
                 }
+                thir::InlineAsmOperand::SymFn { value, .. } => {
+                    self.walk_thir_expr(thir, *value, deps);
+                }
+                thir::InlineAsmOperand::SymStatic { def_id } => {
+                    self.maybe_add_dep(*def_id, deps);
+                }
+                thir::InlineAsmOperand::Out { expr: None, .. }
+                | thir::InlineAsmOperand::Const { .. }
+                | thir::InlineAsmOperand::Label { .. } => {}
             }
+        }
+        true
+    }
 
-            // Expressions with a single sub-expression to walk.
+    /// Handle remaining THIR expressions not covered elsewhere.
+    ///
+    /// Why: keeps fall-through cases explicit and centralized.
+    fn walk_thir_expr_misc(
+        &self,
+        thir: &thir::Thir<'tcx>,
+        expr: &thir::Expr<'tcx>,
+        deps: &mut HashSet<String>,
+    ) -> bool {
+        match &expr.kind {
             ExprKind::Scope { value, .. }
             | ExprKind::Become { value }
             | ExprKind::Yield { value }
             | ExprKind::ConstContinue { value, .. } => {
                 self.walk_thir_expr(thir, *value, deps);
+                true
             }
             ExprKind::NeverToAny { source }
             | ExprKind::PlaceUnwrapUnsafeBinder { source }
             | ExprKind::ValueUnwrapUnsafeBinder { source }
             | ExprKind::WrapUnsafeBinder { source } => {
                 self.walk_thir_expr(thir, *source, deps);
+                true
             }
-
-            // ZstLiteral is used for zero-sized type values, including function items.
-            // The function DefId is in the expression's type, not the expression kind.
-            // For example, `helper` has type `fn() -> i32 {helper}` which is FnDef.
-            // For turbofish like `generic::<S>()`, the type is `fn() {generic::<S>}`
-            // which has both the function DefId and the type arguments.
-            ExprKind::ZstLiteral { .. } => {
-                if let ty::TyKind::FnDef(def_id, args) = expr.ty.kind() {
-                    self.maybe_add_dep(*def_id, deps);
-                    // Also capture type arguments (turbofish syntax).
-                    for arg in *args {
-                        if let Some(ty) = arg.as_type() {
-                            self.collect_type_deps(ty, deps);
-                        }
-                    }
-                }
-            }
-
-            // Const blocks (`const { ... }`) have their own body that may contain
-            // references to other items. Walk the body to capture those dependencies.
-            ExprKind::ConstBlock { did, .. } => {
-                // did is a DefId; convert to LocalDefId if it's local.
-                if let Some(local_did) = did.as_local() {
-                    self.collect_thir_body_deps(local_did, deps);
-                }
-            }
-
-            // ByUse expression (`x.use`) - walk the inner expression.
             ExprKind::ByUse { expr, .. } => {
                 self.walk_thir_expr(thir, *expr, deps);
+                true
             }
-
-            // Loop-match expression (experimental #[loop_match] attribute).
-            // The state is an expression that gets matched on.
             ExprKind::LoopMatch { state, .. } => {
                 self.walk_thir_expr(thir, *state, deps);
+                true
             }
-
-            // Leaf expressions - no sub-expressions to walk.
             ExprKind::VarRef { .. }
             | ExprKind::UpvarRef { .. }
             | ExprKind::Literal { .. }
             | ExprKind::NonHirLiteral { .. }
             | ExprKind::ConstParam { .. }
-            | ExprKind::Continue { .. } => {}
+            | ExprKind::Continue { .. } => true,
+            _ => false,
         }
     }
 
@@ -1477,6 +1567,8 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// This is critical for capturing const references in patterns like
     /// `matches!(x, MAGIC)` which MIR inlines to literal comparisons.
+    ///
+    /// Why: patterns can reference consts that never appear in expressions.
     fn walk_thir_pattern(
         &self,
         pat: &thir::Pat<'tcx>,
@@ -1563,133 +1655,8 @@ impl<'tcx> Extractor<'tcx> {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Anchor extraction for impl blocks
-    // -------------------------------------------------------------------------
-
-    /// Extract anchors for an impl block (orphan rule compliance).
-    ///
-    /// For `impl<P1..=Pn> Trait<T1..=Tn> for T0`, anchors include:
-    /// - T0 (self type) if it's a workspace-local ADT or contains one
-    /// - The trait if it's workspace-local
-    /// - T1..=Tn if they contain workspace-local ADTs
-    ///
-    /// Note: We check `is_workspace_crate` (not just `is_local`) because the
-    /// orphan rule considers all crates in the workspace as "local" for our
-    /// purposes - we can reorganize code across workspace crates.
-    fn extract_impl_anchors(&self, def_id: DefId) -> HashSet<String> {
-        let mut anchors = HashSet::new();
-
-        // Self type (T0).
-        let self_ty = self.tcx.type_of(def_id).skip_binder();
-        self.collect_anchors_from_type(self_ty, &mut anchors);
-
-        // Trait and its type parameters (T1..=Tn).
-        if matches!(self.tcx.def_kind(def_id), DefKind::Impl { of_trait: true })
-        {
-            let trait_ref = self.tcx.impl_trait_ref(def_id).skip_binder();
-
-            // Trait itself.
-            if self.is_workspace_crate(trait_ref.def_id) {
-                anchors.insert(self.raw_def_path(trait_ref.def_id));
-            }
-
-            // Trait type parameters (skip Self which is first).
-            for arg in trait_ref.args.iter().skip(1) {
-                if let Some(ty) = arg.as_type() {
-                    self.collect_anchors_from_type(ty, &mut anchors);
-                }
-            }
-        }
-
-        anchors
-    }
-
-    /// Collect workspace-local ADTs from a type for anchor purposes.
-    ///
-    /// Handles fundamental types (`&T`, `Box<T>`, `Pin<T>`) by unwrapping them
-    /// to find the inner local type. Also recurses into type parameters of
-    /// non-fundamental external types to find "uncovered" local types.
-    fn collect_anchors_from_type(
-        &self,
-        ty: Ty<'tcx>,
-        anchors: &mut HashSet<String>,
-    ) {
-        // Peel references - &T and &mut T are fundamental.
-        let ty = ty.peel_refs();
-
-        match ty.kind() {
-            ty::TyKind::Adt(adt_def, args) => {
-                if adt_def.is_fundamental() {
-                    // Fundamental types (Box, Pin, etc.) - recurse into type args.
-                    for arg in *args {
-                        if let Some(inner_ty) = arg.as_type() {
-                            self.collect_anchors_from_type(inner_ty, anchors);
-                        }
-                    }
-                } else if self.is_workspace_crate(adt_def.did()) {
-                    // Workspace-local ADT - this is an anchor.
-                    anchors.insert(self.raw_def_path(adt_def.did()));
-                } else {
-                    // External non-fundamental ADT (like Vec, HashMap).
-                    // Under orphan rules, local types in type parameters can still
-                    // be anchors (uncovered types). Recurse to find them.
-                    for arg in *args {
-                        if let Some(inner_ty) = arg.as_type() {
-                            self.collect_anchors_from_type(inner_ty, anchors);
-                        }
-                    }
-                }
-            }
-            ty::TyKind::Tuple(tys) => {
-                // Tuples are fundamental - recurse into elements.
-                for elem_ty in *tys {
-                    self.collect_anchors_from_type(elem_ty, anchors);
-                }
-            }
-            ty::TyKind::Array(elem_ty, _) | ty::TyKind::Slice(elem_ty) => {
-                // Arrays and slices - recurse into element type.
-                self.collect_anchors_from_type(*elem_ty, anchors);
-            }
-            ty::TyKind::Dynamic(predicates, _) => {
-                // dyn Trait - if the trait is workspace-local, it's an anchor.
-                for pred in *predicates {
-                    if let ty::ExistentialPredicate::Trait(trait_ref) =
-                        pred.skip_binder()
-                        && self.is_workspace_crate(trait_ref.def_id)
-                    {
-                        anchors.insert(self.raw_def_path(trait_ref.def_id));
-                    }
-                }
-            }
-            // Primitive and other types that can't be local anchors.
-            // We list them explicitly to catch new TyKind variants.
-            ty::TyKind::Bool
-            | ty::TyKind::Char
-            | ty::TyKind::Int(_)
-            | ty::TyKind::Uint(_)
-            | ty::TyKind::Float(_)
-            | ty::TyKind::Str
-            | ty::TyKind::Never
-            | ty::TyKind::Param(_)
-            | ty::TyKind::Bound(_, _)
-            | ty::TyKind::Placeholder(_)
-            | ty::TyKind::Infer(_)
-            | ty::TyKind::Error(_)
-            | ty::TyKind::Foreign(_)
-            | ty::TyKind::RawPtr(_, _)
-            | ty::TyKind::Ref(_, _, _)
-            | ty::TyKind::FnDef(_, _)
-            | ty::TyKind::FnPtr(_, _)
-            | ty::TyKind::Closure(_, _)
-            | ty::TyKind::CoroutineClosure(_, _)
-            | ty::TyKind::Coroutine(_, _)
-            | ty::TyKind::CoroutineWitness(_, _)
-            | ty::TyKind::Alias(_, _)
-            | ty::TyKind::Pat(_, _)
-            | ty::TyKind::UnsafeBinder(_) => {}
-        }
-    }
+    // Anchor extraction (extract_impl_anchors, collect_anchors_from_type) lives
+    // in crate::anchors to isolate orphan-rule type traversal from extraction.
 
     // -------------------------------------------------------------------------
     // Helper methods
@@ -1703,6 +1670,8 @@ impl<'tcx> Extractor<'tcx> {
     /// External crate deps are needed for accurate linking cost estimation in the
     /// condense phase. The number of external crates a symbol depends on strongly
     /// predicts that symbol's contribution to linking time.
+    ///
+    /// Why: dependency encoding differs for workspace vs external crates.
     fn maybe_add_dep(&self, def_id: DefId, deps: &mut HashSet<String>) {
         if self.is_workspace_crate(def_id) {
             // Workspace crate: add full symbol path.
@@ -1727,6 +1696,8 @@ impl<'tcx> Extractor<'tcx> {
     /// This returns true for the current crate (`LOCAL_CRATE`) and for any
     /// external crate whose name is in the `workspace_crates` list.
     /// Used for dependency extraction where we want cross-crate workspace deps.
+    ///
+    /// Why: workspace crates are treated as "local" for extraction.
     fn is_workspace_crate(&self, def_id: DefId) -> bool {
         if def_id.krate == LOCAL_CRATE {
             return true;
@@ -1742,6 +1713,8 @@ impl<'tcx> Extractor<'tcx> {
     /// macro expansion like tracing's `__CALLSITE`, structs from `tokio::select!`)
     /// can't be split independently from their parent. We skip extracting them and
     /// collapse any dependencies on them to the containing function.
+    ///
+    /// Why: nested items cannot be scheduled independently.
     fn is_nested_in_body(&self, def_id: DefId) -> bool {
         let mut current = def_id;
         loop {
@@ -1775,6 +1748,8 @@ impl<'tcx> Extractor<'tcx> {
     /// Find the containing function if this `def_id` is nested inside one.
     ///
     /// For items inside closures, returns the function containing the closure.
+    ///
+    /// Why: nested items must be attributed to a parent function symbol.
     fn find_containing_function(&self, def_id: DefId) -> Option<DefId> {
         let mut current = def_id;
         loop {
@@ -1803,6 +1778,8 @@ impl<'tcx> Extractor<'tcx> {
     /// target, not the lib target.
     ///
     /// Returns true if the item itself or any parent module has `cfg(test)`.
+    ///
+    /// Why: test-only symbols must not leak into lib targets.
     fn is_cfg_test(&self, def_id: DefId) -> bool {
         // Check if this item or any ancestor has cfg(test).
         let mut current = def_id;
@@ -1833,6 +1810,8 @@ impl<'tcx> Extractor<'tcx> {
     /// - `#[cfg_attr(..., test)]` that evaluated to include test
     ///
     /// Uses the `CfgTrace` attribute kind to detect cfg conditions.
+    ///
+    /// Why: cfg(test) detection is the gate for test-only extraction.
     fn has_cfg_test_attr(&self, def_id: DefId) -> bool {
         use rustc_hir::OwnerId;
         use rustc_hir::attrs::CfgEntry;
@@ -1874,6 +1853,8 @@ impl<'tcx> Extractor<'tcx> {
 
     /// Normalize a `def_id`: collapse variants to their enum, assoc items to container,
     /// and nested items to their containing function.
+    ///
+    /// Why: downstream graphs cannot split nested or variant items independently.
     fn normalize_def_id(&self, def_id: DefId) -> DefId {
         // First check if this is nested in a function body.
         if let Some(containing_fn) = self.find_containing_function(def_id) {
@@ -1895,6 +1876,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Get the string path for a `def_id`.
+    ///
+    /// Why: human-readable paths are used for logs and diagnostics.
     fn def_path_str(&self, def_id: DefId) -> String {
         self.tcx.def_path_str(def_id)
     }
@@ -1910,20 +1893,25 @@ impl<'tcx> Extractor<'tcx> {
     /// - `{{impl}}` or `{{impl}}[N]` for impl blocks
     /// - `_` or `_[N]` for anonymous items (from derive macros)
     /// - Double braces `{{...}}` for anonymous/generated items
-    #[expect(
-        clippy::too_many_lines,
-        reason = "formatting-heavy symbol path assembly is easiest to keep in one place"
-    )]
+    ///
+    /// Why: symbol keys must exactly match rustc self-profile paths.
     fn raw_def_path(&self, def_id: DefId) -> String {
-        use std::fmt::Write as _;
-
-        use rustc_hir::definitions::DefPathData;
-
         // Hot path: cache DefPath strings to avoid repeated query work.
         if let Some(cached) = self.raw_def_path_cache.borrow().get(&def_id) {
             return cached.clone();
         }
 
+        let out = self.build_raw_def_path(def_id);
+        self.raw_def_path_cache
+            .borrow_mut()
+            .insert(def_id, out.clone());
+        out
+    }
+
+    /// Build the raw `DefPath` string without touching the cache.
+    ///
+    /// Why: keeps formatting logic isolated from caching.
+    fn build_raw_def_path(&self, def_id: DefId) -> String {
         let def_path = self.tcx.def_path(def_id);
         let crate_name_symbol = if def_id.is_local() {
             None
@@ -1940,96 +1928,108 @@ impl<'tcx> Extractor<'tcx> {
         out.push_str(crate_name);
 
         for disambiguated in &def_path.data {
-            let disambiguator = disambiguated.disambiguator;
-            match &disambiguated.data {
-                DefPathData::CrateRoot => { /* Skip, we added crate name */ }
-                DefPathData::TypeNs(sym)
-                | DefPathData::ValueNs(sym)
-                | DefPathData::MacroNs(sym)
-                | DefPathData::LifetimeNs(sym) => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push_str(sym.as_str());
-                    } else {
-                        let _ =
-                            write!(out, "{}[{}]", sym.as_str(), disambiguator);
-                    }
-                }
-                DefPathData::Impl => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push_str("{{impl}}");
-                    } else {
-                        let _ = write!(out, "{{{{impl}}}}[{disambiguator}]");
-                    }
-                }
-                DefPathData::ForeignMod => {
-                    out.push_str("::{{extern}}");
-                }
-                DefPathData::Use => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push_str("{{use}}");
-                    } else {
-                        let _ = write!(out, "{{{{use}}}}[{disambiguator}]");
-                    }
-                }
-                DefPathData::GlobalAsm => {
-                    out.push_str("::{{global_asm}}");
-                }
-                DefPathData::Closure => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push_str("{{closure}}");
-                    } else {
-                        let _ = write!(out, "{{{{closure}}}}[{disambiguator}]");
-                    }
-                }
-                DefPathData::Ctor => {
-                    out.push_str("::{{constructor}}");
-                }
-                DefPathData::AnonConst | DefPathData::LateAnonConst => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push('_');
-                    } else {
-                        let _ = write!(out, "_[{disambiguator}]");
-                    }
-                }
-                DefPathData::OpaqueTy => {
-                    out.push_str("::");
-                    if disambiguator == 0 {
-                        out.push_str("{{opaque}}");
-                    } else {
-                        let _ = write!(out, "{{{{opaque}}}}[{disambiguator}]");
-                    }
-                }
-                DefPathData::AnonAssocTy(sym) => {
-                    out.push_str("::{{assoc_ty:");
-                    out.push_str(sym.as_str());
-                    out.push_str("}}");
-                }
-                DefPathData::SyntheticCoroutineBody => {
-                    out.push_str("::{{coroutine}}");
-                }
-                DefPathData::NestedStatic => {
-                    out.push_str("::{{nested_static}}");
-                }
-                DefPathData::OpaqueLifetime(sym) => {
-                    out.push_str("::{{lifetime:");
-                    out.push_str(sym.as_str());
-                    out.push_str("}}");
-                }
-                DefPathData::DesugaredAnonymousLifetime => {
-                    out.push_str("::{{anon_lifetime}}");
-                }
-            }
+            Self::push_def_path_segment(
+                &mut out,
+                disambiguated.data,
+                disambiguated.disambiguator,
+            );
         }
 
-        self.raw_def_path_cache
-            .borrow_mut()
-            .insert(def_id, out.clone());
         out
+    }
+
+    /// Append a `DefPath` segment to the raw path buffer.
+    ///
+    /// Why: isolates rustc formatting rules from the main path builder.
+    fn push_def_path_segment(
+        out: &mut String,
+        data: DefPathData,
+        disambiguator: u32,
+    ) {
+        use std::fmt::Write as _;
+
+        match data {
+            DefPathData::CrateRoot => { /* Skip, we added crate name */ }
+            DefPathData::TypeNs(sym)
+            | DefPathData::ValueNs(sym)
+            | DefPathData::MacroNs(sym)
+            | DefPathData::LifetimeNs(sym) => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push_str(sym.as_str());
+                } else {
+                    let _ = write!(out, "{}[{}]", sym.as_str(), disambiguator);
+                }
+            }
+            DefPathData::Impl => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push_str("{{impl}}");
+                } else {
+                    let _ = write!(out, "{{{{impl}}}}[{disambiguator}]");
+                }
+            }
+            DefPathData::ForeignMod => {
+                out.push_str("::{{extern}}");
+            }
+            DefPathData::Use => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push_str("{{use}}");
+                } else {
+                    let _ = write!(out, "{{{{use}}}}[{disambiguator}]");
+                }
+            }
+            DefPathData::GlobalAsm => {
+                out.push_str("::{{global_asm}}");
+            }
+            DefPathData::Closure => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push_str("{{closure}}");
+                } else {
+                    let _ = write!(out, "{{{{closure}}}}[{disambiguator}]");
+                }
+            }
+            DefPathData::Ctor => {
+                out.push_str("::{{constructor}}");
+            }
+            DefPathData::AnonConst | DefPathData::LateAnonConst => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push('_');
+                } else {
+                    let _ = write!(out, "_[{disambiguator}]");
+                }
+            }
+            DefPathData::OpaqueTy => {
+                out.push_str("::");
+                if disambiguator == 0 {
+                    out.push_str("{{opaque}}");
+                } else {
+                    let _ = write!(out, "{{{{opaque}}}}[{disambiguator}]");
+                }
+            }
+            DefPathData::AnonAssocTy(sym) => {
+                out.push_str("::{{assoc_ty:");
+                out.push_str(sym.as_str());
+                out.push_str("}}");
+            }
+            DefPathData::SyntheticCoroutineBody => {
+                out.push_str("::{{coroutine}}");
+            }
+            DefPathData::NestedStatic => {
+                out.push_str("::{{nested_static}}");
+            }
+            DefPathData::OpaqueLifetime(sym) => {
+                out.push_str("::{{lifetime:");
+                out.push_str(sym.as_str());
+                out.push_str("}}");
+            }
+            DefPathData::DesugaredAnonymousLifetime => {
+                out.push_str("::{{anon_lifetime}}");
+            }
+        }
     }
 
     /// Get a simple type/trait name without module path.
@@ -2037,12 +2037,16 @@ impl<'tcx> Extractor<'tcx> {
     /// For local items, returns the simple name (e.g., `MyType`).
     /// For external items, returns just the item name (e.g., `Box` instead of `std::boxed::Box`).
     /// This avoids `::` in impl names which would break `into_module()`.
+    ///
+    /// Why: impl display names must remain path-safe for module construction.
     fn simple_type_name(&self, def_id: DefId) -> String {
         // Get the item name directly from the DefId.
         self.tcx.item_name(def_id).to_string()
     }
 
     /// Get the source file for a local `def_id`.
+    ///
+    /// Why: source paths are surfaced in the UI and diagnostics.
     fn source_file(&self, local_def_id: LocalDefId) -> String {
         let span = self.tcx.def_span(local_def_id.to_def_id());
         let source_map = self.tcx.sess.source_map();
@@ -2063,6 +2067,8 @@ impl<'tcx> Extractor<'tcx> {
     }
 
     /// Extract visibility for a `def_id`.
+    ///
+    /// Why: visibility affects downstream scheduling and UI display.
     fn extract_visibility(&self, def_id: DefId) -> Visibility {
         match self.tcx.visibility(def_id) {
             TyVisibility::Public => Visibility::Public,
@@ -2074,10 +2080,19 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// Uses simple names (without module paths) to avoid `::` which would
     /// break `into_module()`. Also includes trait type parameters for impls
-    /// like `impl From<LocalType> for i32`.
+    /// like `impl From<LocalType> for i32`, plus the impl's own generics
+    /// (e.g., `impl<T> Trait for Type<T>`).
+    ///
+    /// Why: impl names must be human-readable and module-safe.
     fn impl_name(&self, def_id: DefId) -> String {
         let self_ty = self.tcx.type_of(def_id).skip_binder();
         let self_ty_str = self.format_ty(self_ty);
+        let impl_generics = self.impl_generics(def_id);
+        let impl_prefix = if impl_generics.is_empty() {
+            "impl".to_string()
+        } else {
+            format!("impl{impl_generics}")
+        };
 
         if matches!(self.tcx.def_kind(def_id), DefKind::Impl { of_trait: true })
         {
@@ -2110,10 +2125,55 @@ impl<'tcx> Extractor<'tcx> {
                 self.tcx.trait_def(trait_ref.def_id).safety.is_unsafe();
             let unsafe_prefix = if is_unsafe_trait { "unsafe " } else { "" };
             format!(
-                "{unsafe_prefix}impl {neg_prefix}{trait_with_args} for {self_ty_str}"
+                "{unsafe_prefix}{impl_prefix} {neg_prefix}{trait_with_args} for {self_ty_str}"
             )
         } else {
-            format!("impl {self_ty_str}")
+            format!("{impl_prefix} {self_ty_str}")
+        }
+    }
+
+    /// Format the impl's generic parameters as a header suffix (e.g., "<T, 'a>").
+    ///
+    /// This omits bounds, defaults, and where clauses to keep display names
+    /// concise while still showing which parameters are introduced by the impl.
+    ///
+    /// Why: sidebar display should reflect impl headers without noisy bounds.
+    fn impl_generics(&self, def_id: DefId) -> String {
+        let generics = self.tcx.generics_of(def_id);
+        let params: Vec<String> = generics
+            .own_params
+            .iter()
+            .filter_map(|param| match param.kind {
+                ty::GenericParamDefKind::Lifetime => {
+                    let raw_name = param.name.to_string();
+                    // Skip anonymous/elided lifetimes to avoid noisy `impl<'_>`.
+                    if raw_name == "_" {
+                        return None;
+                    }
+                    let name = if raw_name.starts_with('\'') {
+                        raw_name
+                    } else {
+                        format!("'{raw_name}")
+                    };
+                    if name == "'_" {
+                        return None;
+                    }
+                    Some(name)
+                }
+                ty::GenericParamDefKind::Type { .. } => {
+                    Some(param.name.to_string())
+                }
+                ty::GenericParamDefKind::Const { .. } => {
+                    let ty = self.tcx.type_of(param.def_id).skip_binder();
+                    let ty_str = self.format_ty(ty);
+                    Some(format!("const {}: {}", param.name, ty_str))
+                }
+            })
+            .collect();
+        if params.is_empty() {
+            String::new()
+        } else {
+            format!("<{}>", params.join(", "))
         }
     }
 
@@ -2122,6 +2182,8 @@ impl<'tcx> Extractor<'tcx> {
     /// This produces clean names like `[Foo; 3]` instead of the debug
     /// representation `[Foo; 3_usize]` or `dyn Trait` instead of
     /// `dyn [Binder { value: Trait(...), bound_vars: [] }]`.
+    ///
+    /// Why: readable type strings improve UI clarity and diagnostics.
     fn format_ty(&self, ty: Ty<'tcx>) -> String {
         match ty.kind() {
             // ADT types: use simple name to avoid `::` in impl names.
@@ -2230,6 +2292,8 @@ impl<'tcx> Extractor<'tcx> {
     /// Returns `None` for arguments that should be elided (e.g., late-bound or
     /// erased lifetimes). This is used when formatting generic type parameters
     /// like `MyType<'a, T>` to include all visible generic arguments.
+    ///
+    /// Why: impl names should include only meaningful generic parameters.
     fn format_generic_arg(&self, arg: ty::GenericArg<'tcx>) -> Option<String> {
         // Try type argument first.
         if let Some(ty) = arg.as_type() {
@@ -2266,6 +2330,8 @@ impl<'tcx> Extractor<'tcx> {
     ///
     /// Builds a nested Module hierarchy from the flat symbol map and returns
     /// it along with the profile mapping.
+    ///
+    /// Why: downstream phases expect a hierarchical module tree.
     fn into_result(self) -> ExtractionResult {
         let mut root = Module {
             symbols: HashMap::new(),

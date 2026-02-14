@@ -2,16 +2,25 @@
 //!
 //! Extracted from `tarjanize-viz` so both the static HTML visualization and the
 //! interactive split explorer can share scheduling primitives.
+//!
+//! Why: consolidating schedule logic prevents drift between CLI and UI and
+//! keeps critical-path results consistent across tools.
 
 pub mod data;
 pub mod export;
+mod grouping;
 pub mod heatmap;
+mod horizon;
 pub mod recommend;
 pub mod schedule;
 pub mod split;
 pub mod target_graph;
 
-use tarjanize_schemas::{CostModel, Module, SymbolGraph, sum_event_times};
+use std::time::Duration;
+
+use tarjanize_schemas::{
+    CostModel, SymbolGraph, TargetId, duration_to_ms_f64, ms_to_duration,
+};
 
 use crate::schedule::TargetGraph;
 
@@ -24,6 +33,9 @@ use crate::schedule::TargetGraph;
 /// This replaces the manual `tarjanize cost --output-model` step for
 /// interactive use, where we want to auto-fit on startup without
 /// requiring a separate CLI invocation.
+///
+/// Why: the viz must compute schedules on demand, so we fit a model
+/// automatically when explicit models are unavailable.
 pub fn auto_fit_cost_model(symbol_graph: &SymbolGraph) -> Option<CostModel> {
     // Fit using lib targets only because they have the most reliable
     // profiling data. Non-lib targets (tests, examples) often lack
@@ -46,21 +58,17 @@ pub fn auto_fit_cost_model(symbol_graph: &SymbolGraph) -> Option<CostModel> {
 /// Test targets are augmented with their lib's per-symbol costs when
 /// the test target has no wall-clock profiling data (same logic as
 /// `tarjanize-cost`'s `build_target_graph`).
+///
+/// Why: scheduling operates on targets, so we normalize target costs
+/// and dependencies into a graph suitable for critical-path analysis.
 pub fn build_target_graph(
     symbol_graph: &SymbolGraph,
     cost_model: Option<&CostModel>,
 ) -> TargetGraph {
     use std::collections::HashMap;
-    use std::time::Duration;
 
     use indexmap::IndexSet;
     use petgraph::graph::DiGraph;
-
-    /// Converts f64 milliseconds to Duration at the boundary between
-    /// regression math (f64) and scheduling (Duration).
-    fn ms_to_duration(ms: f64) -> Duration {
-        Duration::from_secs_f64(ms / 1000.0)
-    }
 
     let mut names: IndexSet<String> = IndexSet::new();
     let mut costs: Vec<Duration> = Vec::new();
@@ -69,41 +77,49 @@ pub fn build_target_graph(
     // First pass: register targets, compute costs and symbol counts.
     // Costs stay as f64 ms during computation (mixing regression
     // outputs), then convert to Duration at the end.
+    //
+    // Why: we need a stable target index order and normalized costs before
+    // building dependency edges.
     let mut cost_map: HashMap<String, f64> = HashMap::new();
     let mut sym_count_map: HashMap<String, usize> = HashMap::new();
 
     for (package_name, package) in &symbol_graph.packages {
         for (target_key, target_data) in &package.targets {
-            let target_id = format!("{package_name}/{target_key}");
+            let target_id = TargetId::new(package_name, target_key).to_string();
             names.insert(target_id.clone());
 
-            let syms = count_symbols(&target_data.root);
+            let syms = target_data.root.count_symbols();
             sym_count_map.insert(target_id.clone(), syms);
 
             // Compute cost: use CostModel if available, else effective.
-            let attr = collect_frontend_cost(&target_data.root);
+            let attr = target_data.root.collect_frontend_cost();
+            let attr_ms = duration_to_ms_f64(attr);
             let cost = if let Some(model) = cost_model {
-                let meta: f64 = target_data
+                let meta = target_data
                     .timings
                     .event_times_ms
                     .iter()
                     .filter(|(k, _)| k.starts_with("metadata_decode_"))
-                    .map(|(_, v)| v)
-                    .sum();
-                let other: f64 = target_data
+                    .map(|(_, v)| *v)
+                    .fold(Duration::ZERO, |acc, next| acc + next);
+                let other = target_data
                     .timings
                     .event_times_ms
                     .iter()
                     .filter(|(k, _)| !k.starts_with("metadata_decode_"))
-                    .map(|(_, v)| v)
-                    .sum();
-                model.predict(attr, meta, other)
+                    .map(|(_, v)| *v)
+                    .fold(Duration::ZERO, |acc, next| acc + next);
+                model.predict(
+                    attr_ms,
+                    duration_to_ms_f64(meta),
+                    duration_to_ms_f64(other),
+                )
             } else if !target_data.timings.wall_time.is_zero() {
                 // Use wall-clock when profiled.
                 target_data.timings.wall_time.as_secs_f64() * 1000.0
             } else {
                 // Fall back to per-symbol sum.
-                attr
+                attr_ms
             };
 
             cost_map.insert(target_id, cost);
@@ -113,13 +129,16 @@ pub fn build_target_graph(
     // Augment test targets with lib costs when the test has no wall-clock
     // profiling data and no cost model is in use. When a cost model IS
     // provided, predictions already account for the full compilation.
+    //
+    // Why: test targets often recompile the lib, so their cost should reflect
+    // both the test code and the lib's front-end work.
     if cost_model.is_none() {
         for (package_name, package) in &symbol_graph.packages {
             if !package.targets.contains_key("test") {
                 continue;
             }
-            let test_id = format!("{package_name}/test");
-            let lib_id = format!("{package_name}/lib");
+            let test_id = TargetId::new(package_name, "test").to_string();
+            let lib_id = TargetId::new(package_name, "lib").to_string();
 
             let test_has_wall = package
                 .targets
@@ -137,12 +156,16 @@ pub fn build_target_graph(
     }
 
     // Collect vectors in names order, converting f64 ms to Duration.
+    //
+    // Why: TargetGraph uses parallel arrays keyed by index for fast scheduling.
     for name in &names {
         costs.push(ms_to_duration(*cost_map.get(name).unwrap_or(&0.0)));
         symbol_counts.push(*sym_count_map.get(name).unwrap_or(&0));
     }
 
     // Build dependency graph.
+    //
+    // Why: schedule computation requires a DAG of target dependencies.
     let mut graph = DiGraph::<usize, ()>::with_capacity(names.len(), 0);
     for _ in 0..names.len() {
         graph.add_node(0);
@@ -150,7 +173,7 @@ pub fn build_target_graph(
 
     for (package_name, package) in &symbol_graph.packages {
         for (target_key, target_data) in &package.targets {
-            let target_id = format!("{package_name}/{target_key}");
+            let target_id = TargetId::new(package_name, target_key).to_string();
             let Some(target_idx) = names.get_index_of(&target_id) else {
                 continue;
             };
@@ -178,44 +201,27 @@ pub fn build_target_graph(
     }
 }
 
-/// Recursively sums all symbol `event_times_ms` in a module tree.
-fn collect_frontend_cost(module: &Module) -> f64 {
-    let mut total = 0.0;
-    for symbol in module.symbols.values() {
-        total += sum_event_times(&symbol.event_times_ms);
-    }
-    for submodule in module.submodules.values() {
-        total += collect_frontend_cost(submodule);
-    }
-    total
-}
-
-/// Recursively counts symbols in a module tree.
-fn count_symbols(module: &Module) -> usize {
-    let mut count = module.symbols.len();
-    for submodule in module.submodules.values() {
-        count += count_symbols(submodule);
-    }
-    count
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
-    use std::time::Duration;
 
     use tarjanize_schemas::{
-        Package, Symbol, SymbolKind, Target, TargetTimings, Visibility,
+        Module, Package, Symbol, SymbolKind, Target, TargetTimings, Visibility,
     };
 
     use super::*;
     use crate::split::SplitOperation;
 
     /// Converts f64 milliseconds to Duration for test convenience.
+    ///
+    /// Why: keeps test inputs readable while matching production units.
     fn ms(val: f64) -> Duration {
         Duration::from_secs_f64(val / 1000.0)
     }
 
+    /// Returns `None` when there is no profiling data to fit a model.
+    ///
+    /// Why: avoids presenting a bogus model when the graph is empty.
     #[test]
     fn auto_fit_returns_none_for_empty_graph() {
         let sg = SymbolGraph::default();
@@ -227,10 +233,15 @@ mod tests {
     // =================================================================
 
     /// Builds a simple `Symbol` with a single `typeck` event cost.
+    ///
+    /// Why: minimal symbols keep test graphs focused on schedule behavior.
     fn make_symbol(event_cost: f64) -> Symbol {
         Symbol {
             file: "lib.rs".to_string(),
-            event_times_ms: HashMap::from([("typeck".to_string(), event_cost)]),
+            event_times_ms: HashMap::from([(
+                "typeck".to_string(),
+                ms(event_cost),
+            )]),
             dependencies: HashSet::new(),
             kind: SymbolKind::ModuleDef {
                 kind: "Function".to_string(),
@@ -247,6 +258,9 @@ mod tests {
     /// the model's `predict()` for cost, not the wall-clock fallback.
     /// The model decomposes timing into attr (per-symbol sum), meta
     /// (`metadata_decode_*` events), and other (remaining events).
+    ///
+    /// Why: validates that model-based predictions override wall-clock
+    /// measurements when a model is supplied.
     #[test]
     fn build_target_graph_with_cost_model() {
         let mut symbols = HashMap::new();
@@ -261,8 +275,8 @@ mod tests {
             timings: TargetTimings {
                 wall_time: ms(20.0),
                 event_times_ms: HashMap::from([
-                    ("metadata_decode_something".to_string(), 3.0),
-                    ("other_event".to_string(), 2.0),
+                    ("metadata_decode_something".to_string(), ms(3.0)),
+                    ("other_event".to_string(), ms(2.0)),
                 ]),
             },
             dependencies: HashSet::new(),
@@ -314,6 +328,8 @@ mod tests {
 
     /// Without a cost model, `build_target_graph` should use the target's
     /// `wall_time_ms` when it is positive.
+    ///
+    /// Why: ensures we prefer real timing data over derived estimates.
     #[test]
     fn build_target_graph_wall_clock_fallback() {
         let mut symbols = HashMap::new();
@@ -354,6 +370,8 @@ mod tests {
 
     /// When there is no cost model and `wall_time_ms` is zero, the cost
     /// falls back to the sum of all per-symbol `event_times_ms`.
+    ///
+    /// Why: ensures a deterministic fallback when profiling data is absent.
     #[test]
     fn build_target_graph_symbol_sum_fallback() {
         let mut symbols = HashMap::new();
@@ -401,6 +419,9 @@ mod tests {
     /// target has no wall-clock data (`wall_time_ms` == 0), the test's
     /// cost is augmented with the lib's cost. This compensates for test
     /// targets re-compiling the lib's code.
+    ///
+    /// Why: prevents undercounting test targets when they effectively
+    /// recompile the library.
     #[test]
     fn build_target_graph_test_augmentation() {
         // lib target: cost = 10ms (wall-clock).
@@ -462,6 +483,9 @@ mod tests {
 
     /// Cross-package dependencies should produce edges in the target
     /// graph. Edge direction: dependency -> dependent.
+    ///
+    /// Why: edge direction affects critical-path analysis and must match
+    /// the actual build order.
     #[test]
     fn build_target_graph_dependencies() {
         let pkg_a_target = Target {
@@ -541,6 +565,8 @@ mod tests {
     /// independent SCCs of ~25ms each) -> pkg-c (5ms).
     ///
     /// Critical path before splitting: 10 + 50 + 5 = 65ms.
+    ///
+    /// Why: provides a stable fixture to validate end-to-end improvements.
     fn make_three_package_chain() -> SymbolGraph {
         let pkg_a_target = Target {
             timings: TargetTimings::default(),
@@ -599,6 +625,8 @@ mod tests {
 
     /// Splitting a large target into two parallel pieces should reduce
     /// the critical path length.
+    ///
+    /// Why: validates the end-to-end schedule improvement from splitting.
     #[test]
     fn full_pipeline_split_reduces_critical_path() {
         let sg = make_three_package_chain();
@@ -615,8 +643,9 @@ mod tests {
         );
 
         // Condense pkg-b/lib to find its 2 independent SCCs.
-        let intra = target_graph::condense_target(&sg, "pkg-b/lib")
-            .expect("pkg-b/lib must be condensable");
+        let intra =
+            target_graph::condense_target(&sg, &TargetId::new("pkg-b", "lib"))
+                .expect("pkg-b/lib must be condensable");
         assert_eq!(intra.nodes.len(), 2);
 
         // Split out the SCC containing "alpha" (~25ms).
