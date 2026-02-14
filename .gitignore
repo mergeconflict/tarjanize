@@ -5,7 +5,6 @@ target
 
 # Node.js (esbuild bundler + vitest)
 node_modules
-package-lock.json
 
 # ts-rs generated TypeScript declarations (cargo test regenerates these)
 types/generated/
