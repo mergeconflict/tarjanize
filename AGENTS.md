@@ -183,7 +183,5 @@ Workspace-level lint configuration follows [M-STATIC-VERIFICATION](https://micro
 
 Read these docs for deeper context on specific topics:
 
-- **[docs/cost-model-validation.md](docs/cost-model-validation.md)** — Cost model validation against Omicron (~160 crates). Documents R^2=0.856 accuracy, per-symbol cost skew, and why only lib targets matter for critical path
-- **[COMPILATION_COSTS.md](COMPILATION_COSTS.md)** — Reference: how rustc compilation works (frontend/backend phases, CGU parallelism, profiling data). tarjanize only tracks frontend costs
-- **[docs/structural-cost-predictors.md](docs/structural-cost-predictors.md)** — Analysis of which code structural properties drive compilation time
+- **[docs/cost-model.md](docs/cost-model.md)** — Cost model: rustc compilation reference, validation (R^2=0.856), per-symbol cost skew, event-level analysis, and structural cost predictors
 - **[docs/structural-extraction-plan.md](docs/structural-extraction-plan.md)** — Event-based cost model design: per-symbol attribution, two-term regression, validation results

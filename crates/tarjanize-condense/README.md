@@ -24,7 +24,7 @@ The core algorithm is in `scc.rs` (`condense_and_partition`):
 
 **Effective dependents**: A dependent set S of SCC X is "effective" if the edge S→X is non-redundant — i.e., X is not already reachable from S through other dependencies. This is computed using incremental HMR (Habib-Morvan-Rampon) transitive reduction, which is recomputed after each merge.
 
-**Metadata estimation**: Synthetic crates don't have real metadata times, so they're estimated via linear regression: `metadata_ms = 0.26 * frontend_ms + 1662` (R² = 0.705, derived from Omicron build data). See `docs/cost-model-validation.md`.
+**Metadata estimation**: Synthetic crates don't have real metadata times, so they're estimated via linear regression: `metadata_ms = 0.26 * frontend_ms + 1662` (R² = 0.705, derived from Omicron build data). See `docs/cost-model.md`.
 
 **Path conflict resolution**: When symbols from different original crates end up in the same synthetic crate with conflicting paths, they're placed in `conflict_from_{original_crate}` submodules.
 
